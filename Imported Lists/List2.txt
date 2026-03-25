@@ -1,0 +1,16 @@
+++ High Elf Fleets (v3.5.2) [GF 1995pts] [7 Units] ++
+
+Protectors [10] Q4+ D5+ | 240pts | 10x Highborn
+8x Shardgun (12", A2, Crack), 10x CCW (A1), 2x Shard Cannon (24", A3, AP(1), Crack)
+
+Shifters [5] Q3+ D4+ | 245pts | 5x Ambush, 5x Teleport, 5x Highborn
+5x Web Spinner (12", A2, AP(4)), 5x CCW (A1)
+
+3x Vanquishers [3] Q3+ D4+ | 250pts | 3x Relentless, 3x Highborn
+3x Surge Rockets (24", A3, AP(1), Unstoppable), 3x CCW (A1)
+
+Anti-Gravity Tank [1] Q3+ D2+ | 535pts | Fast, Impact(6), Strider, Tough(12), Highborn
+Mounted Shardguns (12", A2, Crack), Prism Cannon (36", A2, AP(4), Deadly(6))
+
+Combat Walker [1] Q3+ D2+ | 225pts | Scout, Tough(6), Highborn, Stealth
+Rapid Shard Cannon (24", A6, AP(1), Crack), Stomp (A2, AP(1))

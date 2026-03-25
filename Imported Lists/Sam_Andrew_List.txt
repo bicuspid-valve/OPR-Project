@@ -1,0 +1,13 @@
+++ High Elf Fleets (v3.5.2) [GF 2000pts] [10 Units] ++
+
+3x Shifters [5] Q3+ D4+ | 245pts | 5x Ambush, 5x Teleport, 5x Highborn
+5x Web Spinner (12", A2, AP(4)), 5x CCW (A1)
+
+Scorchers [3] Q3+ D4+ | 140pts | 3x Highborn
+3x CCW (A1), 3x Fusion Rifle (12", A1, AP(4), Deadly(3))
+
+3x Combat Walker [1] Q3+ D2+ | 210pts | Scout, Tough(6), Highborn
+Rapid Shard Cannon (24", A6, AP(1), Crack), Stomp (A2, AP(1))
+
+3x Support Artillery [1] Q3+ D3+ | 165pts | Artillery, Tough(3)
+Burst Mortar (30", A2, Blast(3), Indirect), Artillery Crew (A3)

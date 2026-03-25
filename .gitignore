@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Build artifacts
+build/
+*.so
+*.pyd
+
+# ML checkpoints and outputs
+ml_checkpoints/
+ml_checkpoints_bench_seq/
+ml_checkpoints_tactical_test/
+ml_logs/
+results/
+training_metrics.png

@@ -1,0 +1,19 @@
+++ High Elf Fleets (v3.5.2) [GF 1440pts] [5 Units] ++
+
+Elven Noble [1] Q3+ D4+ | 55pts | Hero, Tough(3), Highborn, Shielded, Ambush, Crossing Attack(1), Flying
+CCW (A2)
+| Joined to:
+Gliders [10] Q3+ D4+ | 405pts | 10x Ambush, 10x Flying, 10x Highborn
+2x CCW (A2), Shred Blaster (24", A4, Rending), 8x Laser Blaster (18", A1, AP(2)), 8x CCW (A1), Heavy Laser Blaster (18", A3, AP(2))
+
+Scorchers [3] Q3+ D4+ | 160pts | 3x Highborn
+3x CCW (A1), Fusion Pike (18", A1, AP(4), Deadly(3)), 2x Fusion Rifle (12", A1, AP(4), Deadly(3))
+
+Elemental Strikers [3] Q3+ D3+ | 270pts | 3x Fearless, 3x Furious, Tough(3), 3x Highborn, Shielded
+Energy Sword (A3, AP(1), Rending), 2x Dual Energy Swords (A4, AP(1), Rending)
+
+Combat Walker [1] Q3+ D2+ | 210pts | Scout, Tough(6), Highborn
+Rapid Shard Cannon (24", A6, AP(1), Crack), Stomp (A2, AP(1))
+
+Great Elemental [1] Q3+ D2+ | 340pts | Fear(2), Fearless, Tough(12), Highborn
+2x Shardgun (12", A2, Crack), 2x Great Claw (A4, Rending), Stomp (A4, AP(1))
