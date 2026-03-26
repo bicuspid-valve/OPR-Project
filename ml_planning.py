@@ -43,9 +43,11 @@ from ml_features import (
 )
 from ml_integration_tactical import (
     execute_decoded_decision, pick_target_from_ranking,
-    compute_post_move_rel, decode_direction_params,
+    compute_post_move_rel, compute_in_range_mask, compute_in_range_mask_batched,
+    decode_direction_params,
     decode_distance_params, compute_post_move_position,
-    _get_model_space_positions, _get_movement_budgets, MOVE_TYPE_NAMES,
+    _get_model_space_positions, _get_movement_budgets,
+    _get_max_weapon_ranges, MOVE_TYPE_NAMES,
 )
 from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
@@ -423,8 +425,15 @@ def simulate_forward(
                       forced_unit_idx=selected_idx, post_move_rel=post_move_rel)
 
         charge_target_idx = int(out2.charge_target_logits.argmax().item()) if enemy_alive_mask.any() else 0
-        shoot_target_idx = int(out2.shoot_target_logits.argmax().item()) if enemy_alive_mask.any() else 0
-        target_ranking = torch.argsort(out2.shoot_target_logits, descending=True).tolist()
+        max_wr = max(
+            (w.range_inches for w in selected_unit.unit.weapons if not w.melee),
+            default=0.0,
+        )
+        shoot_range_mask = compute_in_range_mask(
+            post_move_rel, float(max_wr), enemy_alive_mask)
+        masked_shoot_logits = out2.shoot_target_logits.masked_fill(~shoot_range_mask, float('-inf'))
+        shoot_target_idx = int(masked_shoot_logits.argmax().item()) if shoot_range_mask.any() else 0
+        target_ranking = torch.argsort(masked_shoot_logits, descending=True).tolist()
 
         # Convert to game-space destination
         dest = None
@@ -483,6 +492,7 @@ class _PlanningInferenceRequest:
     enemy_positions: list           # 10 × (float, float) model-space
     advance_distances: list         # per friendly slot (float)
     rush_distances: list            # per friendly slot (float)
+    max_weapon_ranges: list         # per friendly slot (float)
 
 
 @dataclass
@@ -584,20 +594,17 @@ def _batched_argmax_forward(
     enemy_batch = torch.stack([r.enemy_alive_mask for r in requests]) # (B, 10)
 
     # Trunk (single pass)
-    h = model.trunk(state_batch)                                       # (B, 128)
+    h, u_attended = model.trunk(state_batch)                           # (B, 512), (B, 20, 180)
 
     # Unit selection — argmax
     unit_logits = model.unit_selection_head(h)                         # (B, 10)
     unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
     unit_indices = unit_logits.argmax(dim=-1)                          # (B,)
 
-    # Extract per-sample unit features via gather
-    friendly_block = state_batch[:, :n_units * TACTICAL_UNIT_FEATURES].reshape(
-        n, n_units, TACTICAL_UNIT_FEATURES,
-    )
-    unit_features = friendly_block.gather(
+    # Extract per-sample unit features from attended embeddings
+    unit_features = u_attended[:, :n_units, :].gather(
         1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n, 1, TACTICAL_UNIT_FEATURES),
-    ).squeeze(1).detach()                                              # (B, 140)
+    ).squeeze(1).detach()                                              # (B, 180)
 
     # Move type — argmax
     h_uf = torch.cat([h, unit_features], dim=-1)                       # (B, 268)
@@ -656,7 +663,13 @@ def _batched_argmax_forward(
     pmr_batch = torch.stack(pmr_tensors)                               # (B, 30)
     shoot_input = torch.cat([h, unit_features, move_onehot, pmr_batch], dim=-1)
     shoot_logits = model.shoot_target_head(shoot_input)                # (B, 10)
-    shoot_logits = shoot_logits.masked_fill(~enemy_batch, float('-inf'))
+    # Mask by alive AND in-range (matching training masking)
+    max_wr_list = [requests[i].max_weapon_ranges[unit_list[i]] for i in range(n)]
+    max_wr_t = torch.tensor(max_wr_list, dtype=torch.float32)
+    shoot_mask_batch = compute_in_range_mask_batched(pmr_batch, max_wr_t, enemy_batch)
+    shoot_logits = shoot_logits.masked_fill(~shoot_mask_batch, float('-inf'))
+    no_shootable = ~shoot_mask_batch.any(dim=-1)                       # (B,)
+    shoot_logits = shoot_logits.masked_fill(no_shootable.unsqueeze(-1), 0.0)
     shoot_indices = shoot_logits.argmax(dim=-1)                        # (B,)
 
     # Value head
@@ -756,11 +769,12 @@ def _rollout_generator(
         f_pos = _get_model_space_positions(my_units, la_player)
         e_pos = _get_model_space_positions(opp_units, la_player)
         adv_dists, rush_dists = _get_movement_budgets(my_units)
+        mwr = _get_max_weapon_ranges(my_units)
 
         # >>> YIELD for batched inference <<<
         result = yield _PlanningInferenceRequest(
             state_vec, alive_mask, enemy_alive_mask,
-            f_pos, e_pos, adv_dists, rush_dists,
+            f_pos, e_pos, adv_dists, rush_dists, mwr,
         )
 
         # Decode result into game action
@@ -822,10 +836,11 @@ def _rollout_generator(
     f_pos = _get_model_space_positions(val_friendly, player)
     e_pos = _get_model_space_positions(val_enemy, player)
     adv_dists, rush_dists = _get_movement_budgets(val_friendly)
+    mwr = _get_max_weapon_ranges(val_friendly)
 
     final_result = yield _PlanningInferenceRequest(
         state_vec, val_alive, val_enemy_alive,
-        f_pos, e_pos, adv_dists, rush_dists,
+        f_pos, e_pos, adv_dists, rush_dists, mwr,
     )
     return final_result.value
 
@@ -987,8 +1002,10 @@ def plan_activation(
     )
 
     # 1. One trunk pass
-    x = state_vec.unsqueeze(0)  # (1, 2811)
-    h = model.trunk(x).squeeze(0)  # (128,)
+    x = state_vec.unsqueeze(0)  # (1, 3611)
+    h, u_attended = model.trunk(x)
+    h = h.squeeze(0)              # (512,)
+    u_attended = u_attended.squeeze(0)  # (20, 180)
 
     unit_logits = model.unit_selection_head(h.unsqueeze(0)).squeeze(0)  # (10,)
     unit_logits = unit_logits.masked_fill(~alive_mask, float('-inf'))
@@ -1033,8 +1050,12 @@ def plan_activation(
 
     for uid in candidate_units:
         unit = friendly_units[uid]
-        unit_features = model._extract_unit_features(state_vec, uid).detach()  # (140,)
-        uf_b = unit_features.unsqueeze(0)  # (1, 140)
+        max_wr = max(
+            (w.range_inches for w in unit.unit.weapons if not w.melee),
+            default=0.0,
+        )
+        unit_features = model._extract_unit_features(u_attended, uid).detach()  # (180,)
+        uf_b = unit_features.unsqueeze(0)  # (1, 180)
 
         # Move type logits depend on h + unit_features — compute once per unit
         h_uf = torch.cat([h_b, uf_b], dim=-1)           # (1, 268)
@@ -1093,8 +1114,11 @@ def plan_activation(
             post_move_rel = compute_post_move_rel(post_x, post_y, enemy_positions)
             shoot_input = torch.cat([h_b, uf_b, move_onehot, post_move_rel.unsqueeze(0)], dim=-1)
             shoot_logits = model.shoot_target_head(shoot_input).squeeze(0)
-            shoot_logits = shoot_logits.masked_fill(~enemy_alive_mask, float('-inf'))
-            if no_enemies:
+            shoot_range_mask = compute_in_range_mask(
+                post_move_rel, float(max_wr), enemy_alive_mask)
+            shoot_logits = shoot_logits.masked_fill(~shoot_range_mask, float('-inf'))
+            no_shootable = no_enemies or not shoot_range_mask.any()
+            if no_shootable:
                 shoot_target_idx = 0
             else:
                 shoot_probs = torch.softmax(shoot_logits, dim=-1)

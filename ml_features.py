@@ -31,15 +31,18 @@ TOTAL_FEATURES = MAX_UNITS_PER_SIDE * 2 * UNIT_FEATURES + GLOBAL_FEATURES  # 215
 
 # Tactical model (v2): egocentric (sin θ, cos θ, dist) for objectives and enemies
 # Per-unit: 10 basic + 2 position + 15 obj-rel + 30 enemy-rel + 30 same-side-rel
-#         + 70 ranged + 10 melee + has_activated + fatigued + is_shaken = 170
+#         + 70 ranged + 10 melee + 10 opp-post-advance-dist
+#         + has_activated + fatigued + is_shaken = 180
 _NUM_OBJECTIVES = 5
 _TACTICAL_OBJ_REL = _NUM_OBJECTIVES * 3       # 15: (sin θ, cos θ, dist) per objective
 _TACTICAL_OPP_REL = MAX_UNITS_PER_SIDE * 3    # 30: (sin θ, cos θ, dist) per opposing unit
 _TACTICAL_SAME_REL = MAX_UNITS_PER_SIDE * 3   # 30: (sin θ, cos θ, dist) per same-side unit
 _TACTICAL_BASE = 10 + 2 + _TACTICAL_OBJ_REL + _TACTICAL_OPP_REL + _TACTICAL_SAME_REL  # 87
-TACTICAL_UNIT_FEATURES = _TACTICAL_BASE + NUM_RANGE_THRESHOLDS * MAX_UNITS_PER_SIDE + MAX_UNITS_PER_SIDE + 3  # 170
-# (87 + 70 ranged + 10 melee + 3 tactical bools)
-TACTICAL_TOTAL_FEATURES = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES + GLOBAL_FEATURES  # 3411
+_TACTICAL_OPP_POST_ADV = MAX_UNITS_PER_SIDE   # 10: post-advance distance per opposing unit
+TACTICAL_UNIT_FEATURES = (_TACTICAL_BASE + NUM_RANGE_THRESHOLDS * MAX_UNITS_PER_SIDE
+                          + MAX_UNITS_PER_SIDE + _TACTICAL_OPP_POST_ADV + 3)  # 180
+# (87 + 70 ranged + 10 melee + 10 opp-post-advance + 3 tactical bools)
+TACTICAL_TOTAL_FEATURES = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES + GLOBAL_FEATURES  # 3611
 
 # Tactical per-unit feature offsets
 _TOFF_SCALARS = 0         # 10 scalars
@@ -49,9 +52,10 @@ _TOFF_OPP_REL = 27        # 30: 10 opposing units × (sin θ, cos θ, dist)
 _TOFF_SAME_REL = 57       # 30: 10 same-side units × (sin θ, cos θ, dist)
 _TOFF_RANGED = 87         # 70: ranged matchup values (10 enemies × 7 thresholds)
 _TOFF_MELEE = _TOFF_RANGED + MAX_UNITS_PER_SIDE * NUM_RANGE_THRESHOLDS  # 157: 10 melee values
-_TOFF_ACTIVATED = 167     # has_activated
-_TOFF_FATIGUED = 168      # fatigued
-_TOFF_SHAKEN = 169        # is_shaken
+_TOFF_OPP_POST_ADV = _TOFF_MELEE + MAX_UNITS_PER_SIDE  # 167: 10 post-advance distances
+_TOFF_ACTIVATED = _TOFF_OPP_POST_ADV + MAX_UNITS_PER_SIDE  # 177: has_activated
+_TOFF_FATIGUED = _TOFF_ACTIVATED + 1   # 178: fatigued
+_TOFF_SHAKEN = _TOFF_FATIGUED + 1      # 179: is_shaken
 
 # Normalisation ceilings
 _MAX_TOUGH = 24
@@ -507,11 +511,12 @@ def _encode_unit_tactical_into(
     melee_matchups: np.ndarray,
     total_side_points: int,
     opposing_positions: list[tuple[float, float]],
+    opposing_advance_distances: list[float],
     same_side_positions: list[tuple[float, float]],
     buf: np.ndarray,
     offset: int,
 ) -> None:
-    """Write TACTICAL_UNIT_FEATURES (170) floats into buf for the v2 tactical model.
+    """Write TACTICAL_UNIT_FEATURES (180) floats into buf for the v2 tactical model.
 
     Uses egocentric (sin θ, cos θ, dist) encoding for objectives, opposing units,
     and same-side units.
@@ -524,9 +529,10 @@ def _encode_unit_tactical_into(
       57-86   10 same-side units × (sin θ, cos θ, dist) = 30
       87-156  70 ranged matchup values (10 enemies × 7 thresholds)
       157-166 10 melee matchup values
-      167     has_activated
-      168     fatigued
-      169     is_shaken
+      167-176 10 post-advance distances (how close each opposing unit could get)
+      177     has_activated
+      178     fatigued
+      179     is_shaken
     """
     if us.models_alive <= 0:
         return  # buf is zero-initialized
@@ -574,8 +580,10 @@ def _encode_unit_tactical_into(
         o += 3
 
     # 27-56  Opposing units: (sin θ, cos θ, dist) per opposing unit
+    # 167-176  Post-advance distances (computed in same loop)
     o = offset + _TOFF_OPP_REL
-    for ox, oy in opposing_positions:
+    pa = offset + _TOFF_OPP_POST_ADV
+    for j, (ox, oy) in enumerate(opposing_positions):
         dx = ox - cx
         dy = oy - cy
         d = math.sqrt(dx * dx + dy * dy)
@@ -587,6 +595,7 @@ def _encode_unit_tactical_into(
             buf[o + 1] = dx / d
         buf[o + 2] = d * _INV_BOARD_DIAG
         o += 3
+        buf[pa + j] = max(0.0, d - opposing_advance_distances[j]) * _INV_BOARD_DIAG
 
     # 57-86  Same-side units: (sin θ, cos θ, dist) per same-side unit
     o = offset + _TOFF_SAME_REL
@@ -614,7 +623,7 @@ def _encode_unit_tactical_into(
     melee_end = melee_start + MAX_UNITS_PER_SIDE
     buf[melee_start:melee_end] = melee_matchups * scale
 
-    # 167-169: tactical booleans written by encode_state_tactical caller
+    # 177-179: tactical booleans written by encode_state_tactical caller
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +813,20 @@ def encode_state_tactical(
     enemy_positions = _get_opposing_positions(enemy_units, player)
     friendly_positions = _get_opposing_positions(friendly_units, player)
 
+    # Advance distances for post-advance feature (0.0 for dead/missing slots)
+    enemy_advance_dists = [
+        float(enemy_units[i].unit.advance_distance)
+        if i < len(enemy_units) and enemy_units[i].models_alive > 0
+        else 0.0
+        for i in range(MAX_UNITS_PER_SIDE)
+    ]
+    friendly_advance_dists = [
+        float(friendly_units[i].unit.advance_distance)
+        if i < len(friendly_units) and friendly_units[i].models_alive > 0
+        else 0.0
+        for i in range(MAX_UNITS_PER_SIDE)
+    ]
+
     buf = np.zeros(TACTICAL_TOTAL_FEATURES, dtype=np.float32)
 
     # --- Friendly slots (0–9): TACTICAL_UNIT_FEATURES each ---
@@ -815,6 +838,7 @@ def encode_state_tactical(
             mm = friendly_melee_matchups[i] if i < len(friendly_melee_matchups) else _ZERO_MELEE_ROW
             _encode_unit_tactical_into(us, True, player, objectives, rm, mm,
                                        total_friendly_points, enemy_positions,
+                                       enemy_advance_dists,
                                        friendly_positions, buf, offset)
             if us.models_alive > 0:
                 if us.activated:
@@ -834,6 +858,7 @@ def encode_state_tactical(
             mm = enemy_melee_matchups[i] if i < len(enemy_melee_matchups) else _ZERO_MELEE_ROW
             _encode_unit_tactical_into(us, False, player, objectives, rm, mm,
                                        total_enemy_points, friendly_positions,
+                                       friendly_advance_dists,
                                        enemy_positions, buf, offset)
             if us.models_alive > 0:
                 if us.activated:

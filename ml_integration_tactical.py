@@ -443,18 +443,15 @@ def batched_argmax_tactical(
     enemy_alive_batch = torch.stack([r.enemy_alive_mask for r in requests]) # (N, 10)
 
     # Trunk
-    h = model.trunk(state_batch)                                            # (N, 128)
+    h, u_attended = model.trunk(state_batch)                                # (N, 512), (N, 20, 180)
 
     # Unit selection (argmax)
     unit_logits = model.unit_selection_head(h)                              # (N, 10)
     unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
     unit_indices = unit_logits.argmax(dim=-1)                               # (N,)
 
-    # Extract per-sample unit features
-    friendly_block = state_batch[:, :n_units * TACTICAL_UNIT_FEATURES].reshape(
-        n, n_units, TACTICAL_UNIT_FEATURES,
-    )
-    unit_features = friendly_block.gather(
+    # Extract per-sample unit features from attended embeddings
+    unit_features = u_attended[:, :n_units, :].gather(
         1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n, 1, TACTICAL_UNIT_FEATURES),
     ).squeeze(1).detach()                                                   # (N, UF)
 
@@ -720,7 +717,7 @@ def apply_tactical_model(
 
     # Auxiliary prediction heads (survival + objective control)
     if hasattr(model, 'aux_friendly_survival_head'):
-        h = model.trunk(state_vec.unsqueeze(0))  # (1, H)
+        h, _u = model.trunk(state_vec.unsqueeze(0))  # (1, H)
         fs_raw = model.aux_friendly_survival_head(h).view(MAX_UNITS_PER_SIDE, 2)
         fs_alpha = F.softplus(fs_raw[:, 0]) + 0.01
         fs_beta = F.softplus(fs_raw[:, 1]) + 0.01
@@ -797,7 +794,7 @@ def apply_tactical_model_sampling(
     am = alive_mask.unsqueeze(0)
 
     # --- Trunk ---
-    h = model.trunk(x)
+    h, u_attended = model.trunk(x)
 
     # --- Unit selection (sample) ---
     unit_logits = model.unit_selection_head(h)
@@ -806,7 +803,7 @@ def apply_tactical_model_sampling(
     selected_idx = int(torch.multinomial(unit_probs, 1).item())
     selected_unit = friendly_units[selected_idx]
 
-    unit_features = model._extract_unit_features(x, selected_idx).detach()
+    unit_features = model._extract_unit_features(u_attended, selected_idx).detach()
 
     # --- Move type head (sample) ---
     h_uf = torch.cat([h, unit_features], dim=-1)

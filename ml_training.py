@@ -594,7 +594,7 @@ def sample_tactical_actions_no_grad(
     am = alive_mask.unsqueeze(0)
 
     # --- Trunk ---
-    h = model.trunk(x)
+    h, u_attended = model.trunk(x)
 
     # --- Unit selection (sample) ---
     unit_logits = model.unit_selection_head(h)
@@ -603,7 +603,7 @@ def sample_tactical_actions_no_grad(
     unit_idx = int(torch.multinomial(unit_probs, 1).item())
     unit_lp = torch.log(unit_probs[unit_idx] + eps).item()
 
-    unit_features = model._extract_unit_features(x, unit_idx).detach()
+    unit_features = model._extract_unit_features(u_attended, unit_idx).detach()
 
     # --- Move type head (sample) ---
     h_uf = torch.cat([h, unit_features], dim=-1)
@@ -738,7 +738,7 @@ def _batched_sample_tactical_no_grad(
     enemy_alive_batch = torch.stack([r.enemy_alive_mask for r in requests]) # (N, 10)
 
     # Trunk
-    h = model.trunk(state_batch)                                            # (N, 128)
+    h, u_attended = model.trunk(state_batch)                                 # (N, 512), (N, 20, 180)
     if torch.isnan(h).any() or torch.isinf(h).any():
         print("  WARNING: NaN/Inf in trunk output during data collection — clamping")
         h = torch.nan_to_num(h, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -755,11 +755,8 @@ def _batched_sample_tactical_no_grad(
     unit_log_probs = torch.log_softmax(unit_logits, dim=-1)
     unit_lp = unit_log_probs.gather(1, unit_indices.unsqueeze(1)).squeeze(1)
 
-    # Extract per-sample unit features
-    friendly_block = state_batch[:, :n_units * TACTICAL_UNIT_FEATURES].reshape(
-        n, n_units, TACTICAL_UNIT_FEATURES,
-    )
-    unit_features = friendly_block.gather(
+    # Extract per-sample unit features from attended embeddings
+    unit_features = u_attended[:, :n_units, :].gather(
         1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n, 1, TACTICAL_UNIT_FEATURES),
     ).squeeze(1).detach()                                                   # (N, UF)
 
@@ -1418,9 +1415,6 @@ def _run_single_episode(model, opponent_model, res_a, res_b,
                         check_morale(target)
                         _sync_dead_models(target, board)
 
-            opp_alive = any(u.models_alive > 0 for u in opp_units)
-            if not opp_alive:
-                break
             current_is_a = not current_is_a
 
         # End of round: update objectives
@@ -1851,9 +1845,6 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                         check_morale(target)
                         _sync_dead_models(target, board)
 
-            opp_alive = any(u.models_alive > 0 for u in opp_units)
-            if not opp_alive:
-                break
             current_is_a = not current_is_a
 
         # End of round: update objectives
@@ -2367,9 +2358,6 @@ def _episode_tactical_generator(opponent_model, _opp_is_tactical,
                         check_morale(target)
                         _sync_dead_models(target, board)
 
-            opp_alive = any(u.models_alive > 0 for u in opp_units)
-            if not opp_alive:
-                break
             current_is_a = not current_is_a
 
         # End of round
@@ -2736,7 +2724,7 @@ def replay_tactical_log_probs_flat(
     enemy_alive_batch = torch.from_numpy(enemy_alive_np)
 
     # === Trunk ===
-    h = model.trunk(state_batch)                                  # (N, 128)
+    h, u_attended = model.trunk(state_batch)                      # (N, 512), (N, 20, 180)
     if torch.isnan(h).any() or torch.isinf(h).any():
         print("  WARNING: NaN/Inf in trunk output during replay — clamping")
         h = torch.nan_to_num(h, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -2745,12 +2733,9 @@ def replay_tactical_log_probs_flat(
     unit_logits = model.unit_selection_head(h)                    # (N, 10)
     unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
 
-    # === Extract unit features ===
+    # === Extract unit features from attended embeddings ===
     unit_indices = torch.tensor([s.unit_idx for s in flat_steps], dtype=torch.long)
-    friendly_block = state_batch[:, :n_units * TACTICAL_UNIT_FEATURES].reshape(
-        n_steps, n_units, TACTICAL_UNIT_FEATURES,
-    )
-    unit_features = friendly_block.gather(
+    unit_features = u_attended[:, :n_units, :].gather(
         1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n_steps, 1, TACTICAL_UNIT_FEATURES),
     ).squeeze(1).detach()
 
@@ -3354,9 +3339,6 @@ def _run_training_episode(
                         check_morale(target)
                         _sync_dead_models(target, board)
 
-            opp_alive = any(u.models_alive > 0 for u in opp_units)
-            if not opp_alive:
-                break
             current_is_a = not current_is_a
 
         # End of round: update objectives

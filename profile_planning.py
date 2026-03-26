@@ -153,7 +153,8 @@ def profile_components(model, hof_data):
         t0 = time.perf_counter()
         with torch.no_grad():
             x = state_vec.unsqueeze(0)
-            h = model.trunk(x).squeeze(0)
+            h, _u = model.trunk(x)
+            h = h.squeeze(0)
         trunk_times.append(time.perf_counter() - t0)
     print(f"2. Trunk forward: {statistics.mean(trunk_times)*1000:.3f}ms avg")
 

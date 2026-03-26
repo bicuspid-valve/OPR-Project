@@ -1,15 +1,19 @@
 """ML tactical model v2: PyTorch network for per-activation wargame decisions.
 
-Trunk architecture: 1024 → 512 → 512 → 512 (stem + 2 residual layers).
+Trunk architecture: self-attention over 20 unit embeddings (180-dim, 5 heads),
+then flatten + compress → 1024 → 512 + 2 residual layers.
 
 Sequential head chain with free movement:
     h                            → unit_selection_head   → (10,)
-    h ++ unit_feat(170)          → move_type_head        → (4,) hold/advance/rush/charge
+    h ++ unit_feat(180)          → move_type_head        → (4,) hold/advance/rush/charge
     h ++ unit_feat ++ move(4)    → direction_head        → (3,) sin, cos, log_conc
                                  → distance_head         → (2,) alpha_raw, beta_raw
     h ++ unit_feat ++ move(4)    → charge_target_head    → (10,)
     h ++ unit_feat ++ move(4)
       ++ post_move_rel(30)       → shoot_target_head     → (10,)
+
+unit_feat is the attended embedding for the selected unit (180-dim, enriched by
+cross-unit attention) rather than raw input features.
 """
 from __future__ import annotations
 
@@ -19,7 +23,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ml_features import TACTICAL_TOTAL_FEATURES, MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES
+from ml_features import (
+    TACTICAL_TOTAL_FEATURES, MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES,
+    GLOBAL_FEATURES,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -29,8 +36,11 @@ TRUNK_STEM = 1024
 TRUNK_WIDTH = 512
 N_FRIENDLY = MAX_UNITS_PER_SIDE   # 10
 N_ENEMY = MAX_UNITS_PER_SIDE      # 10
+N_TOTAL_UNITS = N_FRIENDLY + N_ENEMY  # 20
 NUM_MOVE_TYPES = 4                # 0=hold, 1=advance, 2=rush, 3=charge
 POST_MOVE_REL_FEATURES = N_ENEMY * 3  # 30: (sin θ, cos θ, dist) per enemy from post-move pos
+ATTN_DIM = TACTICAL_UNIT_FEATURES    # 180 — attend over raw feature dim
+ATTN_HEADS = 5                       # 180 / 5 = 36 dims per head
 
 # Movement type indices
 MOVE_HOLD = 0
@@ -64,7 +74,8 @@ class TacticalModel(nn.Module):
     Input:  (batch, TACTICAL_TOTAL_FEATURES) encoded game state
     Output: TacticalModelOutput
 
-    Trunk: 1024 → 512 → 512 → 512 (stem compresses input, then 2 residual layers).
+    Trunk: self-attention over 20 units (180-dim, 5 heads) → flatten →
+           1024 → 512 + 2 residual layers.
     All heads always produce outputs (no conditional execution during forward).
     The integration layer decides which outputs to use based on move_type.
     """
@@ -72,9 +83,16 @@ class TacticalModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
-        # Stem: compress input to trunk width
+        # Self-attention over 20 unit embeddings (180-dim each)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=ATTN_DIM, num_heads=ATTN_HEADS, batch_first=True,
+        )
+        self.attn_norm = nn.LayerNorm(ATTN_DIM)
+
+        # Stem: flatten attended units + global → compress to trunk width
+        attn_flat = N_TOTAL_UNITS * ATTN_DIM + GLOBAL_FEATURES  # 20*180 + 11 = 3611
         self.stem = nn.Sequential(
-            nn.Linear(TACTICAL_TOTAL_FEATURES, TRUNK_STEM),
+            nn.Linear(attn_flat, TRUNK_STEM),
             nn.LayerNorm(TRUNK_STEM),
             nn.ReLU(),
             nn.Linear(TRUNK_STEM, TRUNK_WIDTH),
@@ -95,7 +113,7 @@ class TacticalModel(nn.Module):
         )
 
         H = TRUNK_WIDTH  # 512
-        UF = TACTICAL_UNIT_FEATURES  # 170
+        UF = TACTICAL_UNIT_FEATURES  # 180
 
         # 1) Unit selection: h → 10 logits
         self.unit_selection_head = nn.Linear(H, N_FRIENDLY)
@@ -126,25 +144,43 @@ class TacticalModel(nn.Module):
         # Objective control: 5 objectives × 3 classes (friendly/enemy/neutral)
         self.aux_obj_control_head = nn.Linear(H, 5 * 3)
 
-    def trunk(self, x: torch.Tensor) -> torch.Tensor:
-        """Run input through stem + residual blocks.
+    def trunk(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run input through attention + stem + residual blocks.
 
-        Exposed as a method (not nn.Sequential) so that callers which
-        previously accessed model.trunk(x) continue to work unchanged.
+        Returns
+        -------
+        h : (batch, 512) — global trunk representation
+        u_attended : (batch, 20, 180) — per-unit attended embeddings
         """
-        h = self.stem(x)
+        # Reshape flat input into unit blocks + global features
+        unit_block = x[..., :N_TOTAL_UNITS * TACTICAL_UNIT_FEATURES]
+        glob = x[..., N_TOTAL_UNITS * TACTICAL_UNIT_FEATURES:]  # (batch, 11)
+
+        # (batch, 20, 180)
+        units = unit_block.reshape(*x.shape[:-1], N_TOTAL_UNITS, ATTN_DIM)
+
+        # Self-attention with residual + LayerNorm
+        u_attn, _ = self.attn(units, units, units)
+        u_attended = self.attn_norm(units + u_attn)  # (batch, 20, 180)
+
+        # Flatten attended units + global → stem → residual blocks
+        flat = torch.cat([u_attended.flatten(-2), glob], dim=-1)
+        h = self.stem(flat)
         h = h + self.res_block_1(h)
         h = h + self.res_block_2(h)
-        return h
+        return h, u_attended
 
-    def _extract_unit_features(self, x: torch.Tensor, unit_idx: int) -> torch.Tensor:
-        """Extract the feature slice for friendly unit *unit_idx*.
+    def _extract_unit_features(self, u_attended: torch.Tensor, unit_idx: int) -> torch.Tensor:
+        """Extract the attended embedding for friendly unit *unit_idx*.
+
+        Parameters
+        ----------
+        u_attended : (batch, 20, 180) or (20, 180) — attended unit embeddings
+        unit_idx : friendly unit slot (0–9)
 
         Works for both single and batched inputs.
         """
-        start = unit_idx * TACTICAL_UNIT_FEATURES
-        end = start + TACTICAL_UNIT_FEATURES
-        return x[..., start:end]
+        return u_attended[..., unit_idx, :]
 
     def _run_conditioned_heads(
         self,
@@ -234,7 +270,7 @@ class TacticalModel(nn.Module):
             if post_move_rel is not None and post_move_rel.dim() == 1:
                 post_move_rel = post_move_rel.unsqueeze(0)
 
-        h = self.trunk(x)  # (batch, 512)
+        h, u_attended = self.trunk(x)  # (batch, 512), (batch, 20, 180)
 
         # --- Unit selection ---
         unit_logits = self.unit_selection_head(h)  # (batch, 10)
@@ -246,7 +282,7 @@ class TacticalModel(nn.Module):
         else:
             chosen_idx = unit_logits.detach()[0].argmax(dim=-1).item()
 
-        unit_features = self._extract_unit_features(x, chosen_idx)
+        unit_features = self._extract_unit_features(u_attended, chosen_idx)
 
         # --- Conditioned head chain ---
         move_logits, direction_params, distance_params, charge_logits, shoot_logits = (
@@ -280,7 +316,7 @@ class TacticalModel(nn.Module):
     def forward_per_unit(
         self,
         h: torch.Tensor,
-        x: torch.Tensor,
+        u_attended: torch.Tensor,
         unit_indices: list[int],
         enemy_alive_mask: torch.Tensor,
         post_move_rel: torch.Tensor | None = None,
@@ -290,7 +326,7 @@ class TacticalModel(nn.Module):
         Parameters
         ----------
         h : (512,) — pre-computed trunk output (single, unbatched)
-        x : (TACTICAL_TOTAL_FEATURES,) — full state vec for extracting unit features
+        u_attended : (20, 180) — attended unit embeddings from trunk
         unit_indices : which friendly unit slots to evaluate
         enemy_alive_mask : (10,) — enemy alive mask
         post_move_rel : (30,) — post-move relative features (or None for zeros)
@@ -303,7 +339,7 @@ class TacticalModel(nn.Module):
         value = self.value_head(h).squeeze(-1)  # scalar, shared across all candidates
 
         for uid in unit_indices:
-            unit_features = self._extract_unit_features(x, uid)
+            unit_features = self._extract_unit_features(u_attended, uid)
 
             move_logits, direction_params, distance_params, charge_logits, shoot_logits = (
                 self._run_conditioned_heads(h, unit_features, enemy_alive_mask, post_move_rel)

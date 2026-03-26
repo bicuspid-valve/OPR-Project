@@ -136,7 +136,7 @@ class TestTacticalShape:
         fu, eu, board = _simple_game_state()
         vec = encode_state_tactical(fu, eu, 1, board, "A")
         assert vec.shape == (TACTICAL_TOTAL_FEATURES,)
-        assert vec.shape[0] == 3411
+        assert vec.shape[0] == 3611
 
     def test_dtype_float32(self):
         fu, eu, board = _simple_game_state()
@@ -144,10 +144,10 @@ class TestTacticalShape:
         assert vec.dtype == torch.float32
 
     def test_feature_count_constant(self):
-        """TACTICAL_TOTAL_FEATURES = 20 * 170 + 11 = 3411."""
-        assert TACTICAL_UNIT_FEATURES == 170  # 87 base + 70 ranged + 10 melee + 3 bools
+        """TACTICAL_TOTAL_FEATURES = 20 * 180 + 11 = 3611."""
+        assert TACTICAL_UNIT_FEATURES == 180  # 87 base + 70 ranged + 10 melee + 10 post-adv + 3 bools
         assert TACTICAL_TOTAL_FEATURES == MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES + GLOBAL_FEATURES
-        assert TACTICAL_TOTAL_FEATURES == 3411
+        assert TACTICAL_TOTAL_FEATURES == 3611
 
 
 # ===========================================================================
