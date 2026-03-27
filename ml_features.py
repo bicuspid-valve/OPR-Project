@@ -1,4 +1,4 @@
-"""ML feature extraction: encode game state as a fixed-size tensor for the strategic model."""
+"""ML feature extraction: encode game state as a fixed-size tensor for the tactical model."""
 from __future__ import annotations
 
 import math
@@ -22,14 +22,10 @@ MAX_UNITS_PER_SIDE = 10
 RANGE_THRESHOLDS = [6, 9, 12, 18, 24, 30, 36]
 NUM_RANGE_THRESHOLDS = len(RANGE_THRESHOLDS)
 
-# Per-unit: 10 basic + 2 position + 5 obj-dist + 10 enemy-dist
-#         + (NUM_RANGE_THRESHOLDS * MAX_UNITS_PER_SIDE) ranged + 10 melee
-UNIT_FEATURES = 10 + 2 + 5 + MAX_UNITS_PER_SIDE + NUM_RANGE_THRESHOLDS * MAX_UNITS_PER_SIDE + MAX_UNITS_PER_SIDE  # 107
 # 4 (round one-hot) + 5 (objective control) + 2 (points) = 11 global values
 GLOBAL_FEATURES = 11
-TOTAL_FEATURES = MAX_UNITS_PER_SIDE * 2 * UNIT_FEATURES + GLOBAL_FEATURES  # 2151
 
-# Tactical model (v2): egocentric (sin θ, cos θ, dist) for objectives and enemies
+# Tactical model: egocentric (sin θ, cos θ, dist) for objectives and enemies
 # Per-unit: 10 basic + 2 position + 15 obj-rel + 30 enemy-rel + 30 same-side-rel
 #         + 70 ranged + 10 melee + 10 opp-post-advance-dist
 #         + has_activated + fatigued + is_shaken = 180
@@ -66,13 +62,6 @@ _MAX_SPEED = 24.0
 _ZERO_RANGED_ROW = np.zeros((MAX_UNITS_PER_SIDE, NUM_RANGE_THRESHOLDS), dtype=np.float32)
 _ZERO_MELEE_ROW = np.zeros(MAX_UNITS_PER_SIDE, dtype=np.float32)
 
-# Feature offset constants within a unit block
-_OFF_SCALARS = 0       # 10 scalars
-_OFF_POS = 10          # 2 position
-_OFF_OBJ_DIST = 12     # 5 objective distances
-_OFF_OPP_DIST = 17     # 10 opposing unit distances
-_OFF_RANGED = 27       # 70 ranged matchup values (10 enemies × 7 thresholds)
-_OFF_MELEE = _OFF_RANGED + MAX_UNITS_PER_SIDE * NUM_RANGE_THRESHOLDS  # 97, 10 melee values
 
 
 # ---------------------------------------------------------------------------
@@ -409,99 +398,6 @@ def _survival_fraction(us: UnitState) -> float:
     return us.models_alive / max(unit.models, 1)
 
 
-def _encode_unit_into(
-    us: UnitState,
-    is_friendly: bool,
-    player: str,
-    objectives: list[tuple[float, float]],
-    ranged_matchups: np.ndarray,
-    melee_matchups: np.ndarray,
-    total_side_points: int,
-    opposing_positions: list[tuple[float, float]],
-    buf: np.ndarray,
-    offset: int,
-) -> None:
-    """Write UNIT_FEATURES floats into buf[offset:offset+UNIT_FEATURES].
-
-    buf must be zero-initialized; dead units are left as zeros.
-
-    Features layout:
-      0       Wound count (normalised)
-      1       Model count (normalised)
-      2       Speed (normalised, 0 for artillery)
-      3       Survival fraction
-      4       Points fraction
-      5       Flying
-      6       Artillery
-      7       Fearless
-      8       Fear
-      9       Is friendly
-      10-11   Position (x, y)
-      12-16   Distance to 5 objectives
-      17-26   Distance to each of 10 opposing unit slots
-      27-96   Ranged kill proportion at 7 range thresholds × 10 enemy slots
-              (scaled by survival)
-      97-106  Melee kill proportion vs each of 10 enemy slots (scaled by survival)
-    """
-    if us.models_alive <= 0:
-        return  # buf is zero-initialized
-
-    unit = us.unit
-
-    # Position (flip x and y for Player B — 180° rotation)
-    cx, cy = us.centre()
-    if player == "B":
-        cx = _flip_x(cx)
-        cy = _flip_y(cy)
-
-    # 0-9  Scalar features (batch-assign as a list → single C-level copy)
-    wound_count = unit.tough if unit.tough > 0 else 1
-    buf[offset:offset + 10] = [
-        wound_count / _MAX_TOUGH,
-        unit.models / _MAX_MODELS,
-        (0.0 if unit.artillery else float(unit.rush_distance)) / _MAX_SPEED,
-        _survival_fraction(us),
-        unit.points / max(total_side_points, 1),
-        1.0 if unit.flying else 0.0,
-        1.0 if unit.artillery else 0.0,
-        1.0 if unit.fearless else 0.0,
-        1.0 if unit.fear > 0 else 0.0,
-        1.0 if is_friendly else 0.0,
-    ]
-
-    # 10-11  Position (cell-centre normalization: flip produces exactly 1−v,
-    #         eliminating the A/B side information leak on even-dimension grids)
-    buf[offset + _OFF_POS] = (cx + 0.5) / float(COLS)
-    buf[offset + _OFF_POS + 1] = (cy + 0.5) / float(ROWS)
-
-    # 12-16  Distance to each objective (model's coordinate frame)
-    if _fc.USE_C_EXT:
-        obj_dists = _fc.fast_encode_distances(cx, cy, objectives, _INV_BOARD_DIAG)
-        buf[offset + _OFF_OBJ_DIST:offset + _OFF_OBJ_DIST + len(obj_dists)] = obj_dists
-        opp_dists = _fc.fast_encode_distances(cx, cy, opposing_positions, _INV_BOARD_DIAG)
-        buf[offset + _OFF_OPP_DIST:offset + _OFF_OPP_DIST + len(opp_dists)] = opp_dists
-    else:
-        o = offset + _OFF_OBJ_DIST
-        for ox, oy in objectives:
-            buf[o] = math.sqrt((cx - ox) ** 2 + (cy - oy) ** 2) * _INV_BOARD_DIAG
-            o += 1
-        o = offset + _OFF_OPP_DIST
-        for ox, oy in opposing_positions:
-            buf[o] = math.sqrt((cx - ox) ** 2 + (cy - oy) ** 2) * _INV_BOARD_DIAG
-            o += 1
-
-    # 27-96  Ranged matchup kill proportions — vectorized numpy multiply
-    scale = us.models_alive / max(unit.models, 1)
-    ranged_start = offset + _OFF_RANGED
-    ranged_end = ranged_start + MAX_UNITS_PER_SIDE * NUM_RANGE_THRESHOLDS
-    buf[ranged_start:ranged_end] = ranged_matchups.ravel() * scale
-
-    # 97-106  Melee matchup kill proportions — vectorized numpy multiply
-    melee_start = offset + _OFF_MELEE
-    melee_end = melee_start + MAX_UNITS_PER_SIDE
-    buf[melee_start:melee_end] = melee_matchups * scale
-
-
 def _encode_unit_tactical_into(
     us: UnitState,
     is_friendly: bool,
@@ -656,101 +552,6 @@ def _get_opposing_positions(
         else:
             positions.append(_DEAD_SENTINEL)
     return positions
-
-
-# ---------------------------------------------------------------------------
-# Full state encoding
-# ---------------------------------------------------------------------------
-
-def encode_state(
-    friendly_units: list[UnitState],
-    enemy_units: list[UnitState],
-    round_num: int,
-    board: Board,
-    player: str,
-    *,
-    friendly_ranged_matchups: np.ndarray | None = None,
-    friendly_melee_matchups: np.ndarray | None = None,
-    enemy_ranged_matchups: np.ndarray | None = None,
-    enemy_melee_matchups: np.ndarray | None = None,
-    total_friendly_points: int | None = None,
-    total_enemy_points: int | None = None,
-) -> torch.Tensor:
-    """Encode the full game state into a fixed-size tensor.
-
-    Parameters
-    ----------
-    friendly_units : units controlled by *player*
-    enemy_units : opponent's units
-    round_num : 1–4
-    board : current Board state
-    player : "A" or "B"
-    friendly_ranged_matchups / friendly_melee_matchups : precomputed via precompute_damage()
-    enemy_ranged_matchups / enemy_melee_matchups : precomputed for enemy side
-    total_friendly_points / total_enemy_points : starting army-point totals
-    """
-    # Derive totals if not provided
-    if total_friendly_points is None:
-        total_friendly_points = sum(u.unit.points for u in friendly_units)
-    if total_enemy_points is None:
-        total_enemy_points = sum(u.unit.points for u in enemy_units)
-
-    # Derive matchup matrices if not provided (slower path)
-    if friendly_ranged_matchups is None or friendly_melee_matchups is None:
-        fr, fm = precompute_damage(
-            [u.unit for u in friendly_units],
-            [u.unit for u in enemy_units],
-        )
-        friendly_ranged_matchups = friendly_ranged_matchups if friendly_ranged_matchups is not None else fr
-        friendly_melee_matchups = friendly_melee_matchups if friendly_melee_matchups is not None else fm
-    if enemy_ranged_matchups is None or enemy_melee_matchups is None:
-        er, em = precompute_damage(
-            [u.unit for u in enemy_units],
-            [u.unit for u in friendly_units],
-        )
-        enemy_ranged_matchups = enemy_ranged_matchups if enemy_ranged_matchups is not None else er
-        enemy_melee_matchups = enemy_melee_matchups if enemy_melee_matchups is not None else em
-
-    objectives = _get_model_objectives(player)
-    enemy_positions = _get_opposing_positions(enemy_units, player)
-    friendly_positions = _get_opposing_positions(friendly_units, player)
-
-    buf = np.zeros(TOTAL_FEATURES, dtype=np.float32)
-
-    # --- Friendly slots (0–9) ---
-    for i in range(MAX_UNITS_PER_SIDE):
-        offset = i * UNIT_FEATURES
-        if i < len(friendly_units):
-            rm = friendly_ranged_matchups[i] if i < len(friendly_ranged_matchups) else _ZERO_RANGED_ROW
-            mm = friendly_melee_matchups[i] if i < len(friendly_melee_matchups) else _ZERO_MELEE_ROW
-            _encode_unit_into(friendly_units[i], True, player, objectives, rm, mm,
-                              total_friendly_points, enemy_positions, buf, offset)
-
-    # --- Enemy slots (10–19) ---
-    enemy_base = MAX_UNITS_PER_SIDE * UNIT_FEATURES
-    for i in range(MAX_UNITS_PER_SIDE):
-        offset = enemy_base + i * UNIT_FEATURES
-        if i < len(enemy_units):
-            rm = enemy_ranged_matchups[i] if i < len(enemy_ranged_matchups) else _ZERO_RANGED_ROW
-            mm = enemy_melee_matchups[i] if i < len(enemy_melee_matchups) else _ZERO_MELEE_ROW
-            _encode_unit_into(enemy_units[i], False, player, objectives, rm, mm,
-                              total_enemy_points, friendly_positions, buf, offset)
-
-    # --- Global features (11) ---
-    g = MAX_UNITS_PER_SIDE * 2 * UNIT_FEATURES
-    # Round one-hot (4)
-    buf[g + round_num - 1] = 1.0
-    # Objective control (5)
-    buf[g + 4:g + 9] = _objective_control_mapped(board, player)
-    # Friendly points remaining
-    alive_f = sum(u.unit.points for u in friendly_units if u.models_alive > 0)
-    buf[g + 9] = alive_f / max(total_friendly_points, 1)
-    # Enemy points remaining
-    alive_e = sum(u.unit.points for u in enemy_units if u.models_alive > 0)
-    buf[g + 10] = alive_e / max(total_enemy_points, 1)
-
-    assert len(buf) == TOTAL_FEATURES
-    return torch.from_numpy(buf)
 
 
 # ---------------------------------------------------------------------------

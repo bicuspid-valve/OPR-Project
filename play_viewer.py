@@ -27,7 +27,6 @@ from ai import (
 from game import (
     deploy_armies, _sync_dead_models, _collect_enemy_positions,
     _make_unit_labels, _snapshot, _base_name, _kite_range_params,
-    _is_tactical_model,
 )
 from ml_planning import snapshot_game_state, restore_game_state
 from simulation import (

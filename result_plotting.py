@@ -58,8 +58,9 @@ def block_average(data: dict, col: str, block_size: int):
 
 
 def main():
+    user_size = int(input("Please enter block size: "))
     csv_path = sys.argv[1] if len(sys.argv) > 1 else "ml_logs/training_tactical.csv"
-    block_size = int(sys.argv[2]) if len(sys.argv) > 2 else 10
+    block_size = int(sys.argv[2]) if len(sys.argv) > 2 else user_size
 
     path = pathlib.Path(__file__).parent / csv_path
     if not path.exists():

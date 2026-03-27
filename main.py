@@ -331,19 +331,11 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
         model_path = Path(__file__).resolve().parent / "ml_checkpoints" / "final_model.pt"
         if not model_path.exists():
             raise FileNotFoundError(f"ML model not found: {model_path}")
-        # Detect model type: try tactical first (has unit_selection_head), fall back to strategic
         from ml_model_tactical import TacticalModel
-        from ml_model import StrategicModel
         sd = load_model_state_dict(model_path)
-        # Detect model type by checking for tactical-only keys in the checkpoint
-        if "unit_selection_head.weight" in sd:
-            test_model = TacticalModel()
-            test_model.load_state_dict(sd, strict=False)
-            ml_model_type = "tactical"
-        else:
-            test_model = StrategicModel()
-            test_model.load_state_dict(sd, strict=False)
-            ml_model_type = "strategic"
+        test_model = TacticalModel()
+        test_model.load_state_dict(sd, strict=False)
+        ml_model_type = "tactical"
         del test_model
         ml_model_path = str(model_path)
         print(f"ML model loaded: {ml_model_type} ({model_path.name})")
@@ -604,12 +596,8 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
     if graphic:
         ml_model = None
         if use_ml and ml_model_path is not None:
-            if ml_model_type == "tactical":
-                from ml_model_tactical import TacticalModel
-                ml_model = TacticalModel()
-            else:
-                from ml_model import StrategicModel
-                ml_model = StrategicModel()
+            from ml_model_tactical import TacticalModel
+            ml_model = TacticalModel()
             ml_model.load_state_dict(
                 load_model_state_dict(ml_model_path), strict=False)
             ml_model.eval()
@@ -660,14 +648,15 @@ def _run_showcase_game(top_army: ArmyList, mode: str = "objectives",
 
 def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
              time_limit: float | None = None,
-             model_type: str = "strategic",
+             model_type: str = "tactical",
              use_c_ext: bool = True,
              restart_training: bool = False,
              entropy_coeff_start: float = 0.01,
              entropy_coeff_end: float = 0.01,
              memory_max: str | None = None,
              memory_swap_max: str | None = None,
-             worker_count: int | None = None):
+             worker_count: int | None = 6,
+             device: str = "auto"):
     """Run a short ML training run and print summary stats.
 
     use_c_ext: if True (default), use the compiled C extension for hot loops
@@ -724,6 +713,7 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
         entropy_coeff_start=entropy_coeff_start,
         entropy_coeff_end=entropy_coeff_end,
         worker_count=worker_count,
+        device=device,
     )
     model, metrics = run_training(config=config, verbose=verbose,
                                    restart=restart_training)
@@ -740,8 +730,8 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
 
 
 if __name__ == "__main__":
-    ml_train(num_batches=300000, batch_size=512, time_limit=180, model_type="tactical", use_c_ext=True, restart_training=False, memory_max="12G", memory_swap_max="2G", worker_count = 6)
+    #ml_train(num_batches=300000, batch_size=512, time_limit=540, model_type="tactical", use_c_ext=True, restart_training=False, memory_max="14G", memory_swap_max="2G", worker_count = 6)
     #ml_train(num_batches=3, batch_size=256, time_limit=2, model_type="tactical", use_c_ext=False)  # pure Python
     #run_list_evolution(graphic=True, mode="objectives", enforce_forceorg=True, use_ml=True, ml_batch_tactical=False, restart_evolution=False, use_c_ext=True)
-    #from play_viewer import play_interactive
-    #play_interactive()
+    from play_viewer import play_interactive
+    play_interactive()

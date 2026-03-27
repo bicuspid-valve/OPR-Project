@@ -12,7 +12,6 @@ import random
 import time
 from pathlib import Path
 
-from ml_model import StrategicModel
 from ml_training import load_model_state_dict
 from ml_model_tactical import TacticalModel
 from evolution import make_entry, resolve_army, _make_unit_states
@@ -124,13 +123,8 @@ if __name__ == "__main__":
     # Load model
     checkpoint_path = _DIR / "ml_checkpoints" / "final_model.pt"
     state_dict = load_model_state_dict(checkpoint_path)
-    is_tactical = any(k.startswith("unit_selection_head") for k in state_dict)
-    if is_tactical:
-        model = TacticalModel()
-        model_label = "tactical"
-    else:
-        model = StrategicModel()
-        model_label = "strategic"
+    model = TacticalModel()
+    model_label = "tactical"
     model.load_state_dict(state_dict, strict=False)
     model.eval()
     print(f"Loaded {model_label} model from {checkpoint_path}")

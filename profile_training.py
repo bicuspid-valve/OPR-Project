@@ -12,13 +12,14 @@ import torch.multiprocessing as _mp
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 from ml_training import (
-    TrainingConfig, StrategicModel, CheckpointPool, EMABaseline,
+    TrainingConfig, CheckpointPool, EMABaseline,
     TrainingMetrics, get_heuristic_fraction,
     _generate_army_pair, _collect_episodes_shared_worker, _init_shared_worker,
-    replay_log_probs_batch, compute_loss,
-    sample_actions_no_grad, _WORKER_COUNT, _MAX_SHARED_OPPONENTS,
+    replay_tactical_log_probs_flat, compute_loss_flat, compute_gae,
+    _WORKER_COUNT, _MAX_SHARED_OPPONENTS,
 )
-from ml_features import encode_state, precompute_damage
+from ml_model_tactical import TacticalModel
+from ml_features import encode_state_tactical, precompute_damage
 
 
 def profile_training(num_batches=5, batch_size=16):
@@ -26,7 +27,7 @@ def profile_training(num_batches=5, batch_size=16):
     print(f"Batches: {num_batches}, Batch size: {batch_size}, Workers: {_WORKER_COUNT}")
     print()
 
-    model = StrategicModel()
+    model = TacticalModel()
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
@@ -37,12 +38,12 @@ def profile_training(num_batches=5, batch_size=16):
     checkpoint_pool.save(model, 0)
 
     # Shared-memory pool
-    shared_model = StrategicModel()
+    shared_model = TacticalModel()
     shared_model.share_memory()
     shared_model.eval()
     shared_opponents = []
     for _ in range(_MAX_SHARED_OPPONENTS):
-        m = StrategicModel()
+        m = TacticalModel()
         m.share_memory()
         m.eval()
         shared_opponents.append(m)
@@ -86,9 +87,9 @@ def profile_training(num_batches=5, batch_size=16):
     encode_times = []
     for _ in range(50):
         t0 = time.perf_counter()
-        encode_state(states_a, states_b, 1, board, "A")
+        encode_state_tactical(states_a, states_b, 1, board, "A")
         encode_times.append(time.perf_counter() - t0)
-    print(f"  encode_state: {statistics.mean(encode_times)*1000:.2f}ms avg")
+    print(f"  encode_state_tactical: {statistics.mean(encode_times)*1000:.2f}ms avg")
 
     # Profile precompute_damage
     damage_times = []
@@ -100,7 +101,7 @@ def profile_training(num_batches=5, batch_size=16):
 
     # Profile model forward pass
     print("\n--- Profiling model forward pass ---")
-    state_vec = encode_state(states_a, states_b, 1, board, "A")
+    state_vec = encode_state_tactical(states_a, states_b, 1, board, "A")
     fwd_times = []
     for _ in range(100):
         t0 = time.perf_counter()
@@ -180,17 +181,25 @@ def profile_training(num_batches=5, batch_size=16):
         t0 = time.perf_counter()
         model.train()
         all_trajs = [t[0] for t in trajectories]
-        all_records = replay_log_probs_batch(model, all_trajs)
+        flat_result = replay_tactical_log_probs_flat(model, all_trajs)
         replay_time = time.perf_counter() - t0
         phase_times["replay_logprobs"].append(replay_time)
 
         # Phase 4: Loss + backward
         t0 = time.perf_counter()
-        episodes = []
-        for (_, result, opp_type), recs in zip(trajectories, all_records):
-            episodes.append((recs, opp_type))
+        for traj_tuple in trajectories:
+            result = traj_tuple[1]
+            opp_type = traj_tuple[2]
             metrics.record_game(result, opp_type)
-        loss, loss_metrics = compute_loss(episodes, baseline_h, baseline_s, 0.01)
+        all_advantages, all_returns = compute_gae(all_trajs)
+        # Flatten advantages/returns
+        flat_advantages = torch.tensor([a for ep in all_advantages for a in ep], dtype=torch.float32)
+        flat_returns = torch.tensor([r for ep in all_returns for r in ep], dtype=torch.float32)
+        flat_old_lp = torch.tensor(
+            [step.old_log_prob for traj in all_trajs for step in traj], dtype=torch.float32)
+        loss, loss_metrics = compute_loss_flat(
+            flat_result, flat_old_lp, flat_advantages, flat_returns,
+            clip_epsilon=0.2, value_coeff=0.5, entropy_coeff=0.01)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()

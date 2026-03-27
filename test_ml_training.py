@@ -9,18 +9,13 @@ import torch
 
 from board import Board
 from models import ResolvedUnit, UnitState, Weapon
-from ml_model import StrategicModel
+from ml_model_tactical import TacticalModel
 from ml_training import (
     TrainingConfig,
     EMABaseline,
     CheckpointPool,
-    RoundRecord,
-    TrajectoryRound,
     compute_round_reward,
     terminal_reward,
-    sample_actions_and_record,
-    compute_loss,
-    compute_gae,
     get_heuristic_fraction,
     run_training,
     TrainingMetrics,
@@ -316,7 +311,7 @@ class TestOpponentScheduling:
 class TestCheckpointPool:
     def test_save_and_load(self, tmp_path):
         pool = CheckpointPool(max_size=5, save_dir=str(tmp_path / "ckpts"))
-        model = StrategicModel()
+        model = TacticalModel()
         torch.manual_seed(42)
 
         pool.save(model, 0)
@@ -326,17 +321,17 @@ class TestCheckpointPool:
         assert opponent is not None
 
         # Loaded model should produce same outputs
-        from ml_features import TOTAL_FEATURES
-        x = torch.randn(TOTAL_FEATURES)
+        from ml_features import TACTICAL_TOTAL_FEATURES
+        x = torch.randn(TACTICAL_TOTAL_FEATURES)
         with torch.no_grad():
             orig_out = model(x)
             loaded_out = opponent(x)
-        for o, l in zip(orig_out, loaded_out):
-            assert torch.allclose(o, l, atol=1e-6)
+        assert torch.allclose(orig_out.value, loaded_out.value, atol=1e-6)
+        assert torch.allclose(orig_out.move_logits, loaded_out.move_logits, atol=1e-6)
 
     def test_eviction(self, tmp_path):
         pool = CheckpointPool(max_size=3, save_dir=str(tmp_path / "ckpts"))
-        model = StrategicModel()
+        model = TacticalModel()
 
         for i in range(5):
             pool.save(model, i)
@@ -352,101 +347,7 @@ class TestCheckpointPool:
 
 
 # ---------------------------------------------------------------------------
-# 6. Action sampling produces valid log-probs
-# ---------------------------------------------------------------------------
-
-class TestActionSampling:
-    def test_sampling_produces_record(self):
-        """sample_actions_and_record should return a RoundRecord with finite values."""
-        torch.manual_seed(42)
-        model = StrategicModel()
-
-        army_a, army_b = _build_test_armies()
-        units_a = [_make_unit_state(r, owner="A",
-                                    positions=[(10 + j, 5) for j in range(r.models)])
-                   for r in army_a]
-
-        from ml_features import TOTAL_FEATURES
-        x = torch.randn(TOTAL_FEATURES)
-        role_probs, obj_probs, target_priority, act_scores, combat_prefs, stance_probs, _value = model(x)
-
-        mults, record = sample_actions_and_record(
-            role_probs, obj_probs, target_priority, act_scores,
-            combat_prefs, stance_probs, units_a, "A",
-        )
-
-        assert record.log_prob.isfinite()
-        assert record.entropy.isfinite()
-        assert record.entropy.item() > 0  # should have some entropy
-        assert len(mults) == 10
-
-
-# ---------------------------------------------------------------------------
-# 7. Compute loss
-# ---------------------------------------------------------------------------
-
-class TestComputeLoss:
-    def test_loss_is_finite(self):
-        """Loss computation should produce a finite scalar."""
-        torch.manual_seed(42)
-        record = RoundRecord(
-            log_prob=torch.tensor(-1.5, requires_grad=True),
-            entropy=torch.tensor(0.5),
-            reward=0.3,
-            value=torch.tensor(0.1, requires_grad=True),
-        )
-        traj_round = TrajectoryRound(
-            state_vec=[0.0] * 591,
-            unit_actions=[(0, 0, 0, 0)] * 10,
-            unit_alive_mask=[False] * 10,
-            reward=0.3,
-            old_log_prob=-1.5,
-            old_value=0.0,
-        )
-        episodes = [([record], "heuristic")]
-        all_trajs = [[traj_round]]
-        all_advantages, all_returns = compute_gae(all_trajs)
-
-        loss, metrics = compute_loss(
-            episodes, all_trajs, all_advantages, all_returns,
-            clip_epsilon=0.2, value_coeff=0.5, entropy_coeff=0.01,
-        )
-        assert loss.isfinite()
-        assert "loss" in metrics
-        assert "mean_entropy" in metrics
-        assert "mean_reward" in metrics
-        assert "value_loss" in metrics
-
-    def test_loss_requires_grad(self):
-        """Loss should be differentiable."""
-        record = RoundRecord(
-            log_prob=torch.tensor(-1.0, requires_grad=True),
-            entropy=torch.tensor(0.5),
-            reward=1.0,
-            value=torch.tensor(0.2, requires_grad=True),
-        )
-        traj_round = TrajectoryRound(
-            state_vec=[0.0] * 591,
-            unit_actions=[(0, 0, 0, 0)] * 10,
-            unit_alive_mask=[False] * 10,
-            reward=1.0,
-            old_log_prob=-1.0,
-            old_value=0.0,
-        )
-        episodes = [([record], "heuristic")]
-        all_trajs = [[traj_round]]
-        all_advantages, all_returns = compute_gae(all_trajs)
-
-        loss, _ = compute_loss(
-            episodes, all_trajs, all_advantages, all_returns,
-            clip_epsilon=0.2, value_coeff=0.5, entropy_coeff=0.01,
-        )
-        loss.backward()
-        assert record.log_prob.grad is not None
-
-
-# ---------------------------------------------------------------------------
-# 8. Metrics tracking
+# 6. Metrics tracking
 # ---------------------------------------------------------------------------
 
 class TestMetricsTracking:

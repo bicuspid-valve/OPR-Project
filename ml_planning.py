@@ -594,7 +594,7 @@ def _batched_argmax_forward(
     enemy_batch = torch.stack([r.enemy_alive_mask for r in requests]) # (B, 10)
 
     # Trunk (single pass)
-    h, u_attended = model.trunk(state_batch)                           # (B, 512), (B, 20, 180)
+    h, u_attended, _attn_w, _round_oh = model.trunk(state_batch)         # (B, 512), (B, 20, 180)
 
     # Unit selection — argmax
     unit_logits = model.unit_selection_head(h)                         # (B, 10)
@@ -673,7 +673,7 @@ def _batched_argmax_forward(
     shoot_indices = shoot_logits.argmax(dim=-1)                        # (B,)
 
     # Value head
-    values = model.value_head(h).squeeze(-1)                           # (B,)
+    values = model.value_head(h, _round_oh).squeeze(-1)                 # (B,)
 
     # Build target rankings
     charge_list = charge_indices.tolist()
@@ -1003,7 +1003,7 @@ def plan_activation(
 
     # 1. One trunk pass
     x = state_vec.unsqueeze(0)  # (1, 3611)
-    h, u_attended = model.trunk(x)
+    h, u_attended, _attn_w, _ = model.trunk(x)
     h = h.squeeze(0)              # (512,)
     u_attended = u_attended.squeeze(0)  # (20, 180)
 

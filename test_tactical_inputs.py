@@ -16,7 +16,6 @@ from models import ResolvedUnit, UnitState, Weapon
 from ml_features import (
     TACTICAL_TOTAL_FEATURES,
     TACTICAL_UNIT_FEATURES,
-    UNIT_FEATURES,
     GLOBAL_FEATURES,
     MAX_UNITS_PER_SIDE,
     BOARD_DIAG,
@@ -886,41 +885,6 @@ class TestBatchForward:
         assert combat_pref.shape == (batch,)
         assert stance.shape == (batch, 3)
         assert value.shape == (batch,)
-
-
-# ===========================================================================
-# 12. CONSISTENCY BETWEEN STRATEGIC AND TACTICAL ENCODING
-# ===========================================================================
-
-class TestStrategicTacticalConsistency:
-    def test_base_features_match(self):
-        """The first 37 features per unit should match between strategic and tactical."""
-        from ml_features import encode_state
-        fu, eu, board = _simple_game_state()
-        vec_strat = encode_state(fu, eu, 1, board, "A")
-        vec_tact = encode_state_tactical(fu, eu, 1, board, "A")
-
-        # Compare first unit's base features (0-36)
-        for i in range(UNIT_FEATURES):
-            strat_val = vec_strat[i].item()
-            tact_val = vec_tact[i].item()
-            assert tact_val == pytest.approx(strat_val, abs=1e-6), \
-                f"Feature {i} mismatch: strategic={strat_val}, tactical={tact_val}"
-
-    def test_global_features_match(self):
-        """Global features should be identical between strategic and tactical."""
-        from ml_features import encode_state, TOTAL_FEATURES
-        fu, eu, board = _simple_game_state()
-        vec_strat = encode_state(fu, eu, 2, board, "A")
-        vec_tact = encode_state_tactical(fu, eu, 2, board, "A")
-
-        strat_globals = vec_strat[MAX_UNITS_PER_SIDE * 2 * UNIT_FEATURES:]
-        tact_globals = vec_tact[MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES:]
-
-        assert strat_globals.shape == tact_globals.shape == (GLOBAL_FEATURES,)
-        for i in range(GLOBAL_FEATURES):
-            assert tact_globals[i].item() == pytest.approx(strat_globals[i].item(), abs=1e-6), \
-                f"Global feature {i} mismatch"
 
 
 if __name__ == "__main__":

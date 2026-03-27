@@ -217,6 +217,27 @@ class GameViewer:
             self.nn_assessment_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             nn_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
+        # Attention Focus panel (shown when ml_assessment has attention data)
+        self._has_attn = any(
+            f.get('ml_assessment', {}).get('attention_weights')
+            for f in self.frames
+        )
+        if self._has_attn:
+            self.attn_frame = ttk.LabelFrame(right_frame, text="Attention Focus")
+            self.attn_frame.pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
+            attn_inner = tk.Frame(self.attn_frame)
+            attn_inner.pack(fill=tk.BOTH, expand=True, padx=5, pady=3)
+            self.attn_text = tk.Text(
+                attn_inner, font=("Consolas", 9), wrap=tk.NONE,
+                height=14, state=tk.DISABLED, relief=tk.FLAT,
+                bg=ttk.Style().lookup("TLabelframe", "background") or "#f0f0f0",
+            )
+            attn_scrollbar = ttk.Scrollbar(attn_inner, orient=tk.VERTICAL,
+                                           command=self.attn_text.yview)
+            self.attn_text.configure(yscrollcommand=attn_scrollbar.set)
+            self.attn_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            attn_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
         # ML Features panel (shown when a unit is selected)
         self.ml_frame = ttk.LabelFrame(right_frame, text="ML Input Features")
         self.ml_frame.pack(anchor=tk.W, fill=tk.X, pady=(0, 10))
@@ -351,6 +372,27 @@ class GameViewer:
                     self.canvas.create_rectangle(x, y, x + CELL, y + CELL,
                                                  outline="#ffffff", width=2)
 
+        # Highlight top-attended units on the board
+        attn_ranking = self._get_attention_ranking(frame)
+        if attn_ranking is not None:
+            top_friendly_idx, top_enemy_idx = attn_ranking
+            # Draw gold outline for top-attended friendly unit
+            if top_friendly_idx is not None and top_friendly_idx < self.n_units:
+                for col, row in frame['positions'][top_friendly_idx]:
+                    x = col * CELL
+                    y = (ROWS - 1 - row) * CELL
+                    self.canvas.create_rectangle(
+                        x - 1, y - 1, x + CELL + 1, y + CELL + 1,
+                        outline="#ffd700", width=2)
+            # Draw magenta outline for top-attended enemy unit
+            if top_enemy_idx is not None and top_enemy_idx < self.n_units:
+                for col, row in frame['positions'][top_enemy_idx]:
+                    x = col * CELL
+                    y = (ROWS - 1 - row) * CELL
+                    self.canvas.create_rectangle(
+                        x - 1, y - 1, x + CELL + 1, y + CELL + 1,
+                        outline="#ff00ff", width=2)
+
         # Draw unit info box if a unit is selected
         if self._selected_unit is not None:
             self._draw_info_box(frame)
@@ -390,6 +432,17 @@ class GameViewer:
             else:
                 self.nn_assessment_text.insert("1.0", "(pre-game — no assessment yet)")
             self.nn_assessment_text.configure(state=tk.DISABLED)
+
+        # Update attention focus panel
+        if self._has_attn:
+            self.attn_text.configure(state=tk.NORMAL)
+            self.attn_text.delete("1.0", tk.END)
+            ml_assessment = frame.get('ml_assessment')
+            if ml_assessment and ml_assessment.get('attention_weights'):
+                self.attn_text.insert("1.0", self._format_attention(ml_assessment))
+            else:
+                self.attn_text.insert("1.0", "(no attention data this frame)")
+            self.attn_text.configure(state=tk.DISABLED)
 
         # Update activation log — show all descriptions up to current frame
         self.log_text.configure(state=tk.NORMAL)
@@ -502,6 +555,91 @@ class GameViewer:
                 self.canvas.create_text(anchor_x + _INFO_PAD, ty,
                                         text=text, fill=color, anchor=tk.NW, font=font)
             ty += _INFO_LINE_H
+
+    def _get_attention_ranking(self, frame: dict) -> tuple[int | None, int | None] | None:
+        """Return (top_friendly_unit_index, top_enemy_unit_index) in viewer unit indices.
+
+        Attention weights slots 0-9 = friendly (Player A), 10-19 = enemy (Player B).
+        Maps these back to the viewer's unit index list.
+        Returns None if no attention data available.
+        """
+        ml_assessment = frame.get('ml_assessment')
+        if not ml_assessment or not ml_assessment.get('attention_weights'):
+            return None
+
+        weights = ml_assessment['attention_weights']  # (20,) list
+        friendly_names = ml_assessment.get('friendly_names', [])
+        enemy_names = ml_assessment.get('enemy_names', [])
+
+        # Find top friendly slot (0-9) among alive units
+        top_friendly_slot = None
+        top_friendly_w = -1.0
+        for i in range(10):
+            if i < len(friendly_names) and friendly_names[i] is not None:
+                if weights[i] > top_friendly_w:
+                    top_friendly_w = weights[i]
+                    top_friendly_slot = i
+
+        # Find top enemy slot (10-19) among alive units
+        top_enemy_slot = None
+        top_enemy_w = -1.0
+        for i in range(10):
+            if i < len(enemy_names) and enemy_names[i] is not None:
+                if weights[10 + i] > top_enemy_w:
+                    top_enemy_w = weights[10 + i]
+                    top_enemy_slot = i
+
+        # Map slots to viewer unit indices. Player A units come first, then B.
+        a_indices = [ui for ui in range(self.n_units) if self.owners[ui] == "A"]
+        b_indices = [ui for ui in range(self.n_units) if self.owners[ui] == "B"]
+
+        top_friendly_idx = (a_indices[top_friendly_slot]
+                            if top_friendly_slot is not None and top_friendly_slot < len(a_indices)
+                            else None)
+        top_enemy_idx = (b_indices[top_enemy_slot]
+                         if top_enemy_slot is not None and top_enemy_slot < len(b_indices)
+                         else None)
+
+        return top_friendly_idx, top_enemy_idx
+
+    def _format_attention(self, assessment: dict) -> str:
+        """Format attention weights into a ranked list for the attention panel."""
+        weights = assessment['attention_weights']  # (20,) list
+        friendly_names = assessment.get('friendly_names', [])
+        enemy_names = assessment.get('enemy_names', [])
+
+        # Build friendly ranked list (slots 0-9)
+        friendly_entries = []
+        for i in range(10):
+            name = friendly_names[i] if i < len(friendly_names) else None
+            if name is not None:
+                friendly_entries.append((weights[i], name))
+        friendly_entries.sort(key=lambda e: e[0], reverse=True)
+
+        # Build enemy ranked list (slots 10-19)
+        enemy_entries = []
+        for i in range(10):
+            name = enemy_names[i] if i < len(enemy_names) else None
+            if name is not None:
+                enemy_entries.append((weights[10 + i], name))
+        enemy_entries.sort(key=lambda e: e[0], reverse=True)
+
+        lines = []
+        lines.append("Friendly Units (by attention):")
+        for w, name in friendly_entries:
+            bar = "\u2588" * max(1, int(w * 80))
+            lines.append(f"  {w:.3f}  {name}  {bar}")
+
+        lines.append("")
+        lines.append("Enemy Units (by attention):")
+        for w, name in enemy_entries:
+            bar = "\u2588" * max(1, int(w * 80))
+            lines.append(f"  {w:.3f}  {name}  {bar}")
+
+        lines.append("")
+        lines.append("Board: gold = top friendly, magenta = top enemy")
+
+        return "\n".join(lines)
 
     def _format_ml_features(self, frame: dict) -> str:
         """Format ML input features for the selected unit."""

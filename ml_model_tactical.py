@@ -41,12 +41,58 @@ NUM_MOVE_TYPES = 4                # 0=hold, 1=advance, 2=rush, 3=charge
 POST_MOVE_REL_FEATURES = N_ENEMY * 3  # 30: (sin θ, cos θ, dist) per enemy from post-move pos
 ATTN_DIM = TACTICAL_UNIT_FEATURES    # 180 — attend over raw feature dim
 ATTN_HEADS = 5                       # 180 / 5 = 36 dims per head
+NUM_ROUNDS = 4                       # game has 4 rounds (one-hot in global features)
 
 # Movement type indices
 MOVE_HOLD = 0
 MOVE_ADVANCE = 1
 MOVE_RUSH = 2
 MOVE_CHARGE = 3
+
+# Offset of global features within the flat observation vector
+_GLOBAL_OFFSET = N_TOTAL_UNITS * ATTN_DIM  # 20 * 180 = 3600
+
+
+# ---------------------------------------------------------------------------
+# FiLM-conditioned value head
+# ---------------------------------------------------------------------------
+
+class FiLMValueHead(nn.Module):
+    """Value head conditioned on game round via FiLM modulation.
+
+    A small MLP maps the round one-hot to (gamma, beta) vectors that
+    scale and shift the trunk features before the final value projection.
+    This lets the value function learn that identical board states have
+    different values at different stages of the game.
+    """
+
+    def __init__(self, trunk_dim: int = TRUNK_WIDTH, round_dim: int = NUM_ROUNDS):
+        super().__init__()
+        self.film_gen = nn.Sequential(
+            nn.Linear(round_dim, trunk_dim),
+            nn.ReLU(),
+            nn.Linear(trunk_dim, trunk_dim * 2),  # gamma and beta
+        )
+        self.value_proj = nn.Linear(trunk_dim, 1)
+
+        # Init last film_gen layer so gamma ≈ 1, beta ≈ 0 (identity at start)
+        final_layer = self.film_gen[-1]
+        nn.init.zeros_(final_layer.weight)
+        # bias: first half (gamma) = 1, second half (beta) = 0
+        with torch.no_grad():
+            final_layer.bias[:trunk_dim].fill_(1.0)
+            final_layer.bias[trunk_dim:].fill_(0.0)
+
+    def forward(self, h: torch.Tensor, round_onehot: torch.Tensor) -> torch.Tensor:
+        """
+        h:             (..., trunk_dim)
+        round_onehot:  (..., NUM_ROUNDS)
+        Returns:       (...,) scalar value estimates
+        """
+        film_params = self.film_gen(round_onehot)
+        gamma, beta = film_params.chunk(2, dim=-1)
+        h_modulated = gamma * h + beta
+        return self.value_proj(h_modulated).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
@@ -133,8 +179,8 @@ class TacticalModel(nn.Module):
         # 4) Shooting target: h + unit_feat + move_onehot + post_move_rel → 10 logits
         self.shoot_target_head = nn.Linear(H + UF + NUM_MOVE_TYPES + POST_MOVE_REL_FEATURES, N_ENEMY)
 
-        # Value head: h → scalar (not conditioned on actions)
-        self.value_head = nn.Linear(H, 1)
+        # Value head: h + round → scalar (FiLM-conditioned on game round)
+        self.value_head = FiLMValueHead(H)
 
         # Auxiliary prediction heads (trained with supervised targets, not used at inference)
         # Friendly survival: Beta(α, β) per friendly unit — 2 raw params each
@@ -144,23 +190,28 @@ class TacticalModel(nn.Module):
         # Objective control: 5 objectives × 3 classes (friendly/enemy/neutral)
         self.aux_obj_control_head = nn.Linear(H, 5 * 3)
 
-    def trunk(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def trunk(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run input through attention + stem + residual blocks.
 
         Returns
         -------
         h : (batch, 512) — global trunk representation
         u_attended : (batch, 20, 180) — per-unit attended embeddings
+        attn_weights : (batch, 20, 20) — attention weights averaged across heads
+        round_onehot : (batch, 4) — one-hot round indicator extracted from global features
         """
         # Reshape flat input into unit blocks + global features
         unit_block = x[..., :N_TOTAL_UNITS * TACTICAL_UNIT_FEATURES]
         glob = x[..., N_TOTAL_UNITS * TACTICAL_UNIT_FEATURES:]  # (batch, 11)
 
+        # Extract round one-hot (first 4 elements of global features)
+        round_onehot = glob[..., :NUM_ROUNDS]  # (batch, 4) or (4,)
+
         # (batch, 20, 180)
         units = unit_block.reshape(*x.shape[:-1], N_TOTAL_UNITS, ATTN_DIM)
 
         # Self-attention with residual + LayerNorm
-        u_attn, _ = self.attn(units, units, units)
+        u_attn, attn_weights = self.attn(units, units, units, need_weights=True, average_attn_weights=True)
         u_attended = self.attn_norm(units + u_attn)  # (batch, 20, 180)
 
         # Flatten attended units + global → stem → residual blocks
@@ -168,7 +219,7 @@ class TacticalModel(nn.Module):
         h = self.stem(flat)
         h = h + self.res_block_1(h)
         h = h + self.res_block_2(h)
-        return h, u_attended
+        return h, u_attended, attn_weights, round_onehot
 
     def _extract_unit_features(self, u_attended: torch.Tensor, unit_idx: int) -> torch.Tensor:
         """Extract the attended embedding for friendly unit *unit_idx*.
@@ -270,7 +321,7 @@ class TacticalModel(nn.Module):
             if post_move_rel is not None and post_move_rel.dim() == 1:
                 post_move_rel = post_move_rel.unsqueeze(0)
 
-        h, u_attended = self.trunk(x)  # (batch, 512), (batch, 20, 180)
+        h, u_attended, attn_weights, round_onehot = self.trunk(x)
 
         # --- Unit selection ---
         unit_logits = self.unit_selection_head(h)  # (batch, 10)
@@ -289,8 +340,8 @@ class TacticalModel(nn.Module):
             self._run_conditioned_heads(h, unit_features, enemy_alive_mask, post_move_rel)
         )
 
-        # --- Value ---
-        value = self.value_head(h).squeeze(-1)
+        # --- Value (round-conditioned) ---
+        value = self.value_head(h, round_onehot)
 
         if single:
             return TacticalModelOutput(
@@ -320,6 +371,7 @@ class TacticalModel(nn.Module):
         unit_indices: list[int],
         enemy_alive_mask: torch.Tensor,
         post_move_rel: torch.Tensor | None = None,
+        round_onehot: torch.Tensor | None = None,
     ) -> list[TacticalModelOutput]:
         """Run conditioned heads for multiple candidate units from a single trunk pass.
 
@@ -330,13 +382,16 @@ class TacticalModel(nn.Module):
         unit_indices : which friendly unit slots to evaluate
         enemy_alive_mask : (10,) — enemy alive mask
         post_move_rel : (30,) — post-move relative features (or None for zeros)
+        round_onehot : (4,) — one-hot round indicator for FiLM value head
 
         Returns
         -------
         One TacticalModelOutput per candidate unit (unit_logits=None).
         """
         results: list[TacticalModelOutput] = []
-        value = self.value_head(h).squeeze(-1)  # scalar, shared across all candidates
+        if round_onehot is None:
+            round_onehot = torch.zeros(NUM_ROUNDS, device=h.device, dtype=h.dtype)
+        value = self.value_head(h, round_onehot)  # scalar, shared across all candidates
 
         for uid in unit_indices:
             unit_features = self._extract_unit_features(u_attended, uid)

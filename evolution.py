@@ -1218,12 +1218,8 @@ def _init_evo_ml_worker(model_path: str, model_type: str, use_c_ext: bool = True
     import torch
     import fast_core
     fast_core.USE_C_EXT = use_c_ext and fast_core.is_available()
-    if model_type == "tactical":
-        from ml_model_tactical import TacticalModel
-        _g_evo_ml_model = TacticalModel()
-    else:
-        from ml_model import StrategicModel
-        _g_evo_ml_model = StrategicModel()
+    from ml_model_tactical import TacticalModel
+    _g_evo_ml_model = TacticalModel()
     from ml_training import load_model_state_dict
     _g_evo_ml_model.load_state_dict(
         load_model_state_dict(model_path), strict=False)

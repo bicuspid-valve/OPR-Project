@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from contextlib import contextmanager
+
 import numpy as np
 import torch
 import torch.multiprocessing as _mp
@@ -20,13 +22,11 @@ import torch.nn.functional as F
 
 from board import Board
 from models import ResolvedUnit, UnitState
-from ml_features import MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES, encode_state, encode_state_tactical, precompute_damage
-from ml_model import StrategicModel, NUM_ROLES, NUM_OBJECTIVES, NUM_STANCES, N_FRIENDLY
+from ml_features import MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES, encode_state_tactical, precompute_damage
 from ml_model_tactical import (
     TacticalModel, NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
     POST_MOVE_REL_FEATURES,
 )
-from ml_integration import ROLES, STANCES, remap_objective, ml_activation_order
 from ml_integration_tactical import (
     MOVE_TYPE_NAMES, execute_decoded_decision, pick_target_from_ranking,
     compute_post_move_rel, compute_post_move_position,
@@ -42,6 +42,73 @@ try:
     _HAS_EVOLUTION = True
 except Exception:
     _HAS_EVOLUTION = False
+
+
+# ---------------------------------------------------------------------------
+# Device helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_device(device: str) -> torch.device:
+    """Resolve 'auto'/'cuda'/'cpu' to a torch.device."""
+    if device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(device)
+
+
+@contextmanager
+def _force_tensor_device(device: torch.device):
+    """Monkey-patch torch tensor-creation to target *device*.
+
+    Allows replay_tactical_log_probs_flat (which hard-codes CPU tensors via
+    torch.from_numpy / torch.tensor) to run with a model on GPU — every
+    intermediate tensor is created on the correct device.
+    """
+    if device.type == "cpu":
+        yield
+        return
+
+    _orig_from_numpy = torch.from_numpy
+    _orig_tensor = torch.tensor
+    _orig_full = torch.full
+    _orig_zeros = torch.zeros
+    _orig_ones = torch.ones
+
+    def _from_numpy(a):
+        return _orig_from_numpy(a).to(device)
+
+    def _tensor(*args, **kwargs):
+        if "device" not in kwargs:
+            kwargs["device"] = device
+        return _orig_tensor(*args, **kwargs)
+
+    def _full(size, fill_value, **kwargs):
+        if "device" not in kwargs:
+            kwargs["device"] = device
+        return _orig_full(size, fill_value, **kwargs)
+
+    def _zeros(*size, **kwargs):
+        if "device" not in kwargs:
+            kwargs["device"] = device
+        return _orig_zeros(*size, **kwargs)
+
+    def _ones(*size, **kwargs):
+        if "device" not in kwargs:
+            kwargs["device"] = device
+        return _orig_ones(*size, **kwargs)
+
+    torch.from_numpy = _from_numpy
+    torch.tensor = _tensor
+    torch.full = _full
+    torch.zeros = _zeros
+    torch.ones = _ones
+    try:
+        yield
+    finally:
+        torch.from_numpy = _orig_from_numpy
+        torch.tensor = _orig_tensor
+        torch.full = _orig_full
+        torch.zeros = _orig_zeros
+        torch.ones = _orig_ones
 
 
 # ---------------------------------------------------------------------------
@@ -68,14 +135,15 @@ class TrainingConfig:
     value_coeff: float = 0.5           # value loss weight
     gae_lambda: float = 0.95           # GAE lambda for advantage estimation
     ppo_epochs: int = 3                # gradient steps per batch of episodes
-    ppo_minibatch_games: int = 32       # games per PPO minibatch (0 = full batch)
-    model_type: str = "strategic"      # "strategic" (round-level) or "tactical" (per-activation)
+    ppo_minibatch_games: int = 64       # games per PPO minibatch (0 = full batch)
+    model_type: str = "tactical"      # per-activation tactical model
     use_c_ext: bool = True             # use C extension for hot loops (if compiled)
-    worker_count: int | None = None    # number of pool workers (None = use module default)
+    worker_count: int | None = 6       # number of pool workers (None = use module default)
+    device: str = "auto"               # "auto" (GPU if available), "cuda", or "cpu"
     shaping_anneal_end: float = 0.5    # fraction of training at which per-round reward shaping reaches 0
     aux_coeff: float = 0.1            # max weight for auxiliary prediction losses (survival + obj control)
     aux_ratio: float = 0.2             # aux contributes at most this fraction of policy loss magnitude
-    # Per-head entropy targets (tactical model only; strategic still uses entropy_coeff)
+    # Per-head entropy targets (adaptive entropy tuning)
     use_entropy_targets: bool = True   # if True, use per-head adaptive entropy; else use entropy_coeff
     entropy_target_fraction: float = 0.25  # fraction of max entropy for masked categoricals
     entropy_target_move: float = 0.25 * math.log(4)      # ~0.347
@@ -241,8 +309,9 @@ def compute_round_reward(
     prev_friendly_kill_pts: float,
     prev_enemy_kill_pts: float,
     shaping_scale: float = 1.0,
+    round_num: int = 1,
 ) -> tuple[float, float, float]:
-    """Compute shaped reward for one round.
+    """Compute shaped reward for one round with phase-dependent weighting.
 
     Returns (reward, new_friendly_kill_pts, new_enemy_kill_pts).
 
@@ -250,8 +319,12 @@ def compute_round_reward(
     enemy_kill_pts = points of our units the enemy has destroyed (cumulative).
 
     shaping_scale: multiplier for the per-round shaping reward (1.0 = full,
-    0.0 = off).  Annealed to zero over the first half of training so the
-    policy learns from the terminal margin reward alone.
+    0.0 = off).  Annealed over training so the policy gradually shifts to
+    learning from the terminal margin reward.
+
+    round_num: 1-4, used for phase-dependent reward weighting.  Early rounds
+    emphasise kills (force-projection), later rounds emphasise objectives
+    (territory control).
     """
     # Objective control
     friend_tag = player
@@ -267,10 +340,15 @@ def compute_round_reward(
     friendly_killed_this_round = friendly_kill_pts - prev_friendly_kill_pts
     enemy_killed_this_round = enemy_kill_pts - prev_enemy_kill_pts
 
+    # Phase-dependent weighting: kills matter early, objectives matter late
+    t = (round_num - 1) / 3.0           # 0.0 in round 1 → 1.0 in round 4
+    kill_weight = 0.15 - 0.10 * t        # 0.15 → 0.05
+    obj_weight  = 0.005 + 0.015 * t      # 0.005 → 0.02
+
     pts = max(total_army_points, 1)
     reward = shaping_scale * (
-        0.01 * (friendly_objs - enemy_objs)
-        + 0.1 * (friendly_killed_this_round - enemy_killed_this_round) / pts
+        obj_weight * (friendly_objs - enemy_objs)
+        + kill_weight * (friendly_killed_this_round - enemy_killed_this_round) / pts
     )
 
     return reward, friendly_kill_pts, enemy_kill_pts
@@ -344,170 +422,6 @@ def _compute_obj_control_target(
 # ---------------------------------------------------------------------------
 # Action sampling & log-prob computation
 # ---------------------------------------------------------------------------
-
-@dataclass
-class RoundRecord:
-    """Data recorded for one round during an episode."""
-    log_prob: torch.Tensor        # scalar: sum of log-probs of sampled actions
-    entropy: torch.Tensor         # scalar: mean entropy across distributions
-    reward: float = 0.0
-    value: torch.Tensor | None = None  # state value estimate from forward pass
-
-
-@dataclass
-class TrajectoryRound:
-    """Serializable trajectory data for one round (no grad-bearing tensors)."""
-    state_vec: list[float]                        # flattened encoded state
-    unit_actions: list[tuple[int, int, int, int]]  # per-slot (role, obj, combat, stance)
-    unit_alive_mask: list[bool]                   # which slots had alive units
-    reward: float = 0.0
-    old_log_prob: float = 0.0                     # sum of log-probs under collection policy
-    old_value: float = 0.0                        # value estimate under collection policy
-
-
-def sample_actions_and_record(
-    role_probs: torch.Tensor,      # (10, 2)
-    obj_probs: torch.Tensor,       # (10, 5)
-    target_priority: torch.Tensor, # (10,) — multipliers, no sampling needed
-    act_scores: torch.Tensor,      # (10,) — raw scalars, no sampling
-    combat_prefs: torch.Tensor,    # (10,) — sigmoid probs
-    stance_probs: torch.Tensor,    # (10, 3)
-    friendly_units: list[UnitState],
-    player: str,
-) -> tuple[list[float], RoundRecord]:
-    """Sample discrete actions, apply to UnitState, return target_multipliers and record.
-
-    During training we sample from distributions (§4.2) and record log-probs.
-    """
-    total_log_prob = torch.tensor(0.0)
-    total_entropy = torch.tensor(0.0)
-    n_distributions = 0
-
-    target_multipliers = target_priority.tolist()
-
-    for i, us in enumerate(friendly_units):
-        if i >= MAX_UNITS_PER_SIDE:
-            break
-        if us.models_alive <= 0:
-            continue
-
-        # Role: sample from categorical
-        role_dist = torch.distributions.Categorical(probs=role_probs[i])
-        role_idx = role_dist.sample()
-        total_log_prob = total_log_prob + role_dist.log_prob(role_idx)
-        total_entropy = total_entropy + role_dist.entropy()
-        n_distributions += 1
-        us.ai_role = ROLES[role_idx.item()]
-
-        # Objective: sample from categorical
-        obj_dist = torch.distributions.Categorical(probs=obj_probs[i])
-        obj_idx = obj_dist.sample()
-        total_log_prob = total_log_prob + obj_dist.log_prob(obj_idx)
-        total_entropy = total_entropy + obj_dist.entropy()
-        n_distributions += 1
-        us.assigned_objective = remap_objective(obj_idx.item(), player)
-
-        # Combat preference: sample from Bernoulli (sigmoid output)
-        combat_dist = torch.distributions.Bernoulli(probs=combat_prefs[i])
-        combat_sample = combat_dist.sample()
-        total_log_prob = total_log_prob + combat_dist.log_prob(combat_sample)
-        total_entropy = total_entropy + combat_dist.entropy()
-        n_distributions += 1
-        us.combat_preference = "ranged" if combat_sample.item() >= 0.5 else "melee"
-
-        # Movement stance: sample from categorical
-        stance_dist = torch.distributions.Categorical(probs=stance_probs[i])
-        stance_idx = stance_dist.sample()
-        total_log_prob = total_log_prob + stance_dist.log_prob(stance_idx)
-        total_entropy = total_entropy + stance_dist.entropy()
-        n_distributions += 1
-        us.movement_stance = STANCES[stance_idx.item()]
-
-        # Activation priority (non-sampled)
-        us._ml_activation_score = act_scores[i].item()
-
-    mean_entropy = total_entropy / max(n_distributions, 1)
-    record = RoundRecord(log_prob=total_log_prob, entropy=mean_entropy)
-    return target_multipliers, record
-
-
-@torch.no_grad()
-def sample_actions_no_grad(
-    role_probs: torch.Tensor,
-    obj_probs: torch.Tensor,
-    target_priority: torch.Tensor,
-    act_scores: torch.Tensor,
-    combat_prefs: torch.Tensor,
-    stance_probs: torch.Tensor,
-    friendly_units: list[UnitState],
-    player: str,
-) -> tuple[list[float], list[tuple[int, int, int, int]], list[bool], float]:
-    """Sample actions without gradient tracking; return indices for later replay.
-
-    Returns (target_multipliers, unit_actions, unit_alive_mask, old_log_prob).
-    Also applies sampled actions to UnitState objects to drive the game forward.
-
-    Uses raw torch.multinomial/torch.bernoulli instead of distribution objects
-    to avoid Categorical/Bernoulli construction + constraint validation overhead.
-    """
-    target_multipliers = target_priority.tolist()
-    unit_actions: list[tuple[int, int, int, int]] = []
-    unit_alive_mask: list[bool] = []
-
-    # Batch-sample all categoricals at once via multinomial (1 sample each row)
-    # This avoids per-unit Categorical object creation.
-    role_samples = torch.multinomial(role_probs, 1).squeeze(-1)     # (MAX_UNITS,)
-    obj_samples = torch.multinomial(obj_probs, 1).squeeze(-1)       # (MAX_UNITS,)
-    stance_samples = torch.multinomial(stance_probs, 1).squeeze(-1) # (MAX_UNITS,)
-    combat_samples = torch.bernoulli(combat_prefs).to(torch.int32)  # (MAX_UNITS,)
-
-    # Convert to Python lists in one shot to avoid per-element .item() overhead
-    role_list = role_samples.tolist()
-    obj_list = obj_samples.tolist()
-    stance_list = stance_samples.tolist()
-    combat_list = combat_samples.tolist()
-    act_list = act_scores.tolist()
-
-    for i, us in enumerate(friendly_units):
-        if i >= MAX_UNITS_PER_SIDE:
-            break
-        if us.models_alive <= 0:
-            unit_actions.append((0, 0, 0, 0))
-            unit_alive_mask.append(False)
-            continue
-
-        unit_alive_mask.append(True)
-
-        role_idx = role_list[i]
-        obj_idx = obj_list[i]
-        combat_sample = combat_list[i]
-        stance_idx = stance_list[i]
-
-        us.ai_role = ROLES[role_idx]
-        us.assigned_objective = remap_objective(obj_idx, player)
-        us.combat_preference = "ranged" if combat_sample >= 1 else "melee"
-        us.movement_stance = STANCES[stance_idx]
-        us._ml_activation_score = act_list[i]
-
-        unit_actions.append((role_idx, obj_idx, combat_sample, stance_idx))
-
-    # Pad to MAX_UNITS_PER_SIDE if fewer units
-    while len(unit_actions) < MAX_UNITS_PER_SIDE:
-        unit_actions.append((0, 0, 0, 0))
-        unit_alive_mask.append(False)
-
-    # Compute summed log-prob of sampled actions for PPO ratio computation
-    alive_t = torch.tensor(unit_alive_mask, dtype=torch.bool)
-    eps = 1e-8
-    role_lp = torch.log(role_probs.gather(1, role_samples.unsqueeze(1)).squeeze(1) + eps)
-    obj_lp = torch.log(obj_probs.gather(1, obj_samples.unsqueeze(1)).squeeze(1) + eps)
-    stance_lp = torch.log(stance_probs.gather(1, stance_samples.unsqueeze(1)).squeeze(1) + eps)
-    combat_f = combat_samples.float()
-    combat_lp = combat_f * torch.log(combat_prefs + eps) + (1 - combat_f) * torch.log(1 - combat_prefs + eps)
-    total_lp = ((role_lp + obj_lp + stance_lp + combat_lp) * alive_t).sum().item()
-
-    return target_multipliers, unit_actions, unit_alive_mask, total_lp
-
 
 # ---------------------------------------------------------------------------
 # Tactical model: per-activation data structures & sampling
@@ -594,7 +508,7 @@ def sample_tactical_actions_no_grad(
     am = alive_mask.unsqueeze(0)
 
     # --- Trunk ---
-    h, u_attended = model.trunk(x)
+    h, u_attended, _attn_w, round_onehot = model.trunk(x)
 
     # --- Unit selection (sample) ---
     unit_logits = model.unit_selection_head(h)
@@ -689,8 +603,8 @@ def sample_tactical_actions_no_grad(
 
     target_ranking = torch.argsort(shoot_logits, descending=True).tolist()
 
-    # --- Value ---
-    value = model.value_head(h).squeeze(-1).squeeze(0).item()
+    # --- Value (round-conditioned) ---
+    value = model.value_head(h, round_onehot).squeeze(0).item()
 
     # Log-prob: sum across active heads based on move_type
     # Always: unit + move_type
@@ -738,7 +652,7 @@ def _batched_sample_tactical_no_grad(
     enemy_alive_batch = torch.stack([r.enemy_alive_mask for r in requests]) # (N, 10)
 
     # Trunk
-    h, u_attended = model.trunk(state_batch)                                 # (N, 512), (N, 20, 180)
+    h, u_attended, _attn_w, round_onehot = model.trunk(state_batch)           # (N, 512), (N, 20, 180), ..., (N, 4)
     if torch.isnan(h).any() or torch.isinf(h).any():
         print("  WARNING: NaN/Inf in trunk output during data collection — clamping")
         h = torch.nan_to_num(h, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -797,7 +711,7 @@ def _batched_sample_tactical_no_grad(
     unit_list = unit_indices.tolist()
     move_list = move_indices.tolist()
     charge_list = charge_indices.tolist()
-    values = model.value_head(h).squeeze(-1)
+    values = model.value_head(h, round_onehot)
 
     # --- Batched VonMises sampling ---
     raw_sin = direction_raw[:, 0]
@@ -956,11 +870,9 @@ def get_heuristic_fraction(win_rate: float) -> float:
 # Checkpoint pool
 # ---------------------------------------------------------------------------
 
-def _make_model(model_type: str) -> nn.Module:
-    """Create a fresh model instance of the given type."""
-    if model_type == "tactical":
-        return TacticalModel()
-    return StrategicModel()
+def _make_model(model_type: str = "tactical") -> nn.Module:
+    """Create a fresh model instance."""
+    return TacticalModel()
 
 
 def load_model_state_dict(path) -> dict:
@@ -979,7 +891,7 @@ class CheckpointPool:
     """Manages a pool of past model checkpoints for self-play (§5.6)."""
 
     def __init__(self, max_size: int = 20, save_dir: str = "ml_checkpoints",
-                 model_type: str = "strategic",
+                 model_type: str = "tactical",
                  seed_existing: int = 0):
         self.max_size = max_size
         self.save_dir = Path(save_dir)
@@ -1063,10 +975,10 @@ _MAX_SHARED_OPPONENTS = 5
 
 _g_shared_model: nn.Module | None = None
 _g_shared_opponents: list[nn.Module] = []
-_g_worker_model_type: str = "strategic"
+_g_worker_model_type: str = "tactical"
 
 
-def _init_shared_worker(shared_model, shared_opponents, model_type="strategic",
+def _init_shared_worker(shared_model, shared_opponents, model_type="tactical",
                          use_c_ext=True):
     """Initialize worker process with references to shared-memory models."""
     global _g_shared_model, _g_shared_opponents, _g_worker_model_type
@@ -1082,7 +994,7 @@ def _init_shared_worker(shared_model, shared_opponents, model_type="strategic",
     fast_core.USE_C_EXT = use_c_ext and fast_core.is_available()
 
 
-def _collect_episodes_shared_worker(args) -> list[tuple[list[TrajectoryRound], str, str, str]]:
+def _collect_episodes_shared_worker(args) -> list[tuple[list[TacticalActivationRecord], str, str, str]]:
     """Run training episodes using shared-memory models.
 
     Like _collect_episodes_chunked_worker but reads model weights directly from
@@ -1111,23 +1023,8 @@ def _collect_episodes_shared_worker(args) -> list[tuple[list[TrajectoryRound], s
             if slot is not None and slot < len(_g_shared_opponents):
                 opp_models[opp_sd_idx] = _g_shared_opponents[slot]
 
-    # Tactical model: use coroutine-batched path for cross-game inference
-    if _g_worker_model_type == "tactical":
-        return _run_games_batched_tactical(model, game_specs, opp_models,
-                                           shaping_scale=shaping_scale)
-
-    # Strategic model: sequential path
-    results = []
-    for res_a, res_b, states_a_data, states_b_data, opponent_type, opp_sd_idx, army_type in game_specs:
-        opponent_model = opp_models.get(opp_sd_idx)
-        traj_a, result, opp_t, traj_b = _run_single_episode(
-            model, opponent_model, res_a, res_b, states_a_data, states_b_data,
-            opponent_type, BOARD_OBJECTIVES, shaping_scale=shaping_scale,
-        )
-        results.append((traj_a, result, opp_t, army_type))
-        if traj_b is not None:
-            results.append((traj_b, result, "mirror_b", army_type))
-    return results
+    return _run_games_batched_tactical(model, game_specs, opp_models,
+                                       shaping_scale=shaping_scale)
 
 
 def _collect_episodes_chunked_worker(args) -> list:
@@ -1171,12 +1068,10 @@ def _collect_episodes_chunked_worker(args) -> list:
             opp_model.eval()
             opp_models[opp_sd_idx] = opp_model
 
-    episode_fn = _run_single_episode_tactical if model_type == "tactical" else _run_single_episode
-
     results = []
     for res_a, res_b, states_a_data, states_b_data, opponent_type, opp_sd_idx, army_type in game_specs:
         opponent_model = opp_models.get(opp_sd_idx)
-        traj_a, result, opp_t, traj_b = episode_fn(
+        traj_a, result, opp_t, traj_b = _run_single_episode_tactical(
             model, opponent_model, res_a, res_b, states_a_data, states_b_data,
             opponent_type, BOARD_OBJECTIVES,
         )
@@ -1184,277 +1079,6 @@ def _collect_episodes_chunked_worker(args) -> list:
         if traj_b is not None:
             results.append((traj_b, result, "mirror_b", army_type))
     return results
-
-
-def _run_single_episode(model, opponent_model, res_a, res_b,
-                        states_a_data, states_b_data, opponent_type,
-                        BOARD_OBJECTIVES, shaping_scale=1.0):
-    """Run one training episode. Factored out of the old per-game worker."""
-    from game import deploy_armies, _collect_enemy_positions, _sync_dead_models
-    from ai import (
-        pick_target, choose_action_and_goal, activation_order,
-        assign_objectives, reassign_roles,
-    )
-    from combat import resolve_shooting, check_morale, resolve_melee, resolve_impact, check_melee_morale
-    from movement import (
-        execute_movement, execute_charge_movement, execute_counter_charge,
-        post_melee_separation, consolidation_move,
-    )
-
-    # Rebuild UnitState objects from (ResolvedUnit, owner) pairs
-    units_a = [UnitState(ru) for ru in res_a]
-    for u in units_a:
-        u.owner = "A"
-    units_b = [UnitState(ru) for ru in res_b]
-    for u in units_b:
-        u.owner = "B"
-
-    # Re-apply saved mutable state
-    for u, (ai_role, combat_pref, assigned_obj) in zip(units_a, states_a_data):
-        u.ai_role = ai_role
-        u.combat_preference = combat_pref
-        u.assigned_objective = assigned_obj
-    for u, (ai_role, combat_pref, assigned_obj) in zip(units_b, states_b_data):
-        u.ai_role = ai_role
-        u.combat_preference = combat_pref
-        u.assigned_objective = assigned_obj
-
-    board = Board()
-    deploy_armies(units_a, units_b, board)
-
-    fr_a, fm_a = precompute_damage([u.unit for u in units_a], [u.unit for u in units_b])
-    fr_b, fm_b = precompute_damage([u.unit for u in units_b], [u.unit for u in units_a])
-    pts_a = sum(u.unit.points for u in units_a)
-    pts_b = sum(u.unit.points for u in units_b)
-
-    is_mirror = (opponent_type == "selfplay_mirror")
-
-    if opponent_type == "heuristic":
-        assign_objectives(units_b)
-
-    a_first = random.random() < 0.5
-    a_finished_first = a_first
-
-    trajectory: list[TrajectoryRound] = []
-    trajectory_b: list[TrajectoryRound] | None = [] if is_mirror else None
-    prev_a_kill_pts = 0.0
-    prev_b_kill_pts = 0.0
-    # B-side reward tracking (mirror self-play only)
-    prev_b_fkp = 0.0
-    prev_b_ekp = 0.0
-
-    for round_num in range(1, 5):
-        for u in units_a + units_b:
-            u.activated = False
-            u.fatigued = False
-
-        current_is_a = a_first if round_num == 1 else a_finished_first
-
-        # Player A forward pass (no grad)
-        state_vec = encode_state(
-            units_a, units_b, round_num, board, "A",
-            friendly_ranged_matchups=fr_a, friendly_melee_matchups=fm_a,
-            enemy_ranged_matchups=fr_b, enemy_melee_matchups=fm_b,
-            total_friendly_points=pts_a, total_enemy_points=pts_b,
-        )
-        state_vec_list = state_vec.tolist()
-
-        with torch.no_grad():
-            role_probs, obj_probs, target_priority, act_scores, combat_prefs, stance_probs, value = model(state_vec)
-        target_mults_a, unit_actions, unit_alive_mask, old_lp = sample_actions_no_grad(
-            role_probs, obj_probs, target_priority, act_scores,
-            combat_prefs, stance_probs, units_a, "A",
-        )
-
-        traj_round = TrajectoryRound(
-            state_vec=state_vec_list,
-            unit_actions=unit_actions,
-            unit_alive_mask=unit_alive_mask,
-            old_log_prob=old_lp,
-            old_value=value.item(),
-        )
-
-        # Player B decisions
-        target_mults_b = None
-        traj_round_b = None
-        if is_mirror:
-            # Mirror self-play: B uses the same model as A
-            state_vec_b = encode_state(
-                units_b, units_a, round_num, board, "B",
-                friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
-                enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
-                total_friendly_points=pts_b, total_enemy_points=pts_a,
-            )
-            with torch.no_grad():
-                rp_b, op_b, tp_b, as_b, cp_b, sp_b, val_b = model(state_vec_b)
-            target_mults_b, ua_b, uam_b, olp_b = sample_actions_no_grad(
-                rp_b, op_b, tp_b, as_b, cp_b, sp_b, units_b, "B",
-            )
-            traj_round_b = TrajectoryRound(
-                state_vec=state_vec_b.tolist(),
-                unit_actions=ua_b,
-                unit_alive_mask=uam_b,
-                old_log_prob=olp_b,
-                old_value=val_b.item(),
-            )
-        elif opponent_type == "heuristic":
-            reassign_roles(units_b)
-        elif opponent_model is not None:
-            from ml_integration import apply_model_outputs
-            target_mults_b, _ = apply_model_outputs(
-                opponent_model, units_b, units_a, round_num, board, "B",
-                friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
-                enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
-                total_friendly_points=pts_b, total_enemy_points=pts_a,
-            )
-
-        # --- Run the round (alternating activations) ---
-        a_done = False
-        b_done = False
-        a_finished_first = True
-
-        while True:
-            if current_is_a:
-                my_units, opp_units = units_a, units_b
-                my_ml = True
-                my_mults = target_mults_a
-            else:
-                my_units, opp_units = units_b, units_a
-                my_ml = (opponent_type != "heuristic")
-                my_mults = target_mults_b
-
-            if my_ml and current_is_a:
-                ordered = ml_activation_order(my_units)
-            elif my_ml and not current_is_a and (opponent_model is not None or is_mirror):
-                ordered = ml_activation_order(my_units)
-            else:
-                ordered = activation_order(my_units, enemies=opp_units, mode="objectives")
-            active = ordered[0] if ordered else None
-
-            if active is None:
-                if current_is_a:
-                    a_done = True
-                    if not b_done:
-                        a_finished_first = True
-                else:
-                    b_done = True
-                    if not a_done:
-                        a_finished_first = False
-                if a_done and b_done:
-                    break
-                current_is_a = not current_is_a
-                continue
-
-            active.activated = True
-
-            action, goal, charge_target, _reason = choose_action_and_goal(
-                active, opp_units, board, mode="objectives",
-                target_multipliers=my_mults,
-            )
-
-            if action == "charge" and charge_target is not None:
-                enemy_positions = _collect_enemy_positions(opp_units)
-                execute_charge_movement(active, charge_target, board, enemy_positions)
-                execute_counter_charge(charge_target, active, board)
-
-                if active.unit.impact > 0:
-                    resolve_impact(active, charge_target)
-                    _sync_dead_models(charge_target, board)
-
-                charger_wounds = 0
-                if charge_target.models_alive > 0:
-                    charger_wounds = resolve_melee(active, charge_target, is_charge=True) or 0
-                    _sync_dead_models(charge_target, board)
-
-                defender_wounds = 0
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    defender_wounds = resolve_melee(charge_target, active, is_strike_back=True) or 0
-                    _sync_dead_models(active, board)
-
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    check_melee_morale(active, charger_wounds, defender_wounds)
-                    check_melee_morale(charge_target, defender_wounds, charger_wounds)
-                    _sync_dead_models(active, board)
-                    _sync_dead_models(charge_target, board)
-
-                active.fatigued = True
-                if charge_target.models_alive > 0:
-                    charge_target.fatigued = True
-
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    enemy_positions = _collect_enemy_positions(opp_units)
-                    post_melee_separation(active, charge_target, board, enemy_positions)
-                elif active.models_alive > 0:
-                    consolidation_move(active, board, opp_units, BOARD_OBJECTIVES, "objectives")
-                elif charge_target.models_alive > 0:
-                    consolidation_move(charge_target, board, my_units, BOARD_OBJECTIVES, "objectives")
-
-            elif action in ("advance", "rush") and goal is not None:
-                budget = active.unit.advance_distance if action == "advance" else active.unit.rush_distance
-                enemy_positions = _collect_enemy_positions(opp_units)
-                execute_movement(active, goal, budget, board, enemy_positions,
-                                 flying=active.unit.flying)
-
-                if action != "rush":
-                    if active.shaken:
-                        active.shaken = False
-                    else:
-                        target = pick_target(active, opp_units, target_multipliers=my_mults)
-                        if target is not None:
-                            resolve_shooting(active, target)
-                            check_morale(target)
-                            _sync_dead_models(target, board)
-
-            elif action == "hold":
-                if active.shaken:
-                    active.shaken = False
-                else:
-                    target = pick_target(active, opp_units, target_multipliers=my_mults)
-                    if target is not None:
-                        resolve_shooting(active, target)
-                        check_morale(target)
-                        _sync_dead_models(target, board)
-
-            current_is_a = not current_is_a
-
-        # End of round: update objectives
-        board.update_objectives(units_a, units_b)
-
-        reward, prev_a_kill_pts, prev_b_kill_pts = compute_round_reward(
-            units_a, units_b, board, "A", pts_a,
-            prev_a_kill_pts, prev_b_kill_pts,
-            shaping_scale=shaping_scale,
-        )
-        traj_round.reward = reward
-        trajectory.append(traj_round)
-
-        if is_mirror and traj_round_b is not None:
-            reward_b, prev_b_fkp, prev_b_ekp = compute_round_reward(
-                units_b, units_a, board, "B", pts_b,
-                prev_b_fkp, prev_b_ekp,
-                shaping_scale=shaping_scale,
-            )
-            traj_round_b.reward = reward_b
-            trajectory_b.append(traj_round_b)
-
-    # Determine winner
-    a_objs = board.count_objectives("A")
-    b_objs = board.count_objectives("B")
-    if a_objs > b_objs:
-        result = "A"
-    elif b_objs > a_objs:
-        result = "B"
-    else:
-        result = "draw"
-
-    trajectory[-1].reward += terminal_reward(result, "A", a_objs, b_objs)
-
-    if is_mirror and trajectory_b:
-        trajectory_b[-1].reward += terminal_reward(result, "B", a_objs, b_objs)
-
-    return trajectory, result, opponent_type, trajectory_b
-
-
 def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                                   states_a_data, states_b_data, opponent_type,
                                   BOARD_OBJECTIVES, shaping_scale=1.0):
@@ -1473,10 +1097,8 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
         execute_movement, execute_charge_movement, execute_counter_charge,
         post_melee_separation, consolidation_move,
     )
-    from ml_integration import apply_model_outputs
     from ml_integration_tactical import apply_tactical_model_sampling
     is_mirror = (opponent_type == "selfplay_mirror")
-    _opp_is_tactical = opponent_model is not None and hasattr(opponent_model, 'unit_selection_head')
 
     # Rebuild UnitState objects
     units_a = [UnitState(ru) for ru in res_a]
@@ -1523,18 +1145,11 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
 
         current_is_a = a_first if round_num == 1 else a_finished_first
 
-        # Player B decisions at round start (opponent uses strategic model or heuristic)
-        # Tactical opponents and mirror decide per-activation, not per-round.
+        # Player B decisions at round start (heuristic only; tactical opponents
+        # and mirror decide per-activation, not per-round).
         target_mults_b = None
         if opponent_type == "heuristic":
             reassign_roles(units_b)
-        elif not is_mirror and opponent_model is not None and not _opp_is_tactical:
-            target_mults_b, _ = apply_model_outputs(
-                opponent_model, units_b, units_a, round_num, board, "B",
-                friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
-                enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
-                total_friendly_points=pts_b, total_enemy_points=pts_a,
-            )
 
         # Track steps in this round for reward assignment
         round_step_indices: list[int] = []
@@ -1729,7 +1344,7 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                         )
 
                     _opp_tac_decision = active is not None
-                elif _opp_is_tactical:
+                elif opponent_model is not None:
                     (selected, _b_target_ranking, _b_action, _b_goal,
                      _b_charge_target, _b_reason, _) = apply_tactical_model_sampling(
                         opponent_model, my_units, opp_units, round_num, board, "B",
@@ -1739,9 +1354,6 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                     )
                     active = selected
                     _opp_tac_decision = active is not None
-                elif opponent_model is not None:
-                    ordered = ml_activation_order(my_units)
-                    active = ordered[0] if ordered else None
                 else:
                     ordered = activation_order(my_units, enemies=opp_units, mode="objectives")
                     active = ordered[0] if ordered else None
@@ -1855,6 +1467,7 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
             units_a, units_b, board, "A", pts_a,
             prev_a_kill_pts, prev_b_kill_pts,
             shaping_scale=shaping_scale,
+            round_num=round_num,
         )
         if round_step_indices:
             trajectory[round_step_indices[-1]].reward = reward
@@ -1864,6 +1477,7 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                 units_b, units_a, board, "B", pts_b,
                 prev_b_fkp, prev_b_ekp,
                 shaping_scale=shaping_scale,
+                round_num=round_num,
             )
             trajectory_b[round_step_indices_b[-1]].reward = reward_b
 
@@ -1910,7 +1524,7 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
 # Coroutine-batched tactical episode collection
 # ---------------------------------------------------------------------------
 
-def _episode_tactical_generator(opponent_model, _opp_is_tactical,
+def _episode_tactical_generator(opponent_model,
                                 res_a, res_b,
                                 states_a_data, states_b_data, opponent_type,
                                 BOARD_OBJECTIVES, shaping_scale=1.0):
@@ -1934,8 +1548,6 @@ def _episode_tactical_generator(opponent_model, _opp_is_tactical,
         execute_movement, execute_charge_movement, execute_counter_charge,
         post_melee_separation, consolidation_move,
     )
-    from ml_integration import apply_model_outputs, ml_activation_order
-
     is_mirror = (opponent_type == "selfplay_mirror")
 
     # Rebuild UnitState objects
@@ -1983,17 +1595,11 @@ def _episode_tactical_generator(opponent_model, _opp_is_tactical,
 
         current_is_a = a_first if round_num == 1 else a_finished_first
 
-        # Player B round-start decisions (strategic model or heuristic)
+        # Player B round-start decisions (heuristic only; tactical opponents
+        # and mirror decide per-activation, not per-round).
         target_mults_b = None
         if opponent_type == "heuristic":
             reassign_roles(units_b)
-        elif not is_mirror and opponent_model is not None and not _opp_is_tactical:
-            target_mults_b, _ = apply_model_outputs(
-                opponent_model, units_b, units_a, round_num, board, "B",
-                friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
-                enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
-                total_friendly_points=pts_b, total_enemy_points=pts_a,
-            )
 
         round_step_indices: list[int] = []
         round_step_indices_b: list[int] = []
@@ -2195,7 +1801,7 @@ def _episode_tactical_generator(opponent_model, _opp_is_tactical,
 
                     _opp_tac_decision = active is not None
 
-                elif _opp_is_tactical:
+                elif opponent_model is not None:
                     # Build B's masks and encode state, then yield
                     b_alive_list = []
                     for i in range(MAX_UNITS_PER_SIDE):
@@ -2253,10 +1859,6 @@ def _episode_tactical_generator(opponent_model, _opp_is_tactical,
                             active = None
 
                     _opp_tac_decision = active is not None
-
-                elif opponent_model is not None:
-                    ordered = ml_activation_order(my_units)
-                    active = ordered[0] if ordered else None
                 else:
                     ordered = activation_order(my_units, enemies=opp_units, mode="objectives")
                     active = ordered[0] if ordered else None
@@ -2367,6 +1969,7 @@ def _episode_tactical_generator(opponent_model, _opp_is_tactical,
             units_a, units_b, board, "A", pts_a,
             prev_a_kill_pts, prev_b_kill_pts,
             shaping_scale=shaping_scale,
+            round_num=round_num,
         )
         if round_step_indices:
             trajectory[round_step_indices[-1]].reward = reward
@@ -2376,6 +1979,7 @@ def _episode_tactical_generator(opponent_model, _opp_is_tactical,
                 units_b, units_a, board, "B", pts_b,
                 prev_b_fkp, prev_b_ekp,
                 shaping_scale=shaping_scale,
+                round_num=round_num,
             )
             trajectory_b[round_step_indices_b[-1]].reward = reward_b
 
@@ -2440,16 +2044,12 @@ def _run_games_batched_tactical(
 
     for i, (res_a, res_b, sa_data, sb_data, opp_type, opp_sd_idx, army_type) in enumerate(game_specs):
         opp_model = opp_models.get(opp_sd_idx)
-        is_tac_opp = opp_model is not None and hasattr(opp_model, 'unit_selection_head')
 
-        if is_tac_opp:
+        if opp_model is not None:
             game_opp_tactical_models[i] = opp_model
-            gen_opp = None        # generator yields; coordinator calls opponent model
-        else:
-            gen_opp = opp_model   # generator calls strategic model directly (or None)
 
         gen = _episode_tactical_generator(
-            gen_opp, is_tac_opp,
+            None,
             res_a, res_b, sa_data, sb_data, opp_type, BOARD_OBJECTIVES,
             shaping_scale=shaping_scale,
         )
@@ -2520,129 +2120,6 @@ def _run_games_batched_tactical(
         if traj_b is not None:
             results.append((traj_b, result, "mirror_b", game_army_types[i]))
     return results
-
-
-def replay_log_probs_batch(
-    model: StrategicModel,
-    all_trajectories: list[list[TrajectoryRound]],
-) -> list[list[RoundRecord]]:
-    """Replay forward passes for ALL episodes in one batched call.
-
-    Takes a list of per-episode trajectories (each from a worker) and produces
-    per-episode lists of RoundRecord objects compatible with compute_loss().
-    Vectorises both the model forward pass and the log-prob computation.
-    """
-    # Flatten all rounds across all episodes into one batch
-    flat_trajs: list[TrajectoryRound] = []
-    episode_lengths: list[int] = []         # rounds per episode
-    for traj in all_trajectories:
-        episode_lengths.append(len(traj))
-        flat_trajs.extend(traj)
-
-    n_rounds_total = len(flat_trajs)
-    n_units = MAX_UNITS_PER_SIDE  # 10
-
-    # Stack state vectors → (N, 591)
-    state_batch = torch.tensor(
-        [t.state_vec for t in flat_trajs], dtype=torch.float32,
-    )
-
-    # Batched forward pass → each output is (N, 10, ...) or (N, 10)
-    role_probs, obj_probs, target_priority, act_scores, combat_prefs, stance_probs, values = model(state_batch)
-    # role_probs: (N, 10, 2), obj_probs: (N, 10, 5), combat_prefs: (N, 10), stance_probs: (N, 10, 3), values: (N,)
-
-    # Build action-index and mask tensors — (N, 10)
-    role_indices = torch.zeros(n_rounds_total, n_units, dtype=torch.long)
-    obj_indices = torch.zeros(n_rounds_total, n_units, dtype=torch.long)
-    combat_indices = torch.zeros(n_rounds_total, n_units)
-    stance_indices = torch.zeros(n_rounds_total, n_units, dtype=torch.long)
-    alive_mask = torch.zeros(n_rounds_total, n_units, dtype=torch.bool)
-
-    for r, traj in enumerate(flat_trajs):
-        for u in range(n_units):
-            if traj.unit_alive_mask[u]:
-                alive_mask[r, u] = True
-                ri, oi, ci, si = traj.unit_actions[u]
-                role_indices[r, u] = ri
-                obj_indices[r, u] = oi
-                combat_indices[r, u] = float(ci)
-                stance_indices[r, u] = si
-
-    # Vectorised log-probs and entropies across all (round, unit) pairs at once
-    # Role: Categorical over dim=-1 of (N, 10, 2)
-    role_dist = torch.distributions.Categorical(probs=role_probs)
-    role_lp = role_dist.log_prob(role_indices)   # (N, 10)
-    role_ent = role_dist.entropy()               # (N, 10)
-
-    obj_dist = torch.distributions.Categorical(probs=obj_probs)
-    obj_lp = obj_dist.log_prob(obj_indices)
-    obj_ent = obj_dist.entropy()
-
-    combat_dist = torch.distributions.Bernoulli(probs=combat_prefs)
-    combat_lp = combat_dist.log_prob(combat_indices)
-    combat_ent = combat_dist.entropy()
-
-    stance_dist = torch.distributions.Categorical(probs=stance_probs)
-    stance_lp = stance_dist.log_prob(stance_indices)
-    stance_ent = stance_dist.entropy()
-
-    # Sum across heads, mask dead units → per-round scalars
-    total_lp = (role_lp + obj_lp + combat_lp + stance_lp) * alive_mask   # (N, 10)
-    total_ent = (role_ent + obj_ent + combat_ent + stance_ent) * alive_mask
-
-    per_round_lp = total_lp.sum(dim=1)         # (N,)
-    per_round_ent = total_ent.sum(dim=1)        # (N,)
-    alive_counts = alive_mask.sum(dim=1).float() * 4  # 4 distributions per alive unit
-    mean_ent = per_round_ent / alive_counts.clamp(min=1)
-
-    # Split back into per-episode lists of RoundRecord
-    all_records: list[list[RoundRecord]] = []
-    idx = 0
-    for ep_i, ep_len in enumerate(episode_lengths):
-        records: list[RoundRecord] = []
-        for r in range(ep_len):
-            records.append(RoundRecord(
-                log_prob=per_round_lp[idx],
-                entropy=mean_ent[idx],
-                reward=flat_trajs[idx].reward,
-                value=values[idx],
-            ))
-            idx += 1
-        all_records.append(records)
-
-    return all_records
-
-
-def replay_tactical_log_probs_batch(
-    model: TacticalModel,
-    all_trajectories: list[list[TacticalActivationRecord]],
-) -> list[list[RoundRecord]]:
-    """Replay forward passes for ALL tactical episodes — delegates to flat replay.
-
-    Returns per-episode lists of RoundRecord (reused for compute_loss compat).
-    """
-    flat_result = replay_tactical_log_probs_flat(model, all_trajectories)
-
-    # Split flat tensors back into per-episode lists
-    episode_lengths = [len(traj) for traj in all_trajectories]
-    flat_steps = [step for traj in all_trajectories for step in traj]
-
-    all_records: list[list[RoundRecord]] = []
-    idx = 0
-    for ep_len in episode_lengths:
-        records: list[RoundRecord] = []
-        for _ in range(ep_len):
-            records.append(RoundRecord(
-                log_prob=flat_result.log_probs[idx],
-                entropy=flat_result.entropies[idx],
-                reward=flat_steps[idx].reward,
-                value=flat_result.values[idx],
-            ))
-            idx += 1
-        all_records.append(records)
-
-    return all_records
-
 
 # ---------------------------------------------------------------------------
 # Flat (vectorized) replay + loss for tactical model — avoids per-step objects
@@ -2724,7 +2201,7 @@ def replay_tactical_log_probs_flat(
     enemy_alive_batch = torch.from_numpy(enemy_alive_np)
 
     # === Trunk ===
-    h, u_attended = model.trunk(state_batch)                      # (N, 512), (N, 20, 180)
+    h, u_attended, _attn_w, round_onehot = model.trunk(state_batch)  # (N, 512), (N, 20, 180), ..., (N, 4)
     if torch.isnan(h).any() or torch.isinf(h).any():
         print("  WARNING: NaN/Inf in trunk output during replay — clamping")
         h = torch.nan_to_num(h, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -2772,8 +2249,8 @@ def replay_tactical_log_probs_flat(
         shoot_mask_batch = enemy_alive_batch
     shoot_logits = shoot_logits.masked_fill(~shoot_mask_batch, float('-inf'))
 
-    # === Value ===
-    values = model.value_head(h).squeeze(-1)
+    # === Value (round-conditioned) ===
+    values = model.value_head(h, round_onehot)
 
     # === Log-probs & entropies ===
     eps = 1e-8
@@ -3146,241 +2623,17 @@ def _compute_aux_loss(
 
 
 # ---------------------------------------------------------------------------
-# Single game episode (training mode — sequential fallback)
-# ---------------------------------------------------------------------------
-
-def _run_training_episode(
-    model: StrategicModel,
-    army_a: list[ResolvedUnit],
-    army_b: list[ResolvedUnit],
-    units_a: list[UnitState],
-    units_b: list[UnitState],
-    opponent_type: str,
-    opponent_model: StrategicModel | None,
-    shaping_scale: float = 1.0,
-) -> tuple[list[RoundRecord], str, str]:
-    """Run a single game episode collecting training data.
-
-    The model always controls Player A.
-    Returns (round_records, game_result, opponent_type).
-    """
-    from game import (
-        deploy_armies, _collect_enemy_positions, _sync_dead_models,
-    )
-    from ai import (
-        pick_target, choose_action_and_goal, activation_order,
-        assign_objectives, reassign_roles,
-    )
-    from combat import resolve_shooting, check_morale, resolve_melee, resolve_impact, check_melee_morale
-    from movement import (
-        execute_movement, execute_charge_movement, execute_counter_charge,
-        post_melee_separation, consolidation_move,
-    )
-    from board import OBJECTIVES as BOARD_OBJECTIVES
-
-    board = Board()
-    deploy_armies(units_a, units_b, board)
-
-    # Precompute damage bases
-    fr_a, fm_a = precompute_damage([u.unit for u in units_a], [u.unit for u in units_b])
-    fr_b, fm_b = precompute_damage([u.unit for u in units_b], [u.unit for u in units_a])
-    pts_a = sum(u.unit.points for u in units_a)
-    pts_b = sum(u.unit.points for u in units_b)
-
-    # Heuristic opponent: assign objectives for Player B
-    if opponent_type == "heuristic":
-        assign_objectives(units_b)
-
-    a_first = random.random() < 0.5
-    a_finished_first = a_first
-
-    round_records: list[RoundRecord] = []
-    prev_a_kill_pts = 0.0
-    prev_b_kill_pts = 0.0
-
-    for round_num in range(1, 5):
-        # Reset activations
-        for u in units_a + units_b:
-            u.activated = False
-            u.fatigued = False
-
-        current_is_a = a_first if round_num == 1 else a_finished_first
-
-        # --- Player A (ML model) forward pass ---
-        state_vec = encode_state(
-            units_a, units_b, round_num, board, "A",
-            friendly_ranged_matchups=fr_a, friendly_melee_matchups=fm_a,
-            enemy_ranged_matchups=fr_b, enemy_melee_matchups=fm_b,
-            total_friendly_points=pts_a, total_enemy_points=pts_b,
-        )
-        role_probs, obj_probs, target_priority, act_scores, combat_prefs, stance_probs, _value = model(state_vec)
-        target_mults_a, record = sample_actions_and_record(
-            role_probs, obj_probs, target_priority, act_scores,
-            combat_prefs, stance_probs, units_a, "A",
-        )
-
-        # --- Player B decisions ---
-        target_mults_b = None
-        if opponent_type == "heuristic":
-            reassign_roles(units_b)
-        elif opponent_model is not None:
-            from ml_integration import apply_model_outputs
-            target_mults_b, _ = apply_model_outputs(
-                opponent_model, units_b, units_a, round_num, board, "B",
-                friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
-                enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
-                total_friendly_points=pts_b, total_enemy_points=pts_a,
-            )
-
-        # --- Run the round (alternating activations) ---
-        a_done = False
-        b_done = False
-        a_finished_first = True
-
-        while True:
-            if current_is_a:
-                my_units, opp_units = units_a, units_b
-                my_ml = True
-                my_mults = target_mults_a
-            else:
-                my_units, opp_units = units_b, units_a
-                my_ml = (opponent_type != "heuristic")
-                my_mults = target_mults_b
-
-            if my_ml and current_is_a:
-                ordered = ml_activation_order(my_units)
-            elif my_ml and not current_is_a and opponent_model is not None:
-                ordered = ml_activation_order(my_units)
-            else:
-                ordered = activation_order(my_units, enemies=opp_units, mode="objectives")
-            active = ordered[0] if ordered else None
-
-            if active is None:
-                if current_is_a:
-                    a_done = True
-                    if not b_done:
-                        a_finished_first = True
-                else:
-                    b_done = True
-                    if not a_done:
-                        a_finished_first = False
-                if a_done and b_done:
-                    break
-                current_is_a = not current_is_a
-                continue
-
-            active.activated = True
-
-            action, goal, charge_target, _reason = choose_action_and_goal(
-                active, opp_units, board, mode="objectives",
-                target_multipliers=my_mults,
-            )
-
-            if action == "charge" and charge_target is not None:
-                enemy_positions = _collect_enemy_positions(opp_units)
-                execute_charge_movement(active, charge_target, board, enemy_positions)
-                execute_counter_charge(charge_target, active, board)
-
-                if active.unit.impact > 0:
-                    resolve_impact(active, charge_target)
-                    _sync_dead_models(charge_target, board)
-
-                charger_wounds = 0
-                if charge_target.models_alive > 0:
-                    charger_wounds = resolve_melee(active, charge_target, is_charge=True) or 0
-                    _sync_dead_models(charge_target, board)
-
-                defender_wounds = 0
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    defender_wounds = resolve_melee(charge_target, active, is_strike_back=True) or 0
-                    _sync_dead_models(active, board)
-
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    check_melee_morale(active, charger_wounds, defender_wounds)
-                    check_melee_morale(charge_target, defender_wounds, charger_wounds)
-                    _sync_dead_models(active, board)
-                    _sync_dead_models(charge_target, board)
-
-                active.fatigued = True
-                if charge_target.models_alive > 0:
-                    charge_target.fatigued = True
-
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    enemy_positions = _collect_enemy_positions(opp_units)
-                    post_melee_separation(active, charge_target, board, enemy_positions)
-                elif active.models_alive > 0:
-                    consolidation_move(active, board, opp_units, BOARD_OBJECTIVES, "objectives")
-                elif charge_target.models_alive > 0:
-                    consolidation_move(charge_target, board, my_units, BOARD_OBJECTIVES, "objectives")
-
-            elif action in ("advance", "rush") and goal is not None:
-                budget = active.unit.advance_distance if action == "advance" else active.unit.rush_distance
-                enemy_positions = _collect_enemy_positions(opp_units)
-                execute_movement(active, goal, budget, board, enemy_positions,
-                                 flying=active.unit.flying)
-
-                if action != "rush":
-                    if active.shaken:
-                        active.shaken = False
-                    else:
-                        target = pick_target(active, opp_units, target_multipliers=my_mults)
-                        if target is not None:
-                            resolve_shooting(active, target)
-                            check_morale(target)
-                            _sync_dead_models(target, board)
-
-            elif action == "hold":
-                if active.shaken:
-                    active.shaken = False
-                else:
-                    target = pick_target(active, opp_units, target_multipliers=my_mults)
-                    if target is not None:
-                        resolve_shooting(active, target)
-                        check_morale(target)
-                        _sync_dead_models(target, board)
-
-            current_is_a = not current_is_a
-
-        # End of round: update objectives
-        board.update_objectives(units_a, units_b)
-
-        # Compute round reward for Player A
-        reward, prev_a_kill_pts, prev_b_kill_pts = compute_round_reward(
-            units_a, units_b, board, "A", pts_a,
-            prev_a_kill_pts, prev_b_kill_pts,
-            shaping_scale=shaping_scale,
-        )
-        record.reward = reward
-        round_records.append(record)
-
-    # Determine winner
-    a_objs = board.count_objectives("A")
-    b_objs = board.count_objectives("B")
-    if a_objs > b_objs:
-        result = "A"
-    elif b_objs > a_objs:
-        result = "B"
-    else:
-        result = "draw"
-
-    # Add terminal reward to round 4
-    round_records[-1].reward += terminal_reward(result, "A", a_objs, b_objs)
-
-    return round_records, result, opponent_type
-
-
-# ---------------------------------------------------------------------------
 # GAE advantage estimation
 # ---------------------------------------------------------------------------
 
 def compute_gae(
-    all_trajectories: list[list[TrajectoryRound]],
+    all_trajectories: list[list[TacticalActivationRecord]],
     gamma: float = 1.0,
     gae_lambda: float = 0.95,
 ) -> tuple[list[list[float]], list[list[float]]]:
     """Compute GAE advantages and returns for all episodes.
 
-    Uses old_value from collection time (stored in TrajectoryRound).
+    Uses old_value from collection time (stored in TacticalActivationRecord).
     Returns (all_advantages, all_returns).
     """
     all_advantages: list[list[float]] = []
@@ -3401,79 +2654,6 @@ def compute_gae(
         all_returns.append(returns)
 
     return all_advantages, all_returns
-
-
-# ---------------------------------------------------------------------------
-# Batch update (PPO clipped surrogate)
-# ---------------------------------------------------------------------------
-
-def compute_loss(
-    episodes: list[tuple[list[RoundRecord], str]],
-    all_trajectories: list[list[TrajectoryRound]],
-    all_advantages: list[list[float]],
-    all_returns: list[list[float]],
-    clip_epsilon: float,
-    value_coeff: float,
-    entropy_coeff: float,
-) -> tuple[torch.Tensor, dict]:
-    """Compute PPO clipped surrogate loss across a batch of episodes.
-
-    Returns (loss, metrics_dict).
-    """
-    policy_losses: list[torch.Tensor] = []
-    value_losses: list[torch.Tensor] = []
-    entropies: list[torch.Tensor] = []
-    n_clipped = 0
-    n_total = 0
-    total_reward = 0.0
-    n_episodes = len(episodes)
-
-    for ep_i, (round_records, opponent_type) in enumerate(episodes):
-        trajectory = all_trajectories[ep_i]
-        advantages = all_advantages[ep_i]
-        returns = all_returns[ep_i]
-        game_reward = sum(r.reward for r in round_records)
-        total_reward += game_reward
-
-        for r_i, record in enumerate(round_records):
-            old_lp = trajectory[r_i].old_log_prob
-            advantage = advantages[r_i]
-
-            # PPO clipped surrogate
-            ratio = torch.exp((record.log_prob - old_lp).clamp(-5.0, 5.0))
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon) * advantage
-            policy_losses.append(-torch.min(surr1, surr2))
-            n_clipped += int(((ratio - 1.0).abs() > clip_epsilon).sum().item())
-            n_total += ratio.numel()
-
-            # Value loss
-            if record.value is not None:
-                value_losses.append((record.value - returns[r_i]) ** 2)
-
-            entropies.append(record.entropy)
-
-    n_rounds = len(policy_losses)
-    if n_rounds > 0:
-        mean_policy_loss = torch.stack(policy_losses).mean()
-        mean_entropy = torch.stack(entropies).mean()
-        mean_value_loss = torch.stack(value_losses).mean() if value_losses else torch.tensor(0.0)
-    else:
-        mean_policy_loss = torch.tensor(0.0)
-        mean_entropy = torch.tensor(0.0)
-        mean_value_loss = torch.tensor(0.0)
-
-    loss = mean_policy_loss + value_coeff * mean_value_loss - entropy_coeff * mean_entropy
-
-    metrics = {
-        "loss": loss.item(),
-        "policy_loss": mean_policy_loss.item(),
-        "value_loss": mean_value_loss.item(),
-        "mean_entropy": mean_entropy.item(),
-        "mean_reward": total_reward / max(n_episodes, 1),
-        "clip_frac": n_clipped / max(n_total, 1),
-    }
-    return loss, metrics
 
 
 # ---------------------------------------------------------------------------
@@ -3731,6 +2911,7 @@ def run_training(
         config = TrainingConfig()
 
     is_tactical = config.model_type == "tactical"
+    device = _resolve_device(config.device)
 
     # Toggle C extension in main process
     import fast_core
@@ -3744,7 +2925,10 @@ def run_training(
         print(f"Loaded {len(hof_armies)} HoF armies, {len(hof_ml_armies)} HoF-ML armies")
 
     if verbose:
-        print(f"Model type: {config.model_type} | C extension: {c_ext_label}")
+        device_label = str(device)
+        if device.type == "cuda":
+            device_label += f" ({torch.cuda.get_device_name(device)})"
+        print(f"Model type: {config.model_type} | C extension: {c_ext_label} | Device: {device_label}")
 
     model = _make_model(config.model_type)
     start_batch = 0
@@ -3804,6 +2988,7 @@ def run_training(
                 if verbose:
                     print(f"Removed {to_remove} old checkpoint file(s)")
 
+    model.to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
@@ -3811,7 +2996,7 @@ def run_training(
     entropy_tuner: EntropyTargetTuner | None = None
     alpha_optimizer: torch.optim.Adam | None = None
     if is_tactical and config.use_entropy_targets:
-        entropy_tuner = EntropyTargetTuner(config)
+        entropy_tuner = EntropyTargetTuner(config).to(device)
         # Load tuner state if resuming
         if not restart:
             tuner_path = Path(config.checkpoint_dir) / "entropy_tuner.pt"
@@ -3897,8 +3082,9 @@ def run_training(
         heuristic_fraction = get_heuristic_fraction(metrics.heuristic_win_rate)
 
         # --- Phase 1: build game specs and deduplicate opponent weights ---
-        # Copy current training weights to shared memory (fast in-place copy)
-        shared_model.load_state_dict(model.state_dict())
+        # Copy current training weights to shared memory (map to CPU for workers)
+        cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()} if device.type != "cpu" else model.state_dict()
+        shared_model.load_state_dict(cpu_sd)
 
         game_specs = []           # per-game: (res_a, res_b, sa_data, sb_data, opp_type, opp_sd_index)
         opponent_state_dicts = [] # deduplicated list of opponent state dicts
@@ -4007,15 +3193,15 @@ def run_training(
         if is_tactical:
             flat_old_lps = torch.tensor(
                 [s.old_log_prob for traj in all_trajs for s in traj],
-                dtype=torch.float32,
+                dtype=torch.float32, device=device,
             )
             flat_advantages_t = torch.tensor(
                 [a for adv in all_advantages for a in adv],
-                dtype=torch.float32,
+                dtype=torch.float32, device=device,
             )
             flat_returns_t = torch.tensor(
                 [r for ret in all_returns for r in ret],
-                dtype=torch.float32,
+                dtype=torch.float32, device=device,
             )
             # Precompute per-game step counts and cumulative offsets for minibatching
             game_step_counts = [len(traj) for traj in all_trajs]
@@ -4047,21 +3233,22 @@ def run_training(
                         mb_flat_idx.extend(range(off, off + game_step_counts[gi]))
                     if not mb_flat_idx:
                         continue
-                    idx_t = torch.tensor(mb_flat_idx, dtype=torch.long)
+                    idx_t = torch.tensor(mb_flat_idx, dtype=torch.long, device=device)
                     mb_old_lps = flat_old_lps[idx_t]
                     mb_advantages = flat_advantages_t[idx_t]
                     mb_returns = flat_returns_t[idx_t]
 
-                    # Forward pass on minibatch
-                    mb_flat_result = replay_tactical_log_probs_flat(model, mb_trajs)
-                    mb_flat_steps = [s for traj in mb_trajs for s in traj]
-                    loss, loss_metrics = compute_loss_flat(
-                        mb_flat_result, mb_old_lps, mb_advantages, mb_returns,
-                        config.clip_epsilon, config.value_coeff, entropy_coeff,
-                        aux_coeff=config.aux_coeff, aux_ratio=config.aux_ratio,
-                        flat_steps=mb_flat_steps,
-                        entropy_tuner=entropy_tuner,
-                    )
+                    # Forward pass + loss on minibatch (device-aware)
+                    with _force_tensor_device(device):
+                        mb_flat_result = replay_tactical_log_probs_flat(model, mb_trajs)
+                        mb_flat_steps = [s for traj in mb_trajs for s in traj]
+                        loss, loss_metrics = compute_loss_flat(
+                            mb_flat_result, mb_old_lps, mb_advantages, mb_returns,
+                            config.clip_epsilon, config.value_coeff, entropy_coeff,
+                            aux_coeff=config.aux_coeff, aux_ratio=config.aux_ratio,
+                            flat_steps=mb_flat_steps,
+                            entropy_tuner=entropy_tuner,
+                        )
 
                     optimizer.zero_grad()
                     if alpha_optimizer is not None:
@@ -4119,53 +3306,16 @@ def run_training(
 
             elif is_tactical:
                 # Full-batch tactical path (minibatch disabled or batch too small)
-                flat_result = replay_tactical_log_probs_flat(model, all_trajs)
-                _flat_steps = [s for traj in all_trajs for s in traj]
-                loss, loss_metrics = compute_loss_flat(
-                    flat_result, flat_old_lps, flat_advantages_t, flat_returns_t,
-                    config.clip_epsilon, config.value_coeff, entropy_coeff,
-                    aux_coeff=config.aux_coeff, aux_ratio=config.aux_ratio,
-                    flat_steps=_flat_steps,
-                    entropy_tuner=entropy_tuner,
-                )
-
-                optimizer.zero_grad()
-                if alpha_optimizer is not None:
-                    alpha_optimizer.zero_grad()
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"  WARNING: NaN/Inf loss at batch {batch_num}, rolling back weights")
-                    model.load_state_dict(pre_ppo_state)
-                    nan_detected = True
-                    break
-                loss.backward()
-
-                alpha_loss_tensor = loss_metrics.pop("_alpha_loss_tensor", None)
-                if alpha_loss_tensor is not None and alpha_optimizer is not None:
-                    alpha_loss_tensor.backward()
-                    alpha_optimizer.step()
-
-                grad_nan = any(
-                    p.grad is not None and torch.isnan(p.grad).any()
-                    for p in model.parameters()
-                )
-                if grad_nan:
-                    print(f"  WARNING: NaN gradients at batch {batch_num}, rolling back weights")
-                    model.load_state_dict(pre_ppo_state)
-                    nan_detected = True
-                    break
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-            else:
-                all_records = replay_log_probs_batch(model, all_trajs)
-
-                episodes: list[tuple[list[RoundRecord], str]] = []
-                for round_records, ot in zip(all_records, opp_types):
-                    episodes.append((round_records, ot))
-
-                loss, loss_metrics = compute_loss(
-                    episodes, all_trajs, all_advantages, all_returns,
-                    config.clip_epsilon, config.value_coeff, entropy_coeff,
-                )
+                with _force_tensor_device(device):
+                    flat_result = replay_tactical_log_probs_flat(model, all_trajs)
+                    _flat_steps = [s for traj in all_trajs for s in traj]
+                    loss, loss_metrics = compute_loss_flat(
+                        flat_result, flat_old_lps, flat_advantages_t, flat_returns_t,
+                        config.clip_epsilon, config.value_coeff, entropy_coeff,
+                        aux_coeff=config.aux_coeff, aux_ratio=config.aux_ratio,
+                        flat_steps=_flat_steps,
+                        entropy_tuner=entropy_tuner,
+                    )
 
                 optimizer.zero_grad()
                 if alpha_optimizer is not None:
@@ -4286,6 +3436,11 @@ def run_training(
 
     pool.close()
     pool.join()
+
+    # Move model back to CPU for saving and downstream use
+    model.to("cpu")
+    if entropy_tuner is not None:
+        entropy_tuner.to("cpu")
 
     # Close training log
     _log_writer.writerow([datetime.now().isoformat(), "---",

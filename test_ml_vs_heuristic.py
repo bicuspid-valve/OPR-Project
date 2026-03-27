@@ -45,20 +45,12 @@ def _load_ml_model():
         raise FileNotFoundError(f"ML model not found: {model_path}")
 
     from ml_model_tactical import TacticalModel
-    from ml_model import StrategicModel
 
     state_dict = load_model_state_dict(model_path)
-    try:
-        model = TacticalModel()
-        model.load_state_dict(state_dict)
-        model_type = "tactical"
-    except RuntimeError:
-        model = StrategicModel()
-        model.load_state_dict(state_dict, strict=False)
-        model_type = "strategic"
-
+    model = TacticalModel()
+    model.load_state_dict(state_dict)
     model.eval()
-    return model, model_type
+    return model, "tactical"
 
 
 def run_test(num_games: int = 50):

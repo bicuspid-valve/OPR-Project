@@ -443,7 +443,7 @@ def batched_argmax_tactical(
     enemy_alive_batch = torch.stack([r.enemy_alive_mask for r in requests]) # (N, 10)
 
     # Trunk
-    h, u_attended = model.trunk(state_batch)                                # (N, 512), (N, 20, 180)
+    h, u_attended, _attn_w, _round_oh = model.trunk(state_batch)              # (N, 512), (N, 20, 180), (N, 20, 20)
 
     # Unit selection (argmax)
     unit_logits = model.unit_selection_head(h)                              # (N, 10)
@@ -475,7 +475,7 @@ def batched_argmax_tactical(
     charge_indices = charge_logits.argmax(dim=-1)                           # (N,)
 
     # Value
-    values = model.value_head(h).squeeze(-1)                                # (N,)
+    values = model.value_head(h, _round_oh).squeeze(-1)                      # (N,)
 
     # Per-sample: decode direction/distance, compute post-move position + post_move_rel
     unit_list = unit_indices.tolist()
@@ -615,6 +615,11 @@ def apply_tactical_model(
 
     # --- Forward pass 1: get unit + move_type + direction/distance ---
     _t2 = time.perf_counter()
+    # Run trunk separately to capture attention weights for viewer
+    h_trunk, u_attended_trunk, attn_weights, _ = model.trunk(state_vec.unsqueeze(0))
+    h_trunk = h_trunk.squeeze(0)
+    u_attended_trunk = u_attended_trunk.squeeze(0)
+    attn_weights = attn_weights.squeeze(0)  # (20, 20)
     out = model(state_vec, alive_mask, enemy_alive_mask)
     _t3 = time.perf_counter()
     _timing_forward_s += _t3 - _t2
@@ -713,11 +718,14 @@ def apply_tactical_model(
             else None
             for i, eu in enumerate(enemy_units)
         ] + [None] * (MAX_UNITS_PER_SIDE - len(enemy_units)),
+        # Attention weights: mean attention received by each of the 20 unit slots
+        # (averaged across all query positions). Slots 0-9 = friendly, 10-19 = enemy.
+        'attention_weights': attn_weights.mean(dim=0).tolist(),  # (20,)
     }
 
     # Auxiliary prediction heads (survival + objective control)
     if hasattr(model, 'aux_friendly_survival_head'):
-        h, _u = model.trunk(state_vec.unsqueeze(0))  # (1, H)
+        h, _u, _aw, _ = model.trunk(state_vec.unsqueeze(0))  # (1, H)
         fs_raw = model.aux_friendly_survival_head(h).view(MAX_UNITS_PER_SIDE, 2)
         fs_alpha = F.softplus(fs_raw[:, 0]) + 0.01
         fs_beta = F.softplus(fs_raw[:, 1]) + 0.01
@@ -794,7 +802,7 @@ def apply_tactical_model_sampling(
     am = alive_mask.unsqueeze(0)
 
     # --- Trunk ---
-    h, u_attended = model.trunk(x)
+    h, u_attended, _attn_w, _ = model.trunk(x)
 
     # --- Unit selection (sample) ---
     unit_logits = model.unit_selection_head(h)

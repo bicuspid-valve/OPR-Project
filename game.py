@@ -28,9 +28,6 @@ from ai import (
 )
 
 
-def _is_tactical_model(model) -> bool:
-    """Return True if model is a TacticalModel (per-activation), False for StrategicModel."""
-    return hasattr(model, 'unit_selection_head')
 
 
 # ===================================================================
@@ -296,27 +293,19 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
 
     # ML setup: lazy imports and precomputed damage bases
     use_ml = ml_model_a is not None or ml_model_b is not None
-    _tactical_a = ml_model_a is not None and _is_tactical_model(ml_model_a)
-    _tactical_b = ml_model_b is not None and _is_tactical_model(ml_model_b)
     if use_ml:
+        from ml_features import precompute_damage
         if ml_sampling:
-            from ml_integration import ml_activation_order
-            from ml_integration import apply_model_outputs_sampling as apply_model_outputs
-            from ml_features import precompute_damage
-            if _tactical_a or _tactical_b:
-                from ml_integration_tactical import (
-                    apply_tactical_model_sampling as apply_tactical_model,
-                    pick_target_from_ranking,
-                )
+            from ml_integration_tactical import (
+                apply_tactical_model_sampling as apply_tactical_model,
+                pick_target_from_ranking,
+            )
         else:
-            from ml_integration import apply_model_outputs, ml_activation_order
-            from ml_features import precompute_damage
-            if _tactical_a or _tactical_b:
-                from ml_integration_tactical import (
-                    apply_tactical_model,
-                    pick_target_from_ranking,
-                )
-        if ml_planning and (_tactical_a or _tactical_b):
+            from ml_integration_tactical import (
+                apply_tactical_model,
+                pick_target_from_ranking,
+            )
+        if ml_planning:
             from ml_planning import plan_activation as _plan_activation
         _fr_a, _fm_a = precompute_damage([u.unit for u in units_a],
                                          [u.unit for u in units_b])
@@ -360,24 +349,6 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
             if ml_model_b is None:
                 reassign_roles(units_b)
 
-        # ML forward pass at round start
-        target_mults_a = None
-        target_mults_b = None
-        if ml_model_a is not None and not _tactical_a:
-            target_mults_a, _ = apply_model_outputs(
-                ml_model_a, units_a, units_b, round_num + 1, board, "A",
-                friendly_ranged_matchups=_fr_a, friendly_melee_matchups=_fm_a,
-                enemy_ranged_matchups=_fr_b, enemy_melee_matchups=_fm_b,
-                total_friendly_points=_pts_a, total_enemy_points=_pts_b,
-            )
-        if ml_model_b is not None and not _tactical_b:
-            target_mults_b, _ = apply_model_outputs(
-                ml_model_b, units_b, units_a, round_num + 1, board, "B",
-                friendly_ranged_matchups=_fr_b, friendly_melee_matchups=_fm_b,
-                enemy_ranged_matchups=_fr_a, enemy_melee_matchups=_fm_a,
-                total_friendly_points=_pts_b, total_enemy_points=_pts_a,
-            )
-
         # Track who finishes first
         a_done = False
         b_done = False
@@ -388,8 +359,6 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
             if current_is_a:
                 my_units, opp_units = units_a, units_b
                 my_ml = ml_model_a
-                my_mults = target_mults_a
-                my_tactical = _tactical_a
                 _my_fr, _my_fm = (_fr_a, _fm_a) if use_ml else (None, None)
                 _opp_fr, _opp_fm = (_fr_b, _fm_b) if use_ml else (None, None)
                 my_pts, opp_pts = (_pts_a, _pts_b) if use_ml else (0, 0)
@@ -397,8 +366,6 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
             else:
                 my_units, opp_units = units_b, units_a
                 my_ml = ml_model_b
-                my_mults = target_mults_b
-                my_tactical = _tactical_b
                 _my_fr, _my_fm = (_fr_b, _fm_b) if use_ml else (None, None)
                 _opp_fr, _opp_fm = (_fr_a, _fm_a) if use_ml else (None, None)
                 my_pts, opp_pts = (_pts_b, _pts_a) if use_ml else (0, 0)
@@ -413,7 +380,7 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
             _ml_reason = ""
 
             # Tactical model: per-activation
-            if my_ml is not None and my_tactical:
+            if my_ml is not None:
                 if _tactical_inference_fn is not None:
                     # Injected inference (used by coroutine batching)
                     active, _ml_target_ranking, _ml_action, _ml_goal, _ml_charge_target, _ml_reason = (
@@ -445,10 +412,6 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                             total_friendly_points=my_pts, total_enemy_points=opp_pts,
                         ))
                     _ml_tac_decision = active is not None
-            elif my_ml is not None:
-                # Strategic model: use pre-computed activation order
-                ordered = ml_activation_order(my_units)
-                active = ordered[0] if ordered else None
             else:
                 ordered = activation_order(my_units, enemies=opp_units, mode=mode)
                 active = ordered[0] if ordered else None
@@ -477,7 +440,7 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
             else:
                 action, goal, charge_target, _reason = choose_action_and_goal(
                     active, opp_units, board, mode=mode,
-                    target_multipliers=my_mults)
+)
 
             if action == "charge" and charge_target is not None:
                 # Full charge sequence
@@ -543,7 +506,7 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                             target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                         else:
                             target = pick_target(active, opp_units,
-                                                 target_multipliers=my_mults)
+                             )
                         if target is not None:
                             resolve_shooting(active, target)
                             check_morale(target)
@@ -558,7 +521,7 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                         target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                     else:
                         target = pick_target(active, opp_units,
-                                             target_multipliers=my_mults)
+                         )
                     if target is not None:
                         resolve_shooting(active, target)
                         check_morale(target)
@@ -633,10 +596,6 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
 
     deploy_armies(units_a, units_b, board)
 
-    _tactical_a = ml_model_a is not None and _is_tactical_model(ml_model_a)
-    _tactical_b = ml_model_b is not None and _is_tactical_model(ml_model_b)
-
-    from ml_integration import apply_model_outputs, ml_activation_order
     from ml_features import precompute_damage
 
     _fr_a, _fm_a = precompute_damage([u.unit for u in units_a],
@@ -671,24 +630,6 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
             if ml_model_b is None:
                 reassign_roles(units_b)
 
-        # Strategic model round-start pass (for non-tactical sides)
-        target_mults_a = None
-        target_mults_b = None
-        if ml_model_a is not None and not _tactical_a:
-            target_mults_a, _ = apply_model_outputs(
-                ml_model_a, units_a, units_b, round_num + 1, board, "A",
-                friendly_ranged_matchups=_fr_a, friendly_melee_matchups=_fm_a,
-                enemy_ranged_matchups=_fr_b, enemy_melee_matchups=_fm_b,
-                total_friendly_points=_pts_a, total_enemy_points=_pts_b,
-            )
-        if ml_model_b is not None and not _tactical_b:
-            target_mults_b, _ = apply_model_outputs(
-                ml_model_b, units_b, units_a, round_num + 1, board, "B",
-                friendly_ranged_matchups=_fr_b, friendly_melee_matchups=_fm_b,
-                enemy_ranged_matchups=_fr_a, enemy_melee_matchups=_fm_a,
-                total_friendly_points=_pts_b, total_enemy_points=_pts_a,
-            )
-
         a_done = False
         b_done = False
         a_finished_first = True
@@ -697,8 +638,6 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
             if current_is_a:
                 my_units, opp_units = units_a, units_b
                 my_ml = ml_model_a
-                my_mults = target_mults_a
-                my_tactical = _tactical_a
                 _my_fr, _my_fm = _fr_a, _fm_a
                 _opp_fr, _opp_fm = _fr_b, _fm_b
                 my_pts, opp_pts = _pts_a, _pts_b
@@ -706,8 +645,6 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
             else:
                 my_units, opp_units = units_b, units_a
                 my_ml = ml_model_b
-                my_mults = target_mults_b
-                my_tactical = _tactical_b
                 _my_fr, _my_fm = _fr_b, _fm_b
                 _opp_fr, _opp_fm = _fr_a, _fm_a
                 my_pts, opp_pts = _pts_b, _pts_a
@@ -718,7 +655,7 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
             _ml_target_ranking: list[int] = []
 
             # Tactical per-activation: encode, yield, decode
-            if my_ml is not None and my_tactical:
+            if my_ml is not None:
                 _alive = [
                     (i < len(my_units)
                      and my_units[i].models_alive > 0
@@ -754,9 +691,6 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                     _ml_tac_decision = active is not None
                 else:
                     active = None
-            elif my_ml is not None:
-                ordered = ml_activation_order(my_units)
-                active = ordered[0] if ordered else None
             else:
                 ordered = activation_order(my_units, enemies=opp_units, mode=mode)
                 active = ordered[0] if ordered else None
@@ -783,7 +717,7 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
             else:
                 action, goal, charge_target, _reason = choose_action_and_goal(
                     active, opp_units, board, mode=mode,
-                    target_multipliers=my_mults)
+)
 
             if action == "charge" and charge_target is not None:
                 enemy_positions = _collect_enemy_positions(opp_units)
@@ -832,7 +766,7 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                             target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                         else:
                             target = pick_target(active, opp_units,
-                                                 target_multipliers=my_mults)
+                             )
                         if target is not None:
                             resolve_shooting(active, target)
                             check_morale(target)
@@ -845,7 +779,7 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                         target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                     else:
                         target = pick_target(active, opp_units,
-                                             target_multipliers=my_mults)
+                         )
                     if target is not None:
                         resolve_shooting(active, target)
                         check_morale(target)
@@ -978,33 +912,25 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
 
     # ML setup
     use_ml = ml_model_a is not None or ml_model_b is not None
-    _tactical_a = ml_model_a is not None and _is_tactical_model(ml_model_a)
-    _tactical_b = ml_model_b is not None and _is_tactical_model(ml_model_b)
     if use_ml:
+        from ml_features import precompute_damage
         if ml_sampling:
-            from ml_integration import ml_activation_order
-            from ml_integration import apply_model_outputs_sampling as apply_model_outputs
-            from ml_features import precompute_damage
-            if _tactical_a or _tactical_b:
-                from ml_integration_tactical import (
-                    apply_tactical_model_sampling as apply_tactical_model,
-                    pick_target_from_ranking,
-                )
+            from ml_integration_tactical import (
+                apply_tactical_model_sampling as apply_tactical_model,
+                pick_target_from_ranking,
+            )
         else:
-            from ml_integration import apply_model_outputs, ml_activation_order
-            from ml_features import precompute_damage
-            if _tactical_a or _tactical_b:
-                from ml_integration_tactical import (
-                    apply_tactical_model,
-                    pick_target_from_ranking,
-                )
+            from ml_integration_tactical import (
+                apply_tactical_model,
+                pick_target_from_ranking,
+            )
         _fr_a, _fm_a = precompute_damage([u.unit for u in units_a],
                                          [u.unit for u in units_b])
         _fr_b, _fm_b = precompute_damage([u.unit for u in units_b],
                                          [u.unit for u in units_a])
         _pts_a = sum(u.unit.points for u in units_a)
         _pts_b = sum(u.unit.points for u in units_b)
-        if ml_planning and (_tactical_a or _tactical_b):
+        if ml_planning:
             from ml_planning import plan_activation as _plan_activation
 
     # Deployment
@@ -1042,24 +968,6 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
             if ml_model_b is None:
                 reassign_roles(units_b)
 
-        # ML forward pass at round start (strategic only — tactical runs per activation)
-        target_mults_a = None
-        target_mults_b = None
-        if ml_model_a is not None and not _tactical_a:
-            target_mults_a, ml_assessment = apply_model_outputs(
-                ml_model_a, units_a, units_b, round_num + 1, board, "A",
-                friendly_ranged_matchups=_fr_a, friendly_melee_matchups=_fm_a,
-                enemy_ranged_matchups=_fr_b, enemy_melee_matchups=_fm_b,
-                total_friendly_points=_pts_a, total_enemy_points=_pts_b,
-            )
-        if ml_model_b is not None and not _tactical_b:
-            target_mults_b, _ = apply_model_outputs(
-                ml_model_b, units_b, units_a, round_num + 1, board, "B",
-                friendly_ranged_matchups=_fr_b, friendly_melee_matchups=_fm_b,
-                enemy_ranged_matchups=_fr_a, enemy_melee_matchups=_fm_a,
-                total_friendly_points=_pts_b, total_enemy_points=_pts_a,
-            )
-
         a_done = False
         b_done = False
         a_finished_first = True
@@ -1068,8 +976,6 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
             if current_is_a:
                 my_units, opp_units = units_a, units_b
                 my_ml = ml_model_a
-                my_mults = target_mults_a
-                my_tactical = _tactical_a
                 _my_fr, _my_fm = (_fr_a, _fm_a) if use_ml else (None, None)
                 _opp_fr, _opp_fm = (_fr_b, _fm_b) if use_ml else (None, None)
                 my_pts, opp_pts = (_pts_a, _pts_b) if use_ml else (0, 0)
@@ -1077,8 +983,6 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
             else:
                 my_units, opp_units = units_b, units_a
                 my_ml = ml_model_b
-                my_mults = target_mults_b
-                my_tactical = _tactical_b
                 _my_fr, _my_fm = (_fr_b, _fm_b) if use_ml else (None, None)
                 _opp_fr, _opp_fm = (_fr_a, _fm_a) if use_ml else (None, None)
                 my_pts, opp_pts = (_pts_b, _pts_a) if use_ml else (0, 0)
@@ -1093,7 +997,7 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
             _ml_reason = ""
 
             # Tactical model: run per-activation
-            if my_ml is not None and my_tactical and ml_planning and (ml_planning is True or ml_planning == my_player):
+            if my_ml is not None and ml_planning and (ml_planning is True or ml_planning == my_player):
                 # Monte Carlo planning (eval only)
                 active, _ml_target_ranking, _ml_action, _ml_goal, _ml_charge_target, _ml_reason, _planning_cands = (
                     _plan_activation(
@@ -1108,7 +1012,7 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                     ))
                 _ml_tac_decision = active is not None
                 ml_assessment = {'planning_candidates': _planning_cands} if _planning_cands else None
-            elif my_ml is not None and my_tactical:
+            elif my_ml is not None:
                 active, _ml_target_ranking, _ml_action, _ml_goal, _ml_charge_target, _ml_reason, _assess = (
                     apply_tactical_model(
                         my_ml, my_units, opp_units, round_num + 1, board, my_player,
@@ -1120,9 +1024,6 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                 # Only store assessment from Player A's perspective
                 if current_is_a:
                     ml_assessment = _assess
-            elif my_ml is not None:
-                ordered = ml_activation_order(my_units)
-                active = ordered[0] if ordered else None
             else:
                 ordered = activation_order(my_units, enemies=opp_units, mode=mode)
                 active = ordered[0] if ordered else None
@@ -1150,7 +1051,7 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
             else:
                 action, goal, charge_target, ai_reason = choose_action_and_goal(
                     active, opp_units, board, mode=mode,
-                    target_multipliers=my_mults)
+)
 
             # Build description
             pre_centre = active.centre()
@@ -1259,7 +1160,7 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                             target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                         else:
                             target = pick_target(active, opp_units,
-                                                 target_multipliers=my_mults)
+                             )
                         if target is not None:
                             target_idx = unit_to_idx[id(target)]
                             target_label = labels[target_idx]
@@ -1287,7 +1188,7 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                         target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                     else:
                         target = pick_target(active, opp_units,
-                                             target_multipliers=my_mults)
+                         )
                     if target is not None:
                         target_idx = unit_to_idx[id(target)]
                         target_label = labels[target_idx]
