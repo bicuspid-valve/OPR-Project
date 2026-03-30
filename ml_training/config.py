@@ -124,6 +124,8 @@ class TrainingConfig:
     training_planning_C: int = 3              # action samples per unit (reduced from 4)
     training_planning_M: int = 4              # rollouts per candidate (same as eval)
     training_planning_N: int = 3              # lookahead activations (reduced from 4)
+    # Unit-local advantage blending
+    unit_local_advantage_blend: float = 0.0   # 0 = pure global GAE, 0.2-0.3 = blend in unit-local GAE
 
 
 # ---------------------------------------------------------------------------

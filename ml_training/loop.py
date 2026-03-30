@@ -347,6 +347,7 @@ def run_training(
         all_trajs = [traj_rounds for traj_rounds, _, _, _ in trajectories]
         all_advantages, all_returns = compute_gae(
             all_trajs, gamma=1.0, gae_lambda=config.gae_lambda,
+            unit_local_blend=config.unit_local_advantage_blend,
         )
 
         # Record game outcomes for metrics tracking

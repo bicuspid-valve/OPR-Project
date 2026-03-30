@@ -659,7 +659,8 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
              device: str = "auto",
              planning_rate: float = 0.0,
              planning_rate_end: float | None = None,
-             minibatch_size: int = 64):
+             minibatch_size: int = 64,
+             blend_ratio: float = 0.0):
     """Run a short ML training run and print summary stats.
 
     use_c_ext: if True (default), use the compiled C extension for hot loops
@@ -722,6 +723,7 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
         planning_rate=planning_rate,
         planning_rate_end=planning_rate_end,
         ppo_minibatch_games=minibatch_size,
+        unit_local_advantage_blend=blend_ratio,
     )
     model, metrics = run_training(config=config, verbose=verbose,
                                    restart=restart_training)
@@ -738,8 +740,8 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
 
 
 if __name__ == "__main__":
-    #ml_train(num_batches=300000, batch_size=512, time_limit=(630), model_type="tactical", use_c_ext=True, restart_training=False, memory_max="14G", memory_swap_max="2G", worker_count = 6, planning_rate = 0.02, minibatch_size = 128)
+    ml_train(num_batches=300000, batch_size=512, time_limit=(240), model_type="tactical", use_c_ext=True, restart_training=True, memory_max="14G", memory_swap_max="2G", worker_count = 6, planning_rate = 0.01, minibatch_size = 128, blend_ratio = 0.25)
     #ml_train(num_batches=3, batch_size=256, time_limit=2, model_type="tactical", use_c_ext=False)  # pure Python
     #run_list_evolution(graphic=True, mode="objectives", enforce_forceorg=True, use_ml=True, ml_batch_tactical=False, restart_evolution=False, use_c_ext=True)
-    from play_viewer import play_interactive
-    play_interactive()
+    #from play_viewer import play_interactive
+    #play_interactive()
