@@ -39,6 +39,7 @@ from ml_features import (
     TACTICAL_UNIT_FEATURES,
     encode_state_tactical,
     precompute_damage,
+    extract_can_charge_mask,
     _flip_x, _flip_y,
 )
 from ml_integration_tactical import (
@@ -53,6 +54,9 @@ from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
     NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
 )
+from simulation import start_round, end_round, score_game
+
+_ML_BOTH_SIDES: frozenset[str] = frozenset({"A", "B"})
 
 # ---------------------------------------------------------------------------
 # Default planning parameters (§3.4)
@@ -355,6 +359,8 @@ def simulate_forward(
     by the profiling script.  The active planning path uses _rollout_generator
     which returns values from the planning player's perspective.
     """
+    a_finished_first: bool | None = None
+
     for _ in range(n_activations):
         if current_is_a:
             my_units, opp_units = units_a, units_b
@@ -373,6 +379,9 @@ def simulate_forward(
 
         if not alive_mask.any():
             # This side has no more activatable units; switch
+            if a_finished_first is None:
+                a_finished_first = current_is_a
+
             current_is_a = not current_is_a
             # Check if the other side also done
             if current_is_a:
@@ -380,7 +389,24 @@ def simulate_forward(
             else:
                 other_mask, _ = _build_masks(units_b, units_a)
             if not other_mask.any():
-                break  # Both sides exhausted — evaluate
+                # Both sides exhausted — round boundary
+                # round_num is 1-indexed; pass 0-indexed to engine functions
+                end_round(board, units_a, units_b, round_num - 1, mode)
+                round_num += 1
+                if round_num > 4:
+                    # Game over after round 4 — return actual result
+                    winner = score_game(board, units_a, units_b, mode)
+                    if winner == "A":
+                        return 1.0
+                    if winner == "B":
+                        return -1.0
+                    return 0.0
+                _aff = a_finished_first if a_finished_first is not None else True
+                current_is_a = start_round(
+                    units_a, units_b, round_num - 1, mode,
+                    a_finished_first=_aff, ml_sides=_ML_BOTH_SIDES,
+                )
+                a_finished_first = None
             continue
 
         state_vec = encode_state_tactical(
@@ -594,21 +620,28 @@ def _batched_argmax_forward(
     enemy_batch = torch.stack([r.enemy_alive_mask for r in requests]) # (B, 10)
 
     # Trunk (single pass)
-    h, u_attended, _attn_w, _round_oh = model.trunk(state_batch)         # (B, 512), (B, 20, 180)
+    h, units, _round_oh = model.trunk(state_batch)                        # (B, 512), (B, 20, 200), (B, 4)
 
     # Unit selection — argmax
     unit_logits = model.unit_selection_head(h)                         # (B, 10)
     unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
     unit_indices = unit_logits.argmax(dim=-1)                          # (B,)
 
-    # Extract per-sample unit features from attended embeddings
-    unit_features = u_attended[:, :n_units, :].gather(
+    # Extract per-sample unit features from unit embeddings
+    unit_features = units[:, :n_units, :].gather(
         1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n, 1, TACTICAL_UNIT_FEATURES),
-    ).squeeze(1).detach()                                              # (B, 180)
+    ).squeeze(1).detach()                                              # (B, 200)
+
+    # Extract can_charge mask for each sample's selected unit
+    can_charge_batch = extract_can_charge_mask(state_batch, unit_indices)  # (B, 10)
 
     # Move type — argmax
     h_uf = torch.cat([h, unit_features], dim=-1)                       # (B, 268)
     move_logits = model.move_type_head(h_uf)                           # (B, 4)
+    # Mask charge when no enemy is in charge range
+    no_chargeable = ~can_charge_batch.any(dim=-1)                      # (B,)
+    move_logits = move_logits.clone()
+    move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(no_chargeable, float('-inf'))
     move_indices = move_logits.argmax(dim=-1)                          # (B,)
     move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()      # (B, 4)
 
@@ -617,9 +650,10 @@ def _batched_argmax_forward(
     direction_raw = model.direction_head(h_uf_m)                       # (B, 3)
     distance_raw = model.distance_head(h_uf_m)                        # (B, 2)
 
-    # Charge target — argmax
+    # Charge target — argmax, mask by alive AND chargeable
     charge_logits = model.charge_target_head(h_uf_m)                   # (B, 10)
     charge_logits = charge_logits.masked_fill(~enemy_batch, float('-inf'))
+    charge_logits = charge_logits.masked_fill(~can_charge_batch, float('-inf'))
     no_enemies = ~enemy_batch.any(dim=-1)                              # (B,)
     charge_indices = charge_logits.argmax(dim=-1)                      # (B,)
 
@@ -673,12 +707,14 @@ def _batched_argmax_forward(
     shoot_indices = shoot_logits.argmax(dim=-1)                        # (B,)
 
     # Value head
-    values = model.value_head(h, _round_oh).squeeze(-1)                 # (B,)
+    values = model.value_head(h, _round_oh).reshape(-1)                 # (B,)
 
     # Build target rankings
     charge_list = charge_indices.tolist()
     shoot_list = shoot_indices.tolist()
     val_list = values.tolist()
+    if not isinstance(val_list, list):
+        val_list = [val_list]
 
     results = []
     for i in range(n):
@@ -733,6 +769,7 @@ def _rollout_generator(
 
     # N-step lookahead (replaces simulate_forward)
     la_is_a = not current_is_a  # after our activation, opponent moves next
+    la_a_finished_first: bool | None = None  # track who finishes first this round
 
     for _ in range(N):
         if la_is_a:
@@ -751,13 +788,33 @@ def _rollout_generator(
         alive_mask, enemy_alive_mask = _build_masks(my_units, opp_units)
 
         if not alive_mask.any():
+            # This side has no activatable units left
+            if la_a_finished_first is None:
+                la_a_finished_first = la_is_a
+
             la_is_a = not la_is_a
             if la_is_a:
                 other_mask, _ = _build_masks(units_a, units_b)
             else:
                 other_mask, _ = _build_masks(units_b, units_a)
             if not other_mask.any():
-                break
+                # Both sides exhausted — round boundary
+                # round_num is 1-indexed; pass 0-indexed to engine functions
+                end_round(board, units_a, units_b, round_num - 1, mode)
+                round_num += 1
+                if round_num > 4:
+                    # Game over after round 4 — return actual result
+                    winner = score_game(board, units_a, units_b, mode)
+                    if winner == "draw":
+                        return 0.0
+                    return 1.0 if (winner == "A") == friendly_is_a else -1.0
+                # Start new round (both sides ML-controlled in rollouts)
+                _aff = la_a_finished_first if la_a_finished_first is not None else True
+                la_is_a = start_round(
+                    units_a, units_b, round_num - 1, mode,
+                    a_finished_first=_aff, ml_sides=_ML_BOTH_SIDES,
+                )
+                la_a_finished_first = None
             continue
 
         state_vec = encode_state_tactical(
@@ -1002,10 +1059,10 @@ def plan_activation(
     )
 
     # 1. One trunk pass
-    x = state_vec.unsqueeze(0)  # (1, 3611)
-    h, u_attended, _attn_w, _ = model.trunk(x)
+    x = state_vec.unsqueeze(0)  # (1, TACTICAL_TOTAL_FEATURES)
+    h, units, _ = model.trunk(x)
     h = h.squeeze(0)              # (512,)
-    u_attended = u_attended.squeeze(0)  # (20, 180)
+    units = units.squeeze(0)      # (20, 200)
 
     unit_logits = model.unit_selection_head(h.unsqueeze(0)).squeeze(0)  # (10,)
     unit_logits = unit_logits.masked_fill(~alive_mask, float('-inf'))
@@ -1054,12 +1111,19 @@ def plan_activation(
             (w.range_inches for w in unit.unit.weapons if not w.melee),
             default=0.0,
         )
-        unit_features = model._extract_unit_features(u_attended, uid).detach()  # (180,)
-        uf_b = unit_features.unsqueeze(0)  # (1, 180)
+        unit_features = model._extract_unit_features(units, uid).detach()  # (200,)
+        uf_b = unit_features.unsqueeze(0)  # (1, 200)
+
+        # Extract can_charge mask for this unit
+        can_charge_mask = extract_can_charge_mask(state_vec, uid)  # (10,) bool
 
         # Move type logits depend on h + unit_features — compute once per unit
         h_uf = torch.cat([h_b, uf_b], dim=-1)           # (1, 268)
         move_logits = model.move_type_head(h_uf).squeeze(0)  # (4,)
+        # Mask charge when no enemy is in charge range
+        if not can_charge_mask.any():
+            move_logits = move_logits.clone()
+            move_logits[MOVE_CHARGE] = float('-inf')
         move_probs = torch.softmax(move_logits, dim=-1)
 
         for _ in range(C):
@@ -1104,7 +1168,9 @@ def plan_activation(
             # 4. Sample charge target (conditioned on h + unit_feat + move)
             charge_logits = model.charge_target_head(h_uf_m).squeeze(0)
             charge_logits = charge_logits.masked_fill(~enemy_alive_mask, float('-inf'))
-            if no_enemies:
+            charge_logits = charge_logits.masked_fill(~can_charge_mask, float('-inf'))
+            no_chargeable = no_enemies or not (enemy_alive_mask & can_charge_mask).any()
+            if no_chargeable:
                 charge_target_idx = 0
             else:
                 charge_probs = torch.softmax(charge_logits, dim=-1)
@@ -1261,3 +1327,498 @@ def plan_activation(
         })
 
     return selected_unit, best_ranking, action, goal, charge_target, reason, planning_candidates
+
+
+# ---------------------------------------------------------------------------
+# Training-time planning (§3.10 of training_augmentation_spec)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def plan_training_activation(
+    model: TacticalModel,
+    state_vec: torch.Tensor,
+    alive_mask: torch.Tensor,
+    enemy_alive_mask: torch.Tensor,
+    friendly_units: list[UnitState],
+    enemy_units: list[UnitState],
+    round_num: int,
+    board: Board,
+    player: str,
+    *,
+    current_is_a: bool,
+    mode: str,
+    friendly_positions: list[tuple[float, float]],
+    enemy_positions: list[tuple[float, float]],
+    advance_distances: list[float],
+    rush_distances: list[float],
+    max_weapon_ranges: list[float] | None = None,
+    fr_a=None, fm_a=None, fr_b=None, fm_b=None,
+    pts_a: int = 0, pts_b: int = 0,
+    planning_params: dict | None = None,
+    opponent_type: int | None = None,
+) -> tuple:
+    """Training-time planning with policy-argmax baseline.
+
+    Runs single-threaded (no worker pool). Returns the same action tuple
+    format as sample_tactical_actions_no_grad, plus planning metadata.
+
+    Returns:
+        (unit_idx, move_type, angle, dist_frac, charge_target_idx,
+         shoot_target_idx, target_ranking, post_move_rel, old_log_prob,
+         value, shoot_mask,
+         was_planned, planning_improved, planning_value_delta,
+         planning_unit_values, planning_unit_indices)
+    """
+    import numpy as np
+
+    params = planning_params or {}
+    K = params.get("K_UNITS", 3)
+    C = params.get("C_SAMPLES_PER_UNIT", 3)
+    M = params.get("M_ROLLOUTS", 4)
+    N = params.get("N_LOOKAHEAD", 3)
+
+    eps = 1e-8
+    no_enemies = not enemy_alive_mask.any()
+
+    # --- Single trunk pass ---
+    x = state_vec.unsqueeze(0)
+    am = alive_mask.unsqueeze(0)
+    h, units, round_onehot = model.trunk(x)
+
+    unit_logits = model.unit_selection_head(h)
+    unit_logits = unit_logits.masked_fill(~am, float('-inf'))
+    unit_probs = torch.softmax(unit_logits, dim=-1).squeeze(0)
+
+    # --- Argmax unit (candidate 0) ---
+    argmax_unit = int(unit_probs.argmax().item())
+
+    # Select top-K candidate units
+    num_alive = int(alive_mask.sum().item())
+    k = min(K, num_alive)
+    _, top_indices = torch.topk(unit_probs, k)
+    candidate_units = top_indices.tolist()
+
+    # Ensure argmax_unit is first; remaining K-1 units are sampled from top-K
+    if argmax_unit in candidate_units:
+        candidate_units.remove(argmax_unit)
+    candidate_units = [argmax_unit] + candidate_units[:K - 1]
+
+    h_b = h  # (1, H)
+
+    # --- Generate candidate actions ---
+    # Same format as plan_activation: (uid, move_type, angle, frac, ranking,
+    #   charge_tgt_idx, shoot_tgt_idx, action, goal, ct_idx, reason)
+    candidate_actions: list[tuple] = []
+    candidate_to_unit: list[int] = []  # maps candidate idx -> unit slot
+    candidate_shoot_masks: list[torch.Tensor] = []  # per-candidate shoot range masks
+    _seen_keys: set[tuple] = set()
+
+    for ui, uid in enumerate(candidate_units):
+        unit = friendly_units[uid]
+        max_wr = max(
+            (w.range_inches for w in unit.unit.weapons if not w.melee),
+            default=0.0,
+        )
+        unit_features = model._extract_unit_features(
+            units.squeeze(0), uid).detach()
+        uf_b = unit_features.unsqueeze(0)
+
+        # Extract can_charge mask for this unit
+        can_charge_mask = extract_can_charge_mask(state_vec, uid)  # (10,) bool
+
+        h_uf = torch.cat([h_b, uf_b], dim=-1)
+        move_logits = model.move_type_head(h_uf).squeeze(0)
+        # Mask charge when no enemy is in charge range
+        if not can_charge_mask.any():
+            move_logits = move_logits.clone()
+            move_logits[MOVE_CHARGE] = float('-inf')
+        move_probs = torch.softmax(move_logits, dim=-1)
+
+        # Argmax unit: 1 argmax action + C-1 sampled actions; others: C sampled
+        n_samples = C
+
+        for si in range(n_samples):
+            # First sample of argmax unit is deterministic; all others are sampled
+            is_argmax_action = (ui == 0 and si == 0)
+            if is_argmax_action:
+                move_type = int(move_probs.argmax().item())
+            else:
+                move_type = int(torch.multinomial(move_probs, 1).item())
+
+            move_onehot = F.one_hot(
+                torch.tensor(move_type), NUM_MOVE_TYPES
+            ).float().unsqueeze(0)
+            h_uf_m = torch.cat([h_b, uf_b, move_onehot], dim=-1)
+
+            # Direction + distance
+            direction_raw = model.direction_head(h_uf_m).squeeze(0)
+            distance_raw = model.distance_head(h_uf_m).squeeze(0)
+            angle, concentration = decode_direction_params(direction_raw)
+            alpha, beta_val, mean_frac = decode_distance_params(distance_raw)
+
+            if is_argmax_action:
+                # Argmax: use distribution modes
+                sampled_angle = angle
+                sampled_frac = mean_frac
+            elif move_type in (MOVE_ADVANCE, MOVE_RUSH):
+                sampled_angle = float(np.random.vonmises(angle, concentration))
+                sampled_frac = float(np.random.beta(alpha, beta_val))
+            else:
+                sampled_angle = angle
+                sampled_frac = mean_frac
+
+            # Post-move position
+            unit_cx, unit_cy = friendly_positions[uid]
+            if move_type == MOVE_ADVANCE:
+                budget = advance_distances[uid]
+                post_x, post_y = compute_post_move_position(
+                    unit_cx, unit_cy, sampled_angle, sampled_frac * budget)
+            elif move_type == MOVE_RUSH:
+                budget = rush_distances[uid]
+                post_x, post_y = compute_post_move_position(
+                    unit_cx, unit_cy, sampled_angle, sampled_frac * budget)
+            else:
+                post_x, post_y = unit_cx, unit_cy
+
+            # Charge target — mask by alive AND chargeable
+            charge_logits = model.charge_target_head(h_uf_m).squeeze(0)
+            charge_logits = charge_logits.masked_fill(
+                ~enemy_alive_mask, float('-inf'))
+            charge_logits = charge_logits.masked_fill(
+                ~can_charge_mask, float('-inf'))
+            no_chargeable = no_enemies or not (enemy_alive_mask & can_charge_mask).any()
+            if no_chargeable:
+                charge_target_idx = 0
+            elif is_argmax_action:
+                charge_target_idx = int(charge_logits.argmax().item())
+            else:
+                charge_probs = torch.softmax(charge_logits, dim=-1)
+                charge_target_idx = int(
+                    torch.multinomial(charge_probs, 1).item())
+
+            # Shoot target
+            post_move_rel = compute_post_move_rel(
+                post_x, post_y, enemy_positions)
+            shoot_input = torch.cat(
+                [h_b, uf_b, move_onehot, post_move_rel.unsqueeze(0)], dim=-1)
+            shoot_logits = model.shoot_target_head(shoot_input).squeeze(0)
+            shoot_range_mask = compute_in_range_mask(
+                post_move_rel, float(max_wr), enemy_alive_mask)
+            shoot_logits = shoot_logits.masked_fill(
+                ~shoot_range_mask, float('-inf'))
+            no_shootable = no_enemies or not shoot_range_mask.any()
+            if no_shootable:
+                shoot_target_idx = 0
+            elif is_argmax_action:
+                shoot_target_idx = int(shoot_logits.argmax().item())
+            else:
+                shoot_probs = torch.softmax(shoot_logits, dim=-1)
+                shoot_target_idx = int(
+                    torch.multinomial(shoot_probs, 1).item())
+
+            target_ranking = torch.argsort(
+                shoot_logits, descending=True).tolist()
+
+            # Resolve to game-space action
+            dest = None
+            if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+                gx, gy = post_x, post_y
+                if player == "B":
+                    gx = _flip_x(gx)
+                    gy = _flip_y(gy)
+                dest = (gx, gy)
+
+            action_str, goal, charge_target_unit, reason = \
+                execute_decoded_decision(
+                    unit, enemy_units, move_type, dest,
+                    charge_target_idx, shoot_target_idx,
+                )
+
+            ct_idx = -1
+            if charge_target_unit is not None:
+                for j, eu in enumerate(enemy_units):
+                    if eu is charge_target_unit:
+                        ct_idx = j
+                        break
+
+            dedup_key = (uid, move_type, action_str, goal, ct_idx)
+            if dedup_key in _seen_keys:
+                continue
+            _seen_keys.add(dedup_key)
+
+            candidate_actions.append((
+                uid, move_type, sampled_angle, sampled_frac, target_ranking,
+                charge_target_idx, shoot_target_idx,
+                action_str, goal, ct_idx, reason,
+            ))
+            candidate_to_unit.append(uid)
+            candidate_shoot_masks.append(shoot_range_mask)
+
+    if not candidate_actions:
+        # Fallback: impossible edge case, return policy argmax with no planning
+        from ml_training import sample_tactical_actions_no_grad
+        result = sample_tactical_actions_no_grad(
+            model, state_vec, alive_mask, enemy_alive_mask,
+            friendly_positions, enemy_positions,
+            advance_distances, rush_distances, max_weapon_ranges,
+        )
+        return result + (False, False, 0.0, None, None)
+
+    # --- Evaluate candidates via rollouts (single-threaded) ---
+    friendly_is_a = (player == "A")
+
+    # Determine units_a/units_b ordering
+    if friendly_is_a:
+        units_a_list = list(friendly_units)
+        units_b_list = list(enemy_units)
+    else:
+        units_a_list = list(enemy_units)
+        units_b_list = list(friendly_units)
+
+    state_bytes = pickle.dumps((
+        units_a_list, units_b_list, board,
+        fr_a, fm_a, fr_b, fm_b, pts_a, pts_b,
+    ))
+
+    avg_values = _run_chunk_batched((
+        state_bytes, candidate_actions, M, N, round_num, mode, player,
+        friendly_is_a, current_is_a,
+    ), model_override=model)
+
+    # --- Identify argmax candidate(s) and compute per-unit average values ---
+    # The first candidate(s) belong to the argmax unit (could be just 1)
+    argmax_cand_idx = 0  # candidate 0 is always the argmax action
+    argmax_value = avg_values[0]
+
+    # Per-unit average values for distillation target
+    unit_value_sums: dict[int, float] = {}
+    unit_value_counts: dict[int, int] = {}
+    for ci, (uid_ci, val_ci) in enumerate(
+            zip(candidate_to_unit, avg_values)):
+        unit_value_sums[uid_ci] = unit_value_sums.get(uid_ci, 0.0) + val_ci
+        unit_value_counts[uid_ci] = unit_value_counts.get(uid_ci, 0) + 1
+
+    planning_unit_indices = list(unit_value_sums.keys())
+    planning_unit_values = [
+        unit_value_sums[u] / unit_value_counts[u]
+        for u in planning_unit_indices
+    ]
+
+    # Per-(unit, move_type) and per-(unit, target) values for sub-head distillation
+    move_value_sums: dict[tuple[int, int], float] = {}
+    move_value_counts: dict[tuple[int, int], int] = {}
+    charge_value_sums: dict[tuple[int, int], float] = {}
+    charge_value_counts: dict[tuple[int, int], int] = {}
+    shoot_value_sums: dict[tuple[int, int], float] = {}
+    shoot_value_counts: dict[tuple[int, int], int] = {}
+    for ci, (uid_ci, val_ci) in enumerate(
+            zip(candidate_to_unit, avg_values)):
+        ca = candidate_actions[ci]
+        mt = ca[1]  # move_type
+        key_mt = (uid_ci, mt)
+        move_value_sums[key_mt] = move_value_sums.get(key_mt, 0.0) + val_ci
+        move_value_counts[key_mt] = move_value_counts.get(key_mt, 0) + 1
+        if mt == MOVE_CHARGE:
+            ct = ca[5]  # charge_target_idx
+            if ct >= 0:
+                key_ct = (uid_ci, ct)
+                charge_value_sums[key_ct] = charge_value_sums.get(key_ct, 0.0) + val_ci
+                charge_value_counts[key_ct] = charge_value_counts.get(key_ct, 0) + 1
+        if mt in (MOVE_HOLD, MOVE_ADVANCE):
+            st = ca[6]  # shoot_target_idx
+            if st >= 0:
+                key_st = (uid_ci, st)
+                shoot_value_sums[key_st] = shoot_value_sums.get(key_st, 0.0) + val_ci
+                shoot_value_counts[key_st] = shoot_value_counts.get(key_st, 0) + 1
+
+    # --- Selection: compare argmax vs best non-argmax ---
+    best_search_idx = argmax_cand_idx
+    best_search_value = argmax_value
+    for ci in range(len(avg_values)):
+        if ci != argmax_cand_idx and avg_values[ci] > best_search_value:
+            best_search_idx = ci
+            best_search_value = avg_values[ci]
+
+    planning_improved = (best_search_idx != argmax_cand_idx
+                         and best_search_value > argmax_value)
+    planning_value_delta = max(best_search_value - argmax_value, 0.0)
+
+    if planning_improved:
+        chosen_idx = best_search_idx
+    else:
+        chosen_idx = argmax_cand_idx
+
+    chosen = candidate_actions[chosen_idx]
+    chosen_uid = chosen[0]
+    chosen_move_type = chosen[1]
+    chosen_angle = chosen[2]
+    chosen_frac = chosen[3]
+    chosen_ranking = chosen[4]
+    chosen_charge_tgt = chosen[5]
+    chosen_shoot_tgt = chosen[6]
+
+    # Extract sub-head distillation targets for chosen unit
+    planning_move_indices = []
+    planning_move_values = []
+    for mt in range(NUM_MOVE_TYPES):
+        key = (chosen_uid, mt)
+        if key in move_value_counts:
+            planning_move_indices.append(mt)
+            planning_move_values.append(
+                move_value_sums[key] / move_value_counts[key])
+
+    planning_charge_indices = []
+    planning_charge_values = []
+    for key, cnt in charge_value_counts.items():
+        if key[0] == chosen_uid:
+            planning_charge_indices.append(key[1])
+            planning_charge_values.append(charge_value_sums[key] / cnt)
+
+    # Shoot distillation: only include targets reachable from ALL candidate
+    # positions for the chosen unit (pairwise validity).  This avoids
+    # distilling toward targets that aren't reachable from some positions.
+    planning_shoot_indices = []
+    planning_shoot_values = []
+    # Collect shoot masks for all hold/advance candidates of the chosen unit
+    _chosen_shoot_masks = []
+    for ci, uid_ci in enumerate(candidate_to_unit):
+        if uid_ci == chosen_uid:
+            ca = candidate_actions[ci]
+            if ca[1] in (MOVE_HOLD, MOVE_ADVANCE):
+                _chosen_shoot_masks.append(candidate_shoot_masks[ci])
+    if _chosen_shoot_masks:
+        # Intersection: target must be in range from every candidate position
+        common_mask = _chosen_shoot_masks[0]
+        for m in _chosen_shoot_masks[1:]:
+            common_mask = common_mask & m
+        for key, cnt in shoot_value_counts.items():
+            if key[0] == chosen_uid:
+                tgt_idx = key[1]
+                if common_mask[tgt_idx]:
+                    planning_shoot_indices.append(tgt_idx)
+                    planning_shoot_values.append(
+                        shoot_value_sums[key] / cnt)
+
+    # --- Compute old_log_prob: π_policy(a_chosen | s) ---
+    # Re-use trunk output already computed; run conditioned heads for the
+    # chosen action to get the policy's sampling log-prob.
+    chosen_unit_lp = torch.log(unit_probs[chosen_uid] + eps).item()
+
+    unit_features = model._extract_unit_features(
+        units.squeeze(0), chosen_uid).detach()
+    uf_b = unit_features.unsqueeze(0)
+
+    # Extract can_charge mask for the chosen unit
+    can_charge_mask = extract_can_charge_mask(state_vec, chosen_uid)  # (10,) bool
+
+    h_uf = torch.cat([h_b, uf_b], dim=-1)
+    move_logits_ch = model.move_type_head(h_uf).squeeze(0)
+    # Mask charge when no enemy is in charge range
+    if not can_charge_mask.any():
+        move_logits_ch = move_logits_ch.clone()
+        move_logits_ch[MOVE_CHARGE] = float('-inf')
+    move_probs_ch = torch.softmax(move_logits_ch, dim=-1)
+    move_lp = torch.log(move_probs_ch[chosen_move_type] + eps).item()
+
+    move_onehot_ch = F.one_hot(
+        torch.tensor(chosen_move_type), NUM_MOVE_TYPES
+    ).float().unsqueeze(0)
+    h_uf_m_ch = torch.cat([h_b, uf_b, move_onehot_ch], dim=-1)
+
+    # Direction log-prob
+    dir_raw = model.direction_head(h_uf_m_ch).squeeze(0)
+    ch_angle, ch_conc = decode_direction_params(dir_raw)
+    _conc_t = torch.tensor(ch_conc)
+    _i0e_c = torch.special.i0e(_conc_t)
+    _log_i0_c = ch_conc + math.log(max(float(_i0e_c.item()), 1e-20))
+    dir_lp = (ch_conc * math.cos(chosen_angle - ch_angle)
+              - (math.log(2.0 * math.pi) + _log_i0_c))
+
+    # Distance log-prob
+    dist_raw = model.distance_head(h_uf_m_ch).squeeze(0)
+    ch_alpha, ch_beta, _ = decode_distance_params(dist_raw)
+    clamped_frac = max(1e-4, min(1.0 - 1e-4, chosen_frac))
+    dist_lp = max(-20.0, min(20.0, torch.distributions.Beta(
+        torch.tensor(ch_alpha), torch.tensor(ch_beta),
+    ).log_prob(torch.tensor(clamped_frac)).item()))
+
+    # Charge log-prob — mask by alive AND chargeable
+    charge_logits_ch = model.charge_target_head(h_uf_m_ch).squeeze(0)
+    charge_logits_ch = charge_logits_ch.masked_fill(
+        ~enemy_alive_mask, float('-inf'))
+    charge_logits_ch = charge_logits_ch.masked_fill(
+        ~can_charge_mask, float('-inf'))
+    no_chargeable = no_enemies or not (enemy_alive_mask & can_charge_mask).any()
+    if no_chargeable:
+        charge_lp = 0.0
+    else:
+        charge_probs_ch = torch.softmax(charge_logits_ch, dim=-1)
+        charge_lp = torch.log(
+            charge_probs_ch[chosen_charge_tgt] + eps).item()
+
+    # Shoot log-prob (need post-move position for chosen action)
+    unit_cx, unit_cy = friendly_positions[chosen_uid]
+    if chosen_move_type == MOVE_ADVANCE:
+        budget = advance_distances[chosen_uid]
+        ch_px, ch_py = compute_post_move_position(
+            unit_cx, unit_cy, chosen_angle, chosen_frac * budget)
+    elif chosen_move_type == MOVE_RUSH:
+        budget = rush_distances[chosen_uid]
+        ch_px, ch_py = compute_post_move_position(
+            unit_cx, unit_cy, chosen_angle, chosen_frac * budget)
+    else:
+        ch_px, ch_py = unit_cx, unit_cy
+
+    ch_pmr = compute_post_move_rel(ch_px, ch_py, enemy_positions)
+    ch_shoot_input = torch.cat(
+        [h_b, uf_b, move_onehot_ch, ch_pmr.unsqueeze(0)], dim=-1)
+    ch_shoot_logits = model.shoot_target_head(ch_shoot_input).squeeze(0)
+    ch_max_wr = max(
+        (w.range_inches for w in friendly_units[chosen_uid].unit.weapons
+         if not w.melee), default=0.0)
+    ch_shoot_mask = compute_in_range_mask(
+        ch_pmr, float(ch_max_wr), enemy_alive_mask)
+    ch_shoot_logits = ch_shoot_logits.masked_fill(
+        ~ch_shoot_mask, float('-inf'))
+    ch_no_shootable = no_enemies or not ch_shoot_mask.any()
+    if ch_no_shootable:
+        shoot_lp = 0.0
+    else:
+        shoot_probs_ch = torch.softmax(ch_shoot_logits, dim=-1)
+        shoot_lp = torch.log(
+            shoot_probs_ch[chosen_shoot_tgt] + eps).item()
+
+    # Combine log-probs (same rules as sample_tactical_actions_no_grad)
+    old_log_prob = chosen_unit_lp + move_lp
+    if chosen_move_type in (MOVE_ADVANCE, MOVE_RUSH):
+        old_log_prob += dir_lp + dist_lp
+    if chosen_move_type in (MOVE_HOLD, MOVE_ADVANCE):
+        old_log_prob += shoot_lp
+    if chosen_move_type == MOVE_CHARGE:
+        old_log_prob += charge_lp
+
+    # Value estimate (from policy, not from planning rollouts)
+    value_est = model.value_head(
+        h, round_onehot,
+        model._get_opp_embed(h, opponent_type),
+    ).squeeze(0).item()
+
+    shoot_mask_list = ch_shoot_mask.tolist()
+    pmr_list = ch_pmr.tolist()
+
+    return (
+        chosen_uid, chosen_move_type, chosen_angle, chosen_frac,
+        chosen_charge_tgt, chosen_shoot_tgt, chosen_ranking,
+        pmr_list, old_log_prob, value_est, shoot_mask_list,
+        True,  # was_planned
+        planning_improved,
+        planning_value_delta,
+        planning_unit_values,
+        planning_unit_indices,
+        planning_move_values or None,
+        planning_move_indices or None,
+        planning_charge_values or None,
+        planning_charge_indices or None,
+        planning_shoot_values or None,
+        planning_shoot_indices or None,
+    )

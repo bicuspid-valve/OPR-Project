@@ -6,7 +6,7 @@ import math
 import numpy as np
 import torch
 
-from board import COLS, ROWS, OBJECTIVES, Board
+from board import COLS, ROWS, OBJECTIVES, OBJ_SEIZE_RANGE, Board
 from models import ResolvedUnit, UnitState
 import fast_core as _fc
 
@@ -22,23 +22,29 @@ MAX_UNITS_PER_SIDE = 10
 RANGE_THRESHOLDS = [6, 9, 12, 18, 24, 30, 36]
 NUM_RANGE_THRESHOLDS = len(RANGE_THRESHOLDS)
 
-# 4 (round one-hot) + 5 (objective control) + 2 (points) = 11 global values
-GLOBAL_FEATURES = 11
+# 4 (round one-hot) + 5 (objective control) + 5 (projected obj control)
+# + 2 (points) = 16 global values
+GLOBAL_FEATURES = 16
 
 # Tactical model: egocentric (sin θ, cos θ, dist) for objectives and enemies
 # Per-unit: 10 basic + 2 position + 15 obj-rel + 30 enemy-rel + 30 same-side-rel
 #         + 70 ranged + 10 melee + 10 opp-post-advance-dist
-#         + has_activated + fatigued + is_shaken = 180
+#         + 10 obj-reachability (5 obj × (can_advance, can_rush))
+#         + 10 can_charge (1 per opposing unit)
+#         + has_activated + fatigued + is_shaken = 200
 _NUM_OBJECTIVES = 5
 _TACTICAL_OBJ_REL = _NUM_OBJECTIVES * 3       # 15: (sin θ, cos θ, dist) per objective
 _TACTICAL_OPP_REL = MAX_UNITS_PER_SIDE * 3    # 30: (sin θ, cos θ, dist) per opposing unit
 _TACTICAL_SAME_REL = MAX_UNITS_PER_SIDE * 3   # 30: (sin θ, cos θ, dist) per same-side unit
 _TACTICAL_BASE = 10 + 2 + _TACTICAL_OBJ_REL + _TACTICAL_OPP_REL + _TACTICAL_SAME_REL  # 87
 _TACTICAL_OPP_POST_ADV = MAX_UNITS_PER_SIDE   # 10: post-advance distance per opposing unit
+_TACTICAL_OBJ_REACH = _NUM_OBJECTIVES * 2     # 10: 5 objectives × (can_advance, can_rush)
+_TACTICAL_CAN_CHARGE = MAX_UNITS_PER_SIDE  # 10: can_charge per opposing unit
 TACTICAL_UNIT_FEATURES = (_TACTICAL_BASE + NUM_RANGE_THRESHOLDS * MAX_UNITS_PER_SIDE
-                          + MAX_UNITS_PER_SIDE + _TACTICAL_OPP_POST_ADV + 3)  # 180
-# (87 + 70 ranged + 10 melee + 10 opp-post-advance + 3 tactical bools)
-TACTICAL_TOTAL_FEATURES = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES + GLOBAL_FEATURES  # 3611
+                          + MAX_UNITS_PER_SIDE + _TACTICAL_OPP_POST_ADV
+                          + _TACTICAL_OBJ_REACH + _TACTICAL_CAN_CHARGE + 3)  # 200
+# (87 + 70 ranged + 10 melee + 10 opp-post-advance + 10 obj-reach + 10 can_charge + 3 tactical bools)
+TACTICAL_TOTAL_FEATURES = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES + GLOBAL_FEATURES  # 4016
 
 # Tactical per-unit feature offsets
 _TOFF_SCALARS = 0         # 10 scalars
@@ -49,9 +55,11 @@ _TOFF_SAME_REL = 57       # 30: 10 same-side units × (sin θ, cos θ, dist)
 _TOFF_RANGED = 87         # 70: ranged matchup values (10 enemies × 7 thresholds)
 _TOFF_MELEE = _TOFF_RANGED + MAX_UNITS_PER_SIDE * NUM_RANGE_THRESHOLDS  # 157: 10 melee values
 _TOFF_OPP_POST_ADV = _TOFF_MELEE + MAX_UNITS_PER_SIDE  # 167: 10 post-advance distances
-_TOFF_ACTIVATED = _TOFF_OPP_POST_ADV + MAX_UNITS_PER_SIDE  # 177: has_activated
-_TOFF_FATIGUED = _TOFF_ACTIVATED + 1   # 178: fatigued
-_TOFF_SHAKEN = _TOFF_FATIGUED + 1      # 179: is_shaken
+_TOFF_OBJ_REACH = _TOFF_OPP_POST_ADV + MAX_UNITS_PER_SIDE  # 177: 10 obj reachability
+_TOFF_CAN_CHARGE = _TOFF_OBJ_REACH + _TACTICAL_OBJ_REACH  # 187: 10 can_charge flags
+_TOFF_ACTIVATED = _TOFF_CAN_CHARGE + _TACTICAL_CAN_CHARGE  # 197: has_activated
+_TOFF_FATIGUED = _TOFF_ACTIVATED + 1   # 198: fatigued
+_TOFF_SHAKEN = _TOFF_FATIGUED + 1      # 199: is_shaken
 
 # Normalisation ceilings
 _MAX_TOUGH = 24
@@ -383,6 +391,81 @@ def _objective_control_mapped(board: Board, player: str) -> list[float]:
     return [_val(i) for i in order]
 
 
+def _projected_objective_control_mapped(
+    board: Board,
+    friendly_units: list[UnitState],
+    enemy_units: list[UnitState],
+    player: str,
+) -> list[float]:
+    """Projected objective control based on current unit positions.
+
+    Same semantics as _objective_control_mapped (+1 friendly, -1 enemy, 0
+    neutral), but computes what control *would* be if update_objectives ran
+    right now, rather than reading the stale board.objective_control.
+
+    If neither side is present the sticky value from board.objective_control
+    is preserved (same rule as update_objectives).
+    """
+    threshold_sq = OBJ_SEIZE_RANGE * OBJ_SEIZE_RANGE
+
+    if player == "A":
+        a_units, b_units = friendly_units, enemy_units
+    else:
+        a_units, b_units = enemy_units, friendly_units
+
+    projected: list[str] = list(board.objective_control)
+    for oi, (oc, orow) in enumerate(OBJECTIVES):
+        a_present = False
+        for u in a_units:
+            if u.models_alive <= 0 or u.shaken:
+                continue
+            for pos in u.alive_positions():
+                dc = pos[0] - oc
+                dr = pos[1] - orow
+                if dc * dc + dr * dr <= threshold_sq:
+                    a_present = True
+                    break
+            if a_present:
+                break
+
+        b_present = False
+        for u in b_units:
+            if u.models_alive <= 0 or u.shaken:
+                continue
+            for pos in u.alive_positions():
+                dc = pos[0] - oc
+                dr = pos[1] - orow
+                if dc * dc + dr * dr <= threshold_sq:
+                    b_present = True
+                    break
+            if b_present:
+                break
+
+        if a_present and b_present:
+            projected[oi] = ""
+        elif a_present:
+            projected[oi] = "A"
+        elif b_present:
+            projected[oi] = "B"
+        # else: keep sticky value
+
+    friendly_tag = player
+    enemy_tag = "B" if player == "A" else "A"
+
+    def _val(idx: int) -> float:
+        if projected[idx] == friendly_tag:
+            return 1.0
+        if projected[idx] == enemy_tag:
+            return -1.0
+        return 0.0
+
+    if player == "A":
+        order = [0, 1, 2, 3, 4]
+    else:
+        order = [0, 2, 1, 4, 3]
+    return [_val(i) for i in order]
+
+
 # ---------------------------------------------------------------------------
 # Per-unit encoding (writes into pre-allocated numpy buffer)
 # ---------------------------------------------------------------------------
@@ -412,7 +495,7 @@ def _encode_unit_tactical_into(
     buf: np.ndarray,
     offset: int,
 ) -> None:
-    """Write TACTICAL_UNIT_FEATURES (180) floats into buf for the v2 tactical model.
+    """Write TACTICAL_UNIT_FEATURES (200) floats into buf for the v2 tactical model.
 
     Uses egocentric (sin θ, cos θ, dist) encoding for objectives, opposing units,
     and same-side units.
@@ -426,9 +509,11 @@ def _encode_unit_tactical_into(
       87-156  70 ranged matchup values (10 enemies × 7 thresholds)
       157-166 10 melee matchup values
       167-176 10 post-advance distances (how close each opposing unit could get)
-      177     has_activated
-      178     fatigued
-      179     is_shaken
+      177-186 10 objective reachability (5 obj × (can_advance, can_rush))
+      187-196 10 can_charge (1 per opposing unit: 1.0 if charge is feasible)
+      197     has_activated
+      198     fatigued
+      199     is_shaken
     """
     if us.models_alive <= 0:
         return  # buf is zero-initialized
@@ -519,7 +604,63 @@ def _encode_unit_tactical_into(
     melee_end = melee_start + MAX_UNITS_PER_SIDE
     buf[melee_start:melee_end] = melee_matchups * scale
 
-    # 177-179: tactical booleans written by encode_state_tactical caller
+    # 177-186  Objective reachability: 5 objectives × (can_advance, can_rush)
+    adv_budget = float(unit.advance_distance)
+    rush_budget = float(unit.rush_distance)
+    orb = offset + _TOFF_OBJ_REACH
+    for ox, oy in objectives:
+        dx = ox - cx
+        dy = oy - cy
+        d = math.sqrt(dx * dx + dy * dy)
+        buf[orb] = 1.0 if d <= adv_budget + OBJ_SEIZE_RANGE else 0.0
+        buf[orb + 1] = 1.0 if d <= rush_budget + OBJ_SEIZE_RANGE else 0.0
+        orb += 2
+
+    # 187-196  Can-charge: 1.0 if this unit can charge opposing unit j, else 0.0
+    # Uses same logic as ai._can_charge: centre-to-centre dist < rush_distance + 2
+    # Skip dead/missing units (sentinel position) to avoid false positives.
+    charge_threshold = rush_budget + 2.0
+    charge_threshold_sq = charge_threshold * charge_threshold
+    cc = offset + _TOFF_CAN_CHARGE
+    for j, (ox, oy) in enumerate(opposing_positions):
+        if (ox, oy) == _DEAD_SENTINEL:
+            continue
+        dx = ox - cx
+        dy = oy - cy
+        if dx * dx + dy * dy < charge_threshold_sq:
+            buf[cc + j] = 1.0
+
+    # 197-199: tactical booleans written by encode_state_tactical caller
+
+
+# ---------------------------------------------------------------------------
+# Can-charge mask extraction
+# ---------------------------------------------------------------------------
+
+
+def extract_can_charge_mask(
+    state_vec: torch.Tensor,
+    unit_idx: int | torch.Tensor,
+) -> torch.Tensor:
+    """Extract the can_charge flags for a friendly unit from the state vector.
+
+    Parameters
+    ----------
+    state_vec : (feat,) or (N, feat) — encoded state
+    unit_idx : int (single) or (N,) long tensor (batched)
+
+    Returns
+    -------
+    (10,) or (N, 10) bool — True for each opposing unit that can be charged.
+    """
+    if isinstance(unit_idx, int):
+        base = unit_idx * TACTICAL_UNIT_FEATURES + _TOFF_CAN_CHARGE
+        return state_vec[..., base:base + MAX_UNITS_PER_SIDE] > 0.5
+    # Batched: unit_idx is (N,) tensor
+    bases = unit_idx.long() * TACTICAL_UNIT_FEATURES + _TOFF_CAN_CHARGE
+    offsets = torch.arange(MAX_UNITS_PER_SIDE, device=state_vec.device)
+    indices = bases.unsqueeze(1) + offsets.unsqueeze(0)  # (N, 10)
+    return state_vec.gather(1, indices) > 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -669,14 +810,16 @@ def encode_state_tactical(
                 if us.shaken:
                     buf[offset + _TOFF_SHAKEN] = 1.0
 
-    # --- Global features (11) ---
+    # --- Global features (16) ---
     g = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES
     buf[g + round_num - 1] = 1.0
     buf[g + 4:g + 9] = _objective_control_mapped(board, player)
+    buf[g + 9:g + 14] = _projected_objective_control_mapped(
+        board, friendly_units, enemy_units, player)
     alive_f = sum(u.unit.points for u in friendly_units if u.models_alive > 0)
-    buf[g + 9] = alive_f / max(total_friendly_points, 1)
+    buf[g + 14] = alive_f / max(total_friendly_points, 1)
     alive_e = sum(u.unit.points for u in enemy_units if u.models_alive > 0)
-    buf[g + 10] = alive_e / max(total_enemy_points, 1)
+    buf[g + 15] = alive_e / max(total_enemy_points, 1)
 
     assert len(buf) == TACTICAL_TOTAL_FEATURES
     return torch.from_numpy(buf)

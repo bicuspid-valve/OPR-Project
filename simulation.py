@@ -350,8 +350,13 @@ def start_round(
     mode: str,
     a_first: bool = True,
     a_finished_first: bool = True,
+    ml_sides: frozenset[str] = frozenset(),
 ) -> bool:
     """Reset activations and assign objectives for a new round.
+
+    *ml_sides* is a frozenset of ``"A"``/``"B"`` strings indicating which
+    sides are ML-controlled.  Role reassignment is skipped for ML sides
+    (the model handles its own objective targeting).
 
     Returns *current_is_a* — True if Player A acts first this round.
     """
@@ -363,8 +368,10 @@ def start_round(
         u.fatigued = False
 
     if mode != "kill_points":
-        assign_objectives(units_a)
-        reassign_roles(units_b)
+        if "A" not in ml_sides:
+            reassign_roles(units_a)
+        if "B" not in ml_sides:
+            reassign_roles(units_b)
 
     return a_first if round_num == 0 else a_finished_first
 

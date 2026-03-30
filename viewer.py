@@ -1006,6 +1006,11 @@ class GameViewer:
                 detail = "  ".join(f"{ctrl_names[j]}:{probs[j]:.0%}" for j in range(3))
                 lines.append(f"  {obj_names[oi]}: {detail}")
 
+        f_act = assessment.get('friendly_activations_remaining')
+        e_act = assessment.get('enemy_activations_remaining')
+        if f_act is not None and e_act is not None:
+            lines.append(f"Activations Remaining:  friendly: {f_act:.1f}  enemy: {e_act:.1f}")
+
     def _format_shooting_stats(self, stats: dict) -> list[str]:
         mod = stats['hit_modifier']
         mod_str = f" (modifier: {mod:+d})" if mod != 0 else ""

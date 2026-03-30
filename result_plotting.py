@@ -71,24 +71,24 @@ def main():
     n = len(data["batch"])
     print(f"Loaded {n} batches from {path.name}")
 
-    fig = plt.figure(figsize=(16, 18))
+    fig = plt.figure(figsize=(16, 22))
     fig.suptitle(
         f"Tactical Training Dashboard  (block avg = {block_size} batches)",
         fontsize=14,
         fontweight="bold",
     )
-    gs = GridSpec(4, 2, figure=fig, hspace=0.35, wspace=0.28)
+    gs = GridSpec(5, 2, figure=fig, hspace=0.35, wspace=0.28)
 
     # --- Panel 1: Win rates vs heuristic ---
     ax1 = fig.add_subplot(gs[0, 0])
     for col, label, color in [
-        ("h_hof_wr", "vs Heuristic HoF", "#534AB7"),
-        ("h_ml_wr", "vs Heuristic ML", "#1D9E75"),
+        ("h_hof_wr", "HoF armies", "#534AB7"),
+        ("h_ml_wr", "HoF-ML armies", "#1D9E75"),
     ]:
         bx, by = block_average(data, col, block_size)
         ax1.plot(bx, by, marker="o", markersize=3, linewidth=1.5, color=color, label=label)
     ax1.set_ylabel("Win Rate")
-    ax1.set_title("Win Rate vs Heuristic Opponents")
+    ax1.set_title("Win Rate vs Heuristic (by army source)")
     ax1.legend(fontsize=8)
     ax1.set_ylim(bottom=0)
     ax1.grid(alpha=0.3)
@@ -96,15 +96,15 @@ def main():
     # --- Panel 2: Win rates self-play ---
     ax2 = fig.add_subplot(gs[0, 1])
     for col, label, color in [
-        ("sp_hof_wr", "vs SP HoF", "#D85A30"),
-        ("sp_ml_wr", "vs SP ML", "#3266AD"),
-        ("sp_rnd_wr", "vs SP Random", "#888888"),
+        ("sp_hof_wr", "HoF armies", "#D85A30"),
+        ("sp_ml_wr", "HoF-ML armies", "#3266AD"),
+        ("sp_rnd_wr", "Random armies", "#888888"),
     ]:
         bx, by = block_average(data, col, block_size)
         ax2.plot(bx, by, marker="o", markersize=3, linewidth=1.5, color=color, label=label)
     ax2.axhline(0.5, color="black", linestyle="--", linewidth=0.8, alpha=0.4)
     ax2.set_ylabel("Win Rate")
-    ax2.set_title("Win Rate vs Self-Play Opponents")
+    ax2.set_title("Win Rate vs Self-Play (by army source)")
     ax2.legend(fontsize=8)
     ax2.set_ylim(0.3, 0.7)
     ax2.grid(alpha=0.3)
@@ -159,19 +159,78 @@ def main():
     ax6.set_title("Policy Entropy (per head)")
     ax6.grid(alpha=0.3)
 
-    # --- Panel 7: Per-head alpha coefficients (full width) ---
-    ax7 = fig.add_subplot(gs[3, :])
+    # --- Panel 7: Per-opponent-type value estimates ---
+    ax7 = fig.add_subplot(gs[3, 0])
+    _val_series = [
+        ("val_heuristic",  "vs Heuristic",          "#534AB7"),
+        ("val_sp_mirror",  "vs Self (mirror)",       "#1D9E75"),
+        ("val_sp_hof",     "vs Checkpoint (HoF)",    "#D85A30"),
+        ("val_sp_ml",      "vs Checkpoint (HoF-ML)", "#3266AD"),
+        ("val_sp_random",  "vs Checkpoint (random)",  "#888888"),
+    ]
+    _has_val = any(c in data for c, _, _ in _val_series)
+    if _has_val:
+        for col, label, color in _val_series:
+            if col in data:
+                bx, by = block_average(data, col, block_size)
+                ax7.plot(bx, by, marker="o", markersize=2, linewidth=1.3,
+                         color=color, label=label)
+        ax7.legend(fontsize=7, ncol=2)
+    else:
+        ax7.text(0.5, 0.5, "val_* columns not in CSV\n(older log format)",
+                 transform=ax7.transAxes, ha="center", va="center",
+                 fontsize=10, color="gray")
+    ax7.set_ylabel("Mean Value")
+    ax7.set_title("Opponent-Conditioned Value Estimates")
+    ax7.grid(alpha=0.3)
+
+    # --- Panel 8: Planning metrics ---
+    ax8 = fig.add_subplot(gs[3, 1])
+    _has_plan = "plan_improve_rate" in data
+    if _has_plan:
+        bx, by = block_average(data, "plan_improve_rate", block_size)
+        ax8.plot(bx, by, marker="o", markersize=2, linewidth=1.5,
+                 color="#2E86C1", label="Improvement rate")
+        ax8.set_ylabel("Improvement Rate", color="#2E86C1")
+        ax8.set_ylim(-0.05, 1.05)
+        ax8.legend(fontsize=8, loc="upper left")
+
+        if "plan_distill_loss" in data:
+            ax8b = ax8.twinx()
+            bx2, by2 = block_average(data, "plan_distill_loss", block_size)
+            ax8b.plot(bx2, by2, marker="s", markersize=2, linewidth=1.3,
+                      color="#C0392B", alpha=0.8, label="Distill loss (total)")
+            # Sub-head breakdown (if available)
+            _dl_colors = {"unit": "#E74C3C", "move": "#F39C12",
+                          "charge": "#8E44AD", "shoot": "#27AE60"}
+            for _dlk, _dlc in _dl_colors.items():
+                _col = f"plan_dl_{_dlk}"
+                if _col in data:
+                    _bx, _by = block_average(data, _col, block_size)
+                    ax8b.plot(_bx, _by, linewidth=1.0, alpha=0.6,
+                              color=_dlc, label=f"DL {_dlk}")
+            ax8b.set_ylabel("Distill Loss", color="#C0392B")
+            ax8b.legend(fontsize=7, loc="upper right")
+    else:
+        ax8.text(0.5, 0.5, "plan_* columns not in CSV\n(older log format)",
+                 transform=ax8.transAxes, ha="center", va="center",
+                 fontsize=10, color="gray")
+    ax8.set_title("Planning Metrics")
+    ax8.grid(alpha=0.3)
+
+    # --- Panel 9: Per-head alpha coefficients (full width) ---
+    ax9 = fig.add_subplot(gs[4, :])
     alpha_cols = [c for c in data if c.startswith("alpha_")]
-    colors7 = plt.cm.Set2(np.linspace(0, 1, len(alpha_cols)))
-    for col, color in zip(alpha_cols, colors7):
+    colors9 = plt.cm.Set2(np.linspace(0, 1, len(alpha_cols)))
+    for col, color in zip(alpha_cols, colors9):
         head_name = col.replace("alpha_", "")
         bx, by = block_average(data, col, block_size)
-        ax7.plot(bx, by, linewidth=1.5, color=color, label=head_name)
-    ax7.set_ylabel("Alpha")
-    ax7.set_xlabel("Batch")
-    ax7.set_title("Adaptive Entropy Coefficients (per head)")
-    ax7.legend(fontsize=7, ncol=2)
-    ax7.grid(alpha=0.3)
+        ax9.plot(bx, by, linewidth=1.5, color=color, label=head_name)
+    ax9.set_ylabel("Alpha")
+    ax9.set_xlabel("Batch")
+    ax9.set_title("Adaptive Entropy Coefficients (per head)")
+    ax9.legend(fontsize=7, ncol=2)
+    ax9.grid(alpha=0.3)
 
     out_path = path.parent.parent / "training_metrics.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")

@@ -169,7 +169,7 @@ def profile_training(num_batches=5, batch_size=16):
         n_chunks = _WORKER_COUNT
         chunk_size_val = max(1, len(game_specs) // n_chunks)
         chunks = [
-            (opp_slot_map, game_specs[i : i + chunk_size_val])
+            (opp_slot_map, game_specs[i : i + chunk_size_val], 1.0)
             for i in range(0, len(game_specs), chunk_size_val)
         ]
         trajectories_raw = list(pool.map(_collect_episodes_shared_worker, chunks))
@@ -248,4 +248,4 @@ def profile_training(num_batches=5, batch_size=16):
 
 
 if __name__ == "__main__":
-    profile_training(num_batches=5, batch_size=16)
+    profile_training(num_batches=2, batch_size=512)

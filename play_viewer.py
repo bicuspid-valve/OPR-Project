@@ -38,6 +38,30 @@ from simulation import (
     ActivationResult,
 )
 
+# ── Diagnostic record for post-game review ────────────────────────
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class _ActivationDiag:
+    """One activation's diagnostic data, logged silently during play."""
+    frame_idx: int                    # index into self.frames at time of recording
+    round_num: int                    # 1-indexed
+    player: str                       # "A" (human) or "B" (AI)
+    unit_name: str
+    action: str                       # "hold" / "advance" / "rush" / "charge"
+    value_before: float               # model's value estimate before activation
+    value_after: float                # model's value estimate after activation
+    # Shadow AI fields (human turns only)
+    shadow_unit_name: str | None = None
+    shadow_action: str | None = None
+    shadow_reason: str | None = None
+    shadow_charge_target: str | None = None
+    shadow_shoot_target: str | None = None
+    shadow_value: float | None = None  # value from shadow assessment
+    diverged: bool = False             # True when human chose differently from AI
+
 # ── Visual constants (matching viewer.py) ──────────────────────────
 CELL = 12
 BOARD_W = COLS * CELL
@@ -318,7 +342,8 @@ class PlayViewer:
     def __init__(self, units_a: list[UnitState], units_b: list[UnitState],
                  board: Board, labels: list[str], owners: list[str],
                  ml_model, mode: str = "objectives",
-                 ml_planning: bool = False, planning_params: dict | None = None):
+                 ml_planning: bool = False, planning_params: dict | None = None,
+                 game_metadata: dict | None = None):
         self.units_a = units_a
         self.units_b = units_b
         self.board = board
@@ -329,6 +354,7 @@ class PlayViewer:
         self.mode = mode
         self.ml_planning = ml_planning
         self.planning_params = planning_params
+        self.game_metadata = game_metadata or {}
         self.n_units = len(labels)
 
         # Template IDs for color assignment
@@ -388,11 +414,20 @@ class PlayViewer:
         self._pending_ai_frames: list[dict] = []
         self._ai_turn_pending: bool = False
 
+        # Diagnostic logging
+        self._diag_log: list[_ActivationDiag] = []
+        self._shadow_recommendation: dict | None = None  # stashed per human turn
+
         # Build UI
         self._build_ui()
 
         # Record deployment frame
         self._record_frame("Deployment complete", round_display=0)
+
+        # Initial objective assignment (one-time, before first round)
+        if self.mode != "kill_points":
+            assign_objectives(self.units_a)
+            assign_objectives(self.units_b)
 
         # Start first round
         self._start_round()
@@ -890,9 +925,11 @@ class PlayViewer:
         elif self.phase == PHASE_BETWEEN_ROUNDS:
             ttk.Button(self.btn_frame, text="Start Next Round", command=self._advance_round).pack(side=tk.LEFT, padx=3)
             ttk.Button(self.btn_frame, text="Replay", command=self._open_replay).pack(side=tk.LEFT, padx=3)
+            ttk.Button(self.btn_frame, text="Diagnostic Review", command=self._open_diagnostic_review).pack(side=tk.LEFT, padx=3)
 
         elif self.phase == PHASE_GAME_OVER:
             ttk.Button(self.btn_frame, text="Replay", command=self._open_replay).pack(side=tk.LEFT, padx=3)
+            ttk.Button(self.btn_frame, text="Diagnostic Review", command=self._open_diagnostic_review).pack(side=tk.LEFT, padx=3)
             ttk.Button(self.btn_frame, text="Close", command=self.root.destroy).pack(side=tk.LEFT, padx=3)
 
     # ───────────────────────────────────────────────────────────────
@@ -901,26 +938,15 @@ class PlayViewer:
 
     def _start_round(self):
         """Begin a new round: reset activations, set turn order."""
-        for u in self.units_a:
-            u.activated = False
-            u.fatigued = False
-        for u in self.units_b:
-            u.activated = False
-            u.fatigued = False
-
-        if self.round_num == 0:
-            self.current_is_a = self.a_first
-        else:
-            self.current_is_a = self.a_finished_first
+        self.current_is_a = sim_start_round(
+            self.units_a, self.units_b,
+            self.round_num, self.mode,
+            a_first=self.a_first,
+            a_finished_first=self.a_finished_first,
+        )
 
         self.a_done = False
         self.b_done = False
-
-        # Reassign roles for heuristic side (human doesn't need this but
-        # the AI side uses heuristic fallbacks for role assignment)
-        if self.mode != "kill_points":
-            assign_objectives(self.units_a)
-            reassign_roles(self.units_b)
 
         # If AI goes first, defer AI turn until user clicks "Next (AI turn)"
         if not self.current_is_a:
@@ -930,6 +956,7 @@ class PlayViewer:
             self.status_var.set("AI goes first this round. Click Next to see the AI's action.")
             self._render()
         else:
+            self._compute_shadow_recommendation()
             self.phase = PHASE_SELECT_UNIT
             self.status_var.set("Select a unit to activate")
             self._clear_selection()
@@ -982,6 +1009,15 @@ class PlayViewer:
                 result_text = f"Draw! ({a_objs} vs {b_objs} objectives)"
 
         self._record_frame(f"Game Over -- {result_text}")
+
+        # Determine result code and auto-save diagnostics
+        if self.mode == "kill_points":
+            result_code = "win" if a_kp > b_kp else ("loss" if b_kp > a_kp else "draw")
+        else:
+            result_code = "win" if a_objs > b_objs else ("loss" if b_objs > a_objs else "draw")
+        if self._diag_log:
+            self._save_diagnostics(result_code)
+
         self.phase = PHASE_GAME_OVER
         self.status_var.set(f"Game Over -- {result_text}")
         self._render()
@@ -1511,6 +1547,33 @@ class PlayViewer:
         description = " ".join(desc_parts)
         self._record_frame(description, combat_stats=combat_stats)
 
+        # --- Diagnostic: log human activation with shadow comparison ---
+        value_after = self._get_value_estimate("A")
+        shadow = self._shadow_recommendation
+        value_before = shadow['value_before'] if shadow else 0.0
+        diag = _ActivationDiag(
+            frame_idx=len(self.frames) - 1,
+            round_num=self.round_num + 1,
+            player="A",
+            unit_name=self.labels[self._selected_unit_idx],
+            action=action,
+            value_before=value_before,
+            value_after=value_after,
+        )
+        if shadow:
+            diag.shadow_unit_name = shadow['unit_name']
+            diag.shadow_action = shadow['action']
+            diag.shadow_reason = shadow['reason']
+            diag.shadow_charge_target = shadow['charge_target']
+            diag.shadow_shoot_target = shadow['shoot_target']
+            diag.shadow_value = shadow['value']
+            # Diverged = different unit OR different action type
+            human_unit = self.labels[self._selected_unit_idx]
+            diag.diverged = (human_unit != shadow['unit_name']
+                             or action != shadow['action'])
+        self._diag_log.append(diag)
+        self._shadow_recommendation = None
+
         # Update combat stats panel
         if combat_stats:
             self.stats_var.set(self._format_combat_stats(combat_stats))
@@ -1552,6 +1615,9 @@ class PlayViewer:
                 self.a_finished_first = False
             return
 
+        # Value estimate before AI acts (from AI's perspective)
+        ai_value_before = self._get_value_estimate("B")
+
         active, target_ranking, ml_action, ml_goal, \
             ml_charge_target, ml_reason, ml_assessment = \
             get_ai_decision(
@@ -1577,6 +1643,8 @@ class PlayViewer:
                 self.a_finished_first = False
             return
 
+        active_idx = self.unit_to_idx[id(active)]
+
         def resolve_target(act, opp):
             return self._pick_target_ranking(act, opp, target_ranking)
 
@@ -1588,6 +1656,18 @@ class PlayViewer:
             mode=self.mode,
             resolve_shoot_target=resolve_target,
         )
+
+        # Diagnostic: log AI activation with value delta
+        ai_value_after = self._get_value_estimate("B")
+        self._diag_log.append(_ActivationDiag(
+            frame_idx=len(self.frames),
+            round_num=self.round_num + 1,
+            player="B",
+            unit_name=self.labels[active_idx],
+            action=ml_action,
+            value_before=ai_value_before,
+            value_after=ai_value_after,
+        ))
 
         self._record_frame(result.description,
                            combat_stats=result.combat_stats,
@@ -1659,6 +1739,7 @@ class PlayViewer:
             if not self.a_done:
                 self.a_finished_first = False
 
+        self._compute_shadow_recommendation()
         self._clear_selection()
         self.phase = PHASE_SELECT_UNIT
         self.status_var.set("Select a unit to activate")
@@ -1805,6 +1886,59 @@ class PlayViewer:
             })
         return unit_points, unit_info
 
+    # ── Diagnostic helpers ─────────────────────────────────────
+
+    def _compute_shadow_recommendation(self):
+        """Silently ask the AI what it would do on the human's side.
+
+        Stores result in self._shadow_recommendation.  Uses
+        snapshot/restore to guarantee no state mutation.
+        """
+        self._shadow_recommendation = None
+        # Only shadow when there are activatable human units
+        a_can = any(u.models_alive > 0 and not u.activated for u in self.units_a)
+        if not a_can:
+            return
+
+        snap = snapshot_game_state(self.units_a, self.units_b, self.board)
+        try:
+            active, target_ranking, action, goal, charge_target, reason, assess = \
+                get_ai_decision(
+                    self.ml_model, self.units_a, self.units_b,
+                    self.round_num + 1, self.board, "A",
+                    **self._ai_decision_kwargs("A"))
+
+            if active is None:
+                return
+
+            active_idx = self.unit_to_idx[id(active)]
+            # Determine top shoot target name
+            shoot_name = None
+            if target_ranking and action not in ("rush", "charge"):
+                for ri in target_ranking:
+                    if ri < len(self.units_b) and self.units_b[ri].models_alive > 0:
+                        shoot_name = self.labels[self.unit_to_idx[id(self.units_b[ri])]]
+                        break
+
+            charge_name = None
+            if charge_target is not None:
+                charge_name = self.labels[self.unit_to_idx[id(charge_target)]]
+
+            shadow_value = assess.get('value', 0.0) if assess else 0.0
+
+            self._shadow_recommendation = {
+                'unit_idx': active_idx,
+                'unit_name': self.labels[active_idx],
+                'action': action,
+                'reason': reason,
+                'charge_target': charge_name,
+                'shoot_target': shoot_name,
+                'value': shadow_value,
+                'value_before': self._get_value_estimate("A"),
+            }
+        finally:
+            restore_game_state(snap, self.units_a, self.units_b, self.board)
+
     # ── Shared helpers for AI suggestion callbacks ───────────────
 
     def _ai_decision_kwargs(self, player: str) -> dict:
@@ -1831,6 +1965,38 @@ class PlayViewer:
             pts_a=self._pts_a, pts_b=self._pts_b,
             mode=self.mode,
         )
+
+    def _get_value_estimate(self, player: str = "A") -> float:
+        """Run a lightweight forward pass and return the model's value estimate.
+
+        Uses mean opponent embedding (eval mode).  Read-only — does not
+        mutate any game state.
+        """
+        import torch
+        from ml_features import encode_state_tactical
+
+        if player == "A":
+            friendly, enemy = self.units_a, self.units_b
+            fr, fm = self._fr_a, self._fm_a
+            er, em = self._fr_b, self._fm_b
+            pts_f, pts_e = self._pts_a, self._pts_b
+        else:
+            friendly, enemy = self.units_b, self.units_a
+            fr, fm = self._fr_b, self._fm_b
+            er, em = self._fr_a, self._fm_a
+            pts_f, pts_e = self._pts_b, self._pts_a
+
+        state_vec = encode_state_tactical(
+            friendly, enemy, self.round_num + 1, self.board, player,
+            friendly_ranged_matchups=fr, friendly_melee_matchups=fm,
+            enemy_ranged_matchups=er, enemy_melee_matchups=em,
+            total_friendly_points=pts_f, total_enemy_points=pts_e,
+        )
+        with torch.no_grad():
+            h, _units, round_oh = self.ml_model.trunk(state_vec.unsqueeze(0))
+            opp_embed = self.ml_model._get_opp_embed(h, None)
+            value = self.ml_model.value_head(h, round_oh, opp_embed).item()
+        return value
 
     def _run_one_ai_activation(self, player: str, round_num: int):
         """Run one AI activation for *player* and return (result, active_idx,
@@ -1885,6 +2051,140 @@ class PlayViewer:
         return "\n".join(lines)
 
     # ── Replay viewer ─────────────────────────────────────────
+
+    def _open_diagnostic_review(self):
+        """Open the post-game diagnostic review dialog."""
+        if not self._diag_log:
+            return
+        DiagnosticReview(self.root, self._diag_log)
+
+    def _save_diagnostics(self, result: str):
+        """Auto-save diagnostic data: append rows to CSV + write per-game JSON.
+
+        Called once at game end.  *result* is "win", "loss", or "draw".
+        """
+        from datetime import datetime
+        diag_dir = Path(__file__).resolve().parent / "diagnostics"
+        diag_dir.mkdir(exist_ok=True)
+
+        game_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        meta = self.game_metadata
+        planning = self.ml_planning
+        planning_str = ""
+        if planning and self.planning_params:
+            pp = self.planning_params
+            planning_str = (f"K={pp.get('K_UNITS','')}"
+                            f",C={pp.get('C_SAMPLES_PER_UNIT','')}"
+                            f",M={pp.get('M_ROLLOUTS','')}"
+                            f",N={pp.get('N_LOOKAHEAD','')}")
+
+        # ── CSV: one row per activation ────────────────────────────
+        csv_path = diag_dir / "diagnostic_activations.csv"
+        write_header = not csv_path.exists()
+
+        csv_fields = [
+            "game_id", "timestamp", "result", "mode",
+            "planning", "planning_params",
+            "army_a", "army_b",
+            "round", "player", "unit", "action",
+            "value_before", "value_after", "value_delta",
+            "shadow_unit", "shadow_action", "shadow_reason",
+            "shadow_charge_target", "shadow_shoot_target",
+            "shadow_value", "diverged",
+        ]
+
+        import csv as csv_mod
+        with open(csv_path, "a", newline="") as f:
+            writer = csv_mod.DictWriter(f, fieldnames=csv_fields)
+            if write_header:
+                writer.writeheader()
+            for d in self._diag_log:
+                writer.writerow({
+                    "game_id": game_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "result": result,
+                    "mode": self.mode,
+                    "planning": planning,
+                    "planning_params": planning_str,
+                    "army_a": meta.get("army_a_desc", ""),
+                    "army_b": meta.get("army_b_desc", ""),
+                    "round": d.round_num,
+                    "player": d.player,
+                    "unit": d.unit_name,
+                    "action": d.action,
+                    "value_before": f"{d.value_before:.4f}",
+                    "value_after": f"{d.value_after:.4f}",
+                    "value_delta": f"{d.value_after - d.value_before:.4f}",
+                    "shadow_unit": d.shadow_unit_name or "",
+                    "shadow_action": d.shadow_action or "",
+                    "shadow_reason": d.shadow_reason or "",
+                    "shadow_charge_target": d.shadow_charge_target or "",
+                    "shadow_shoot_target": d.shadow_shoot_target or "",
+                    "shadow_value": (f"{d.shadow_value:.4f}"
+                                     if d.shadow_value is not None else ""),
+                    "diverged": d.diverged,
+                })
+
+        # ── JSON: full game snapshot ──────────────────────────────
+        def _snap_to_dict(snap):
+            """Convert a _snapshot dict (from game.py) to JSON-safe form."""
+            out = {}
+            for k, v in snap.items():
+                if k == "positions":
+                    out[k] = [[(c, r) for c, r in pos_list] for pos_list in v]
+                else:
+                    out[k] = v
+            return out
+
+        json_path = diag_dir / f"game_{game_id}.json"
+        game_doc = {
+            "game_id": game_id,
+            "result": result,
+            "mode": self.mode,
+            "planning": planning,
+            "planning_params": planning_str,
+            "army_a_desc": meta.get("army_a_desc", ""),
+            "army_b_desc": meta.get("army_b_desc", ""),
+            "army_a_units": [
+                {"name": u.unit.name, "points": u.unit.points,
+                 "template_id": u.unit.template_id}
+                for u in self.units_a
+            ],
+            "army_b_units": [
+                {"name": u.unit.name, "points": u.unit.points,
+                 "template_id": u.unit.template_id}
+                for u in self.units_b
+            ],
+            "labels": list(self.labels),
+            "owners": list(self.owners),
+            "activations": [
+                {
+                    "frame_idx": d.frame_idx,
+                    "round": d.round_num,
+                    "player": d.player,
+                    "unit": d.unit_name,
+                    "action": d.action,
+                    "value_before": d.value_before,
+                    "value_after": d.value_after,
+                    "value_delta": d.value_after - d.value_before,
+                    "shadow_unit": d.shadow_unit_name,
+                    "shadow_action": d.shadow_action,
+                    "shadow_reason": d.shadow_reason,
+                    "shadow_charge_target": d.shadow_charge_target,
+                    "shadow_shoot_target": d.shadow_shoot_target,
+                    "shadow_value": d.shadow_value,
+                    "diverged": d.diverged,
+                }
+                for d in self._diag_log
+            ],
+            "frames": [_snap_to_dict(f) for f in self.frames],
+        }
+
+        import json as json_mod
+        with open(json_path, "w") as f:
+            json_mod.dump(game_doc, f, indent=1)
+
+        print(f"Diagnostics saved: {csv_path.name} ({len(self._diag_log)} rows), {json_path.name}")
 
     def _open_replay(self):
         """Open the replay viewer as a modal window showing frames collected so far."""
@@ -2160,6 +2460,174 @@ class PlayViewer:
 
 
 # ===================================================================
+# POST-GAME REVIEW DIALOG
+# ===================================================================
+
+class DiagnosticReview:
+    """Modal dialog showing per-activation diagnostics after a game."""
+
+    def __init__(self, parent: tk.Tk, diag_log: list[_ActivationDiag]):
+        self.diag_log = diag_log
+        self.win = tk.Toplevel(parent)
+        self.win.title("Post-Game Diagnostic Review")
+        self.win.geometry("820x620")
+        self.win.configure(bg="#1e1e1e")
+
+        # ── Summary stats ─────────────────────────────────────────
+        human = [d for d in diag_log if d.player == "A"]
+        ai = [d for d in diag_log if d.player == "B"]
+        diverged = [d for d in human if d.diverged]
+
+        summary_frame = ttk.LabelFrame(self.win, text="Summary")
+        summary_frame.pack(fill=tk.X, padx=10, pady=(10, 5))
+
+        human_deltas = [d.value_after - d.value_before for d in human]
+        ai_deltas = [d.value_after - d.value_before for d in ai]
+        avg_human = sum(human_deltas) / len(human_deltas) if human_deltas else 0
+        avg_ai = sum(ai_deltas) / len(ai_deltas) if ai_deltas else 0
+
+        lines = []
+        lines.append(f"Total activations:  You: {len(human)}  |  AI: {len(ai)}")
+        lines.append(f"Avg value delta:    You: {avg_human:+.3f}  |  AI: {avg_ai:+.3f}")
+        lines.append(f"Divergences from AI recommendation: {len(diverged)} / {len(human)}")
+
+        if diverged:
+            # Average value delta for diverged vs aligned activations
+            aligned = [d for d in human if not d.diverged]
+            div_deltas = [d.value_after - d.value_before for d in diverged]
+            ali_deltas = [d.value_after - d.value_before for d in aligned]
+            avg_div = sum(div_deltas) / len(div_deltas) if div_deltas else 0
+            avg_ali = sum(ali_deltas) / len(ali_deltas) if ali_deltas else 0
+            lines.append(f"  Aligned avg delta: {avg_ali:+.3f}  |  Diverged avg delta: {avg_div:+.3f}")
+
+        ttk.Label(summary_frame, text="\n".join(lines),
+                  font=("Consolas", 10), justify=tk.LEFT).pack(
+                      anchor=tk.W, padx=8, pady=5)
+
+        # ── Filter buttons ────────────────────────────────────────
+        filter_frame = ttk.Frame(self.win)
+        filter_frame.pack(fill=tk.X, padx=10, pady=(5, 2))
+
+        self._filter = tk.StringVar(value="all")
+        for label, val in [("All", "all"), ("Your turns", "human"),
+                           ("AI turns", "ai"), ("Divergences only", "diverged")]:
+            ttk.Radiobutton(filter_frame, text=label, variable=self._filter,
+                            value=val, command=self._refresh).pack(
+                                side=tk.LEFT, padx=5)
+
+        # ── Detail list ───────────────────────────────────────────
+        list_frame = ttk.Frame(self.win)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(2, 10))
+
+        cols = ("round", "player", "unit", "action", "v_before", "v_after",
+                "delta", "shadow_unit", "shadow_action", "diverged")
+        self.tree = ttk.Treeview(list_frame, columns=cols, show="headings",
+                                 height=18)
+
+        col_widths = {
+            "round": 45, "player": 40, "unit": 110, "action": 60,
+            "v_before": 60, "v_after": 60, "delta": 55,
+            "shadow_unit": 110, "shadow_action": 70, "diverged": 55,
+        }
+        col_labels = {
+            "round": "Rnd", "player": "Side", "unit": "Unit",
+            "action": "Action", "v_before": "V(pre)", "v_after": "V(post)",
+            "delta": "\u0394V", "shadow_unit": "AI Unit",
+            "shadow_action": "AI Action", "diverged": "Diff?",
+        }
+        for c in cols:
+            self.tree.heading(c, text=col_labels[c])
+            self.tree.column(c, width=col_widths[c], minwidth=40)
+
+        scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL,
+                                command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Detail panel below the table
+        detail_frame = ttk.LabelFrame(self.win, text="Selected Activation Detail")
+        detail_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        self.detail_text = tk.Text(detail_frame, font=("Consolas", 9),
+                                   height=5, wrap=tk.WORD, state=tk.DISABLED,
+                                   bg="#1e1e1e", fg="white")
+        self.detail_text.pack(fill=tk.X, padx=5, pady=3)
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        self._refresh()
+
+    def _refresh(self):
+        """Repopulate the treeview based on the current filter."""
+        self.tree.delete(*self.tree.get_children())
+
+        filt = self._filter.get()
+        for d in self.diag_log:
+            if filt == "human" and d.player != "A":
+                continue
+            if filt == "ai" and d.player != "B":
+                continue
+            if filt == "diverged" and not d.diverged:
+                continue
+
+            delta = d.value_after - d.value_before
+            side = "You" if d.player == "A" else "AI"
+            shadow_u = d.shadow_unit_name or ""
+            shadow_a = d.shadow_action or ""
+            div_mark = "\u2717" if d.diverged else ""
+
+            self.tree.insert("", tk.END, values=(
+                d.round_num, side, d.unit_name, d.action,
+                f"{d.value_before:+.3f}", f"{d.value_after:+.3f}",
+                f"{delta:+.3f}",
+                shadow_u, shadow_a, div_mark,
+            ))
+
+    def _on_select(self, _event):
+        """Show detail for the selected row."""
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.tree.index(sel[0])
+
+        # Map back to the right diag entry through the filter
+        filt = self._filter.get()
+        filtered = []
+        for d in self.diag_log:
+            if filt == "human" and d.player != "A":
+                continue
+            if filt == "ai" and d.player != "B":
+                continue
+            if filt == "diverged" and not d.diverged:
+                continue
+            filtered.append(d)
+
+        if idx >= len(filtered):
+            return
+        d = filtered[idx]
+
+        lines = [f"Round {d.round_num} — {'You' if d.player == 'A' else 'AI'} — {d.unit_name}"]
+        lines.append(f"Action: {d.action}  |  Value: {d.value_before:+.3f} \u2192 {d.value_after:+.3f}  (\u0394 = {d.value_after - d.value_before:+.3f})")
+
+        if d.player == "A" and d.shadow_unit_name:
+            lines.append("")
+            lines.append(f"AI would: activate {d.shadow_unit_name}, {d.shadow_action}")
+            if d.shadow_charge_target:
+                lines.append(f"  charge target: {d.shadow_charge_target}")
+            if d.shadow_shoot_target:
+                lines.append(f"  shoot target: {d.shadow_shoot_target}")
+            if d.shadow_reason:
+                lines.append(f"  reason: {d.shadow_reason}")
+            if d.shadow_value is not None:
+                lines.append(f"  AI's pre-action value est: {d.shadow_value:+.3f}")
+
+        self.detail_text.configure(state=tk.NORMAL)
+        self.detail_text.delete("1.0", tk.END)
+        self.detail_text.insert("1.0", "\n".join(lines))
+        self.detail_text.configure(state=tk.DISABLED)
+
+
+# ===================================================================
 # ENTRY POINT
 # ===================================================================
 
@@ -2300,10 +2768,22 @@ def play_interactive():
         print(f"Planning params: K={planning_params['K_UNITS']}, C={planning_params['C_SAMPLES_PER_UNIT']}, M={planning_params['M_ROLLOUTS']}, N={planning_params['N_LOOKAHEAD']}")
     print("\nLaunching game...")
 
+    # Build army description strings for diagnostic export
+    army_a_units = ", ".join(
+        f"{e.template_id}" for e in army_a.entries)
+    army_b_units = ", ".join(
+        f"{e.template_id}" for e in army_b.entries)
+
+    game_meta = {
+        "army_a_desc": f"{army_a_desc} ({army_a.total_cost}pts): {army_a_units}",
+        "army_b_desc": f"HoF_ml #{army_b_data['rank']} ({army_b.total_cost}pts): {army_b_units}",
+    }
+
     viewer = PlayViewer(
         states_a, states_b, board, labels, owners,
         ml_model=model, mode="objectives",
         ml_planning=ml_planning, planning_params=planning_params,
+        game_metadata=game_meta,
     )
     viewer.run()
 

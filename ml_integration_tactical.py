@@ -22,6 +22,7 @@ from ml_features import (
     BOARD_DIAG,
     encode_state_tactical,
     precompute_damage,
+    extract_can_charge_mask,
     _flip_x,
     _flip_y,
 )
@@ -443,21 +444,28 @@ def batched_argmax_tactical(
     enemy_alive_batch = torch.stack([r.enemy_alive_mask for r in requests]) # (N, 10)
 
     # Trunk
-    h, u_attended, _attn_w, _round_oh = model.trunk(state_batch)              # (N, 512), (N, 20, 180), (N, 20, 20)
+    h, units, _round_oh = model.trunk(state_batch)                            # (N, 512), (N, 20, 200), (N, 4)
 
     # Unit selection (argmax)
     unit_logits = model.unit_selection_head(h)                              # (N, 10)
     unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
     unit_indices = unit_logits.argmax(dim=-1)                               # (N,)
 
-    # Extract per-sample unit features from attended embeddings
-    unit_features = u_attended[:, :n_units, :].gather(
+    # Extract per-sample unit features from unit embeddings
+    unit_features = units[:, :n_units, :].gather(
         1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n, 1, TACTICAL_UNIT_FEATURES),
     ).squeeze(1).detach()                                                   # (N, UF)
+
+    # Extract can_charge mask for each sample's selected unit
+    can_charge_batch = extract_can_charge_mask(state_batch, unit_indices)    # (N, 10)
 
     # Move type (argmax)
     h_uf = torch.cat([h, unit_features], dim=-1)
     move_logits = model.move_type_head(h_uf)                                # (N, 4)
+    # Mask charge when no enemy is in charge range
+    no_chargeable = ~can_charge_batch.any(dim=-1)                           # (N,)
+    move_logits = move_logits.clone()
+    move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(no_chargeable, float('-inf'))
     move_indices = move_logits.argmax(dim=-1)                               # (N,)
     move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()           # (N, 4)
 
@@ -467,9 +475,10 @@ def batched_argmax_tactical(
     direction_raw = model.direction_head(h_uf_m)                            # (N, 3)
     distance_raw = model.distance_head(h_uf_m)                              # (N, 2)
 
-    # Charge target (argmax)
+    # Charge target (argmax) — mask by alive AND chargeable
     charge_logits = model.charge_target_head(h_uf_m)                        # (N, 10)
     charge_logits = charge_logits.masked_fill(~enemy_alive_batch, float('-inf'))
+    charge_logits = charge_logits.masked_fill(~can_charge_batch, float('-inf'))
     no_enemies = ~enemy_alive_batch.any(dim=-1)                             # (N,)
     charge_logits = charge_logits.masked_fill(no_enemies.unsqueeze(-1), 0.0)
     charge_indices = charge_logits.argmax(dim=-1)                           # (N,)
@@ -615,11 +624,6 @@ def apply_tactical_model(
 
     # --- Forward pass 1: get unit + move_type + direction/distance ---
     _t2 = time.perf_counter()
-    # Run trunk separately to capture attention weights for viewer
-    h_trunk, u_attended_trunk, attn_weights, _ = model.trunk(state_vec.unsqueeze(0))
-    h_trunk = h_trunk.squeeze(0)
-    u_attended_trunk = u_attended_trunk.squeeze(0)
-    attn_weights = attn_weights.squeeze(0)  # (20, 20)
     out = model(state_vec, alive_mask, enemy_alive_mask)
     _t3 = time.perf_counter()
     _timing_forward_s += _t3 - _t2
@@ -718,14 +722,11 @@ def apply_tactical_model(
             else None
             for i, eu in enumerate(enemy_units)
         ] + [None] * (MAX_UNITS_PER_SIDE - len(enemy_units)),
-        # Attention weights: mean attention received by each of the 20 unit slots
-        # (averaged across all query positions). Slots 0-9 = friendly, 10-19 = enemy.
-        'attention_weights': attn_weights.mean(dim=0).tolist(),  # (20,)
     }
 
     # Auxiliary prediction heads (survival + objective control)
     if hasattr(model, 'aux_friendly_survival_head'):
-        h, _u, _aw, _ = model.trunk(state_vec.unsqueeze(0))  # (1, H)
+        h, _u, _ = model.trunk(state_vec.unsqueeze(0))  # (1, H)
         fs_raw = model.aux_friendly_survival_head(h).view(MAX_UNITS_PER_SIDE, 2)
         fs_alpha = F.softplus(fs_raw[:, 0]) + 0.01
         fs_beta = F.softplus(fs_raw[:, 1]) + 0.01
@@ -741,6 +742,13 @@ def apply_tactical_model(
         obj_logits = model.aux_obj_control_head(h).view(5, 3)
         obj_probs = torch.softmax(obj_logits, dim=-1).tolist()
         assessment['obj_control_probs'] = obj_probs
+
+        # Activation countdown predictions
+        if hasattr(model, 'aux_friendly_activations_head'):
+            f_act = F.softplus(model.aux_friendly_activations_head(h).squeeze(-1)).item()
+            e_act = F.softplus(model.aux_enemy_activations_head(h).squeeze(-1)).item()
+            assessment['friendly_activations_remaining'] = f_act
+            assessment['enemy_activations_remaining'] = e_act
 
     return selected_unit, target_ranking, action, goal, charge_target, reason, assessment
 
@@ -802,7 +810,7 @@ def apply_tactical_model_sampling(
     am = alive_mask.unsqueeze(0)
 
     # --- Trunk ---
-    h, u_attended, _attn_w, _ = model.trunk(x)
+    h, units, _ = model.trunk(x)
 
     # --- Unit selection (sample) ---
     unit_logits = model.unit_selection_head(h)
@@ -811,11 +819,18 @@ def apply_tactical_model_sampling(
     selected_idx = int(torch.multinomial(unit_probs, 1).item())
     selected_unit = friendly_units[selected_idx]
 
-    unit_features = model._extract_unit_features(u_attended, selected_idx).detach()
+    unit_features = model._extract_unit_features(units, selected_idx).detach()
+
+    # Extract can_charge mask for the selected unit
+    can_charge_mask = extract_can_charge_mask(state_vec, selected_idx)       # (10,) bool
 
     # --- Move type head (sample) ---
     h_uf = torch.cat([h, unit_features], dim=-1)
     move_logits = model.move_type_head(h_uf).squeeze(0)
+    # Mask charge when no enemy is in charge range
+    if not can_charge_mask.any():
+        move_logits = move_logits.clone()
+        move_logits[MOVE_CHARGE] = float('-inf')
     move_probs = torch.softmax(move_logits, dim=-1)
     move_type = int(torch.multinomial(move_probs, 1).item())
 
@@ -860,9 +875,10 @@ def apply_tactical_model_sampling(
     # Compute post-move relative features
     post_move_rel = compute_post_move_rel(post_x, post_y, enemy_positions).unsqueeze(0)
 
-    # --- Charge target (sample) ---
+    # --- Charge target (sample) — mask by alive AND chargeable ---
     charge_logits = model.charge_target_head(h_uf_m).squeeze(0)
     charge_logits = charge_logits.masked_fill(~enemy_alive_mask, float('-inf'))
+    charge_logits = charge_logits.masked_fill(~can_charge_mask, float('-inf'))
     no_enemies = not enemy_alive_mask.any()
     if no_enemies:
         charge_target_idx = 0
