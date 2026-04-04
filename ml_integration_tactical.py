@@ -30,7 +30,7 @@ from ml_features import (
 from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
     NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
-    POST_MOVE_REL_FEATURES,
+    POST_MOVE_REL_FEATURES, NUM_DEST_COMPONENTS, DEST_PARAMS_PER_COMPONENT,
 )
 
 from ml_features import BOARD_DIAG
@@ -197,38 +197,77 @@ def compute_in_range_mask_batched(
 
 
 # ---------------------------------------------------------------------------
-# Direction / distance decoding helpers
+# Destination mixture decoding helpers
 # ---------------------------------------------------------------------------
 
-def decode_direction_params(direction_params: torch.Tensor) -> tuple[float, float]:
-    """Extract (mean_sin, mean_cos) → angle from direction head output.
+# Distance support extends to DEST_DIST_MAX so values in [1.0, DEST_DIST_MAX]
+# clamp to 1.0 ("go max"), making "go max" a region rather than a point.
+DEST_DIST_MAX = 1.1
+DEST_DIST_MIN = -0.1  # symmetric padding at bottom for "stay put"
 
-    Returns (angle_radians, concentration).
+
+def decode_destination_params(
+    destination_params: torch.Tensor,
+) -> tuple[list[float], list[float], list[float], list[float], list[float], list[float]]:
+    """Decode the destination mixture head output into per-component parameters.
+
+    Parameters
+    ----------
+    destination_params : (18,) — NUM_DEST_COMPONENTS * 5 + NUM_DEST_COMPONENTS
+
+    Returns
+    -------
+    (angles, concentrations, dist_means, dist_sigmas, mixture_logits, mixture_probs)
+    Each is a list of length NUM_DEST_COMPONENTS.
     """
-    raw_sin = direction_params[0].item()
-    raw_cos = direction_params[1].item()
-    log_conc = direction_params[2].item()
+    K = NUM_DEST_COMPONENTS
+    P = DEST_PARAMS_PER_COMPONENT
 
-    # Normalise to unit circle
-    norm = math.sqrt(raw_sin * raw_sin + raw_cos * raw_cos)
-    if norm < 1e-6:
-        angle = 0.0
-    else:
-        angle = math.atan2(raw_sin / norm, raw_cos / norm)
+    angles = []
+    concentrations = []
+    dist_means = []
+    dist_sigmas = []
+    for i in range(K):
+        base = i * P
+        raw_sin = destination_params[base + 0].item()
+        raw_cos = destination_params[base + 1].item()
+        log_conc = destination_params[base + 2].item()
+        mu_dist = destination_params[base + 3].item()
+        log_sigma_dist = destination_params[base + 4].item()
 
-    concentration = min(torch.nn.functional.softplus(torch.tensor(log_conc)).item() + 0.1, 80.0)
-    return angle, concentration
+        norm = math.sqrt(raw_sin * raw_sin + raw_cos * raw_cos)
+        if norm < 1e-6:
+            angle = 0.0
+        else:
+            angle = math.atan2(raw_sin / norm, raw_cos / norm)
+        angles.append(angle)
+        concentrations.append(min(F.softplus(torch.tensor(log_conc)).item() + 0.1, 80.0))
+        dist_means.append(mu_dist)  # raw, no activation — will be sigmoid'd at sample time
+        dist_sigmas.append(max(F.softplus(torch.tensor(log_sigma_dist)).item() + 0.01, 0.01))
+
+    logits_start = K * P
+    mixture_logits = [destination_params[logits_start + i].item() for i in range(K)]
+    probs = F.softmax(torch.tensor(mixture_logits), dim=-1).tolist()
+
+    return angles, concentrations, dist_means, dist_sigmas, mixture_logits, probs
 
 
-def decode_distance_params(distance_params: torch.Tensor) -> tuple[float, float, float]:
-    """Extract Beta distribution parameters and mean from distance head output.
+def decode_destination_argmax(
+    destination_params: torch.Tensor,
+) -> tuple[float, float]:
+    """Pick the highest-weight mixture component and return its (angle, distance_frac).
 
-    Returns (alpha, beta, mean_frac).
+    Distance frac is clamped to [0, 1] (the [1.0, DEST_DIST_MAX] region maps to 1.0).
     """
-    alpha = min(F.softplus(distance_params[0]).item() + 1.01, 100.0)
-    beta = min(F.softplus(distance_params[1]).item() + 1.01, 100.0)
-    mean_frac = alpha / (alpha + beta)
-    return alpha, beta, mean_frac
+    angles, _concs, dist_means, _sigmas, _logits, probs = decode_destination_params(
+        destination_params)
+    best_k = max(range(NUM_DEST_COMPONENTS), key=lambda i: probs[i])
+    angle = angles[best_k]
+    # Sigmoid maps mu_dist to (0, 1) range, then scale to (DEST_DIST_MIN, DEST_DIST_MAX)
+    raw_frac = torch.sigmoid(torch.tensor(dist_means[best_k])).item()
+    frac = DEST_DIST_MIN + (DEST_DIST_MAX - DEST_DIST_MIN) * raw_frac
+    frac = max(0.0, min(1.0, frac))  # clamp to valid game range
+    return angle, frac
 
 
 def compute_post_move_position(
@@ -471,9 +510,8 @@ def batched_argmax_tactical(
 
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)            # (N, 272)
 
-    # Direction + Distance (decode to argmax values)
-    direction_raw = model.direction_head(h_uf_m)                            # (N, 3)
-    distance_raw = model.distance_head(h_uf_m)                              # (N, 2)
+    # Destination mixture head
+    dest_raw = model.destination_head(h_uf_m)                               # (N, 18)
 
     # Charge target (argmax) — mask by alive AND chargeable
     charge_logits = model.charge_target_head(h_uf_m)                        # (N, 10)
@@ -498,12 +536,9 @@ def batched_argmax_tactical(
         uid = unit_list[i]
         mt = move_list[i]
 
-        # Decode direction
-        angle, _conc = decode_direction_params(direction_raw[i])
+        # Decode destination (argmax component)
+        angle, mf = decode_destination_argmax(dest_raw[i])
         angles.append(angle)
-
-        # Decode distance
-        _alpha, _beta, mf = decode_distance_params(distance_raw[i])
         mean_fracs.append(mf)
 
         # Compute post-move position in model-space
@@ -636,9 +671,8 @@ def apply_tactical_model(
     # Decode move type
     move_type = int(out.move_logits.argmax().item())
 
-    # Decode direction + distance (for advance/rush)
-    angle, concentration = decode_direction_params(out.direction_params)
-    alpha, beta, mean_frac = decode_distance_params(out.distance_params)
+    # Decode destination (argmax component from mixture)
+    angle, mean_frac = decode_destination_argmax(out.destination_params)
 
     # Compute post-move position
     unit_cx, unit_cy = friendly_positions[selected_idx]
@@ -701,10 +735,7 @@ def apply_tactical_model(
         'move_type_confidence': move_conf[move_type].item(),
         'move_type_probs': move_conf.tolist(),
         'direction_angle': angle,
-        'direction_concentration': concentration,
         'distance_frac': mean_frac,
-        'distance_alpha': alpha,
-        'distance_beta': beta,
         'charge_target_idx': charge_target_idx,
         'charge_target_logits': out2.charge_target_logits.tolist(),
         'shoot_target_idx': shoot_target_idx,
@@ -840,24 +871,10 @@ def apply_tactical_model_sampling(
 
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
 
-    # --- Direction + Distance (sample from continuous distributions) ---
-    direction_raw = model.direction_head(h_uf_m).squeeze(0)
-    distance_raw = model.distance_head(h_uf_m).squeeze(0)
-
-    angle, concentration = decode_direction_params(direction_raw)
-    alpha, beta_val, _ = decode_distance_params(distance_raw)
-
-    # Sample direction from von Mises
-    von_mises = torch.distributions.VonMises(
-        torch.tensor(angle), torch.tensor(concentration)
-    )
-    sampled_angle = von_mises.sample().item()
-
-    # Sample distance from Beta
-    beta_dist = torch.distributions.Beta(
-        torch.tensor(alpha), torch.tensor(beta_val)
-    )
-    sampled_frac = beta_dist.sample().item()
+    # --- Destination mixture (sample) ---
+    dest_raw = model.destination_head(h_uf_m).squeeze(0)
+    from ml_training.sampling import _sample_from_dest_mixture_single
+    sampled_angle, sampled_frac, _comp_idx, _dest_lp = _sample_from_dest_mixture_single(dest_raw)
 
     # Compute post-move position (model-space)
     unit_cx, unit_cy = friendly_positions[selected_idx]
@@ -880,7 +897,8 @@ def apply_tactical_model_sampling(
     charge_logits = charge_logits.masked_fill(~enemy_alive_mask, float('-inf'))
     charge_logits = charge_logits.masked_fill(~can_charge_mask, float('-inf'))
     no_enemies = not enemy_alive_mask.any()
-    if no_enemies:
+    no_chargeable = not (enemy_alive_mask & can_charge_mask).any()
+    if no_enemies or no_chargeable:
         charge_target_idx = 0
     else:
         charge_probs = torch.softmax(charge_logits, dim=-1)

@@ -71,13 +71,13 @@ def main():
     n = len(data["batch"])
     print(f"Loaded {n} batches from {path.name}")
 
-    fig = plt.figure(figsize=(16, 22))
+    fig = plt.figure(figsize=(16, 26))
     fig.suptitle(
         f"Tactical Training Dashboard  (block avg = {block_size} batches)",
         fontsize=14,
         fontweight="bold",
     )
-    gs = GridSpec(5, 2, figure=fig, hspace=0.35, wspace=0.28)
+    gs = GridSpec(6, 2, figure=fig, hspace=0.35, wspace=0.28)
 
     # --- Panel 1: Win rates vs heuristic ---
     ax1 = fig.add_subplot(gs[0, 0])
@@ -218,19 +218,33 @@ def main():
     ax8.set_title("Planning Metrics")
     ax8.grid(alpha=0.3)
 
-    # --- Panel 9: Per-head alpha coefficients (full width) ---
+    # --- Panel 9: Dest 4th component objective proximity loss ---
     ax9 = fig.add_subplot(gs[4, :])
+    if "dest_obj_prox" in data:
+        bx, by = block_average(data, "dest_obj_prox", block_size)
+        ax9.plot(bx, by, marker="o", markersize=2, linewidth=1.5, color="#27AE60")
+    else:
+        ax9.text(0.5, 0.5, "dest_obj_prox not in CSV\n(older log format)",
+                 transform=ax9.transAxes, ha="center", va="center",
+                 fontsize=10, color="gray")
+    ax9.set_ylabel("Mean Distance to Nearest Obj")
+    ax9.set_title("4th Dest Component: Objective Proximity (advance/rush only)")
+    ax9.set_ylim(bottom=0)
+    ax9.grid(alpha=0.3)
+
+    # --- Panel 10: Per-head alpha coefficients (full width) ---
+    ax10 = fig.add_subplot(gs[5, :])
     alpha_cols = [c for c in data if c.startswith("alpha_")]
-    colors9 = plt.cm.Set2(np.linspace(0, 1, len(alpha_cols)))
-    for col, color in zip(alpha_cols, colors9):
+    colors10 = plt.cm.Set2(np.linspace(0, 1, len(alpha_cols)))
+    for col, color in zip(alpha_cols, colors10):
         head_name = col.replace("alpha_", "")
         bx, by = block_average(data, col, block_size)
-        ax9.plot(bx, by, linewidth=1.5, color=color, label=head_name)
-    ax9.set_ylabel("Alpha")
-    ax9.set_xlabel("Batch")
-    ax9.set_title("Adaptive Entropy Coefficients (per head)")
-    ax9.legend(fontsize=7, ncol=2)
-    ax9.grid(alpha=0.3)
+        ax10.plot(bx, by, linewidth=1.5, color=color, label=head_name)
+    ax10.set_ylabel("Alpha")
+    ax10.set_xlabel("Batch")
+    ax10.set_title("Adaptive Entropy Coefficients (per head)")
+    ax10.legend(fontsize=7, ncol=2)
+    ax10.grid(alpha=0.3)
 
     out_path = path.parent.parent / "training_metrics.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")

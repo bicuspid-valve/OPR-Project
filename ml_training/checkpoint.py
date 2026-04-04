@@ -76,6 +76,12 @@ def load_model_state_dict(path) -> dict:
     if "opponent_embedding.weight" not in state_dict:
         state_dict = {k: v for k, v in state_dict.items()
                       if not k.startswith("value_head.")}
+    # Checkpoint compat: old checkpoints have direction_head/distance_head
+    # instead of destination_head. Drop them so destination_head reinitialises.
+    if "direction_head.weight" in state_dict:
+        state_dict = {k: v for k, v in state_dict.items()
+                      if not k.startswith("direction_head.")
+                      and not k.startswith("distance_head.")}
     return state_dict
 
 

@@ -39,7 +39,7 @@ model.load_state_dict(state_dict, strict=False)
 model.eval()
 print(f"Loaded {model_label} model from {checkpoint_path}")
 
-NUM_GAMES = 50
+NUM_GAMES = 200
 wins = {"A": 0, "B": 0, "draw": 0}
 winner_labels = {"A": "ML", "B": "Heuristic", "draw": "Draw"}
 

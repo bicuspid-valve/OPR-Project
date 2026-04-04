@@ -150,8 +150,7 @@ def run_training(
         if verbose:
             print(f"Entropy targets: fraction={config.entropy_target_fraction}, "
                   f"move={config.entropy_target_move:.3f}, "
-                  f"dir={config.entropy_target_dir:.3f}, "
-                  f"dist={config.entropy_target_dist:.3f}")
+                  f"dest={config.entropy_target_dest:.3f}")
     if verbose and config.ppo_minibatch_games > 0:
         print(f"PPO minibatching: {config.ppo_minibatch_games} games per minibatch, "
               f"{config.ppo_epochs} epochs")
@@ -166,7 +165,7 @@ def run_training(
         max_size=config.max_checkpoints,
         save_dir=config.checkpoint_dir,
         model_type=config.model_type,
-        seed_existing=0 if restart else 5,
+        seed_existing=0 if restart else config.max_checkpoints,
     )
     if not restart and checkpoint_pool.entries and verbose:
         print(f"Seeded checkpoint pool with {len(checkpoint_pool.entries)} existing checkpoint(s)")
@@ -185,9 +184,9 @@ def run_training(
             "mean_reward", "h_hof_wr", "h_ml_wr", "sp_hof_wr", "sp_ml_wr",
             "sp_rnd_wr", "h_frac", "batch_time", "aux_loss",
             "weighted_aux", "non_aux_loss", "clip_frac",
-            "ent_unit", "ent_move", "ent_dir", "ent_dist",
+            "ent_unit", "ent_move", "ent_dest",
             "ent_charge", "ent_shoot",
-            "alpha_unit", "alpha_move", "alpha_dir", "alpha_dist",
+            "alpha_unit", "alpha_move", "alpha_dest",
             "alpha_charge", "alpha_shoot",
             "val_heuristic", "val_sp_mirror", "val_sp_hof",
             "val_sp_ml", "val_sp_random",
@@ -196,6 +195,7 @@ def run_training(
             "plan_argmax_rate",
             "plan_dl_unit", "plan_dl_move",
             "plan_dl_charge", "plan_dl_shoot",
+            "dest_obj_prox",
         ])
     _log_writer.writerow([datetime.now().isoformat(), "---",
                           f"Training started (start_batch={start_batch})",
@@ -432,6 +432,7 @@ def run_training(
                             planning_distill_max_weight=(
                                 config.planning_distill_max_weight
                                 if config.planning_rate > 0 else 0.0),
+                            dest_obj_proximity_coeff=config.dest_obj_proximity_coeff,
                         )
 
                     optimizer.zero_grad()
@@ -518,6 +519,7 @@ def run_training(
                         planning_distill_max_weight=(
                             config.planning_distill_max_weight
                             if config.planning_rate > 0 else 0.0),
+                        dest_obj_proximity_coeff=config.dest_obj_proximity_coeff,
                     )
 
                 optimizer.zero_grad()
@@ -576,15 +578,15 @@ def run_training(
                 alphas = entropy_tuner.alpha_summary()
                 ent_str = (f"Entropy: {loss_metrics['mean_entropy']:.4f} "
                            f"[u={phe.get('unit', 0):.3f} m={phe.get('move', 0):.3f} "
-                           f"d={phe.get('dir', 0):.3f} D={phe.get('dist', 0):.3f} "
+                           f"dst={phe.get('dest', 0):.3f} "
                            f"c={phe.get('charge', 0):.3f} s={phe.get('shoot', 0):.3f}] "
                            f"(α u={alphas['unit']:.3f} m={alphas['move']:.3f} "
-                           f"d={alphas['dir']:.3f} D={alphas['dist']:.3f} "
+                           f"dst={alphas['dest']:.3f} "
                            f"c={alphas['charge']:.3f} s={alphas['shoot']:.3f})")
             else:
                 ent_str = (f"Entropy: {loss_metrics['mean_entropy']:.4f} "
                            f"[u={phe.get('unit', 0):.3f} m={phe.get('move', 0):.3f} "
-                           f"d={phe.get('dir', 0):.3f} D={phe.get('dist', 0):.3f} "
+                           f"dst={phe.get('dest', 0):.3f} "
                            f"c={phe.get('charge', 0):.3f} s={phe.get('shoot', 0):.3f}] "
                            f"(c={entropy_coeff:.4f})")
             print(
@@ -608,7 +610,7 @@ def run_training(
             alphas = entropy_tuner.alpha_summary()
             alpha_cols = [f"{alphas[k]:.4f}" for k in EntropyTargetTuner.HEAD_NAMES]
         else:
-            alpha_cols = [""] * 6
+            alpha_cols = [""] * len(EntropyTargetTuner.HEAD_NAMES)
         _opp_val_dict = loss_metrics.get("per_opp_type_mean_values", {})
         _opp_val_cols = [
             f"{_opp_val_dict.get(k, '')}"
@@ -633,7 +635,7 @@ def run_training(
             f"{loss_metrics.get('non_aux_loss', 0.0):.4f}",
             f"{loss_metrics.get('clip_frac', 0.0):.4f}",
             *[f"{loss_metrics.get('per_head_entropy', {}).get(k, 0.0):.4f}"
-              for k in ("unit", "move", "dir", "dist", "charge", "shoot")],
+              for k in ("unit", "move", "dest", "charge", "shoot")],
             *alpha_cols,
             *_opp_val_cols,
             f"{loss_metrics.get('planning_activations', 0)}",
@@ -643,6 +645,7 @@ def run_training(
             f"{loss_metrics.get('planning_argmax_rate', 0.0):.4f}",
             *[f"{loss_metrics.get('planning_distill_sub', {}).get(k, 0.0):.6f}"
               for k in ("unit", "move", "charge", "shoot")],
+            f"{loss_metrics.get('dest_obj_proximity', 0.0):.4f}",
         ])
         _log_file.flush()
 

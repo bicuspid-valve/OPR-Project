@@ -45,14 +45,16 @@ from ml_features import (
 from ml_integration_tactical import (
     execute_decoded_decision, pick_target_from_ranking,
     compute_post_move_rel, compute_in_range_mask, compute_in_range_mask_batched,
-    decode_direction_params,
-    decode_distance_params, compute_post_move_position,
+    decode_destination_params, decode_destination_argmax,
+    DEST_DIST_MAX, DEST_DIST_MIN,
+    compute_post_move_position,
     _get_model_space_positions, _get_movement_budgets,
     _get_max_weapon_ranges, MOVE_TYPE_NAMES,
 )
 from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
     NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+    NUM_DEST_COMPONENTS, DEST_PARAMS_PER_COMPONENT,
 )
 from simulation import start_round, end_round, score_game
 
@@ -423,9 +425,8 @@ def simulate_forward(
         selected_unit = my_units[selected_idx]
         move_type = int(out.move_logits.argmax().item())
 
-        # Decode direction + distance (means)
-        angle, _conc = decode_direction_params(out.direction_params)
-        _alpha, _beta, mean_frac = decode_distance_params(out.distance_params)
+        # Decode destination (argmax of mixture components)
+        angle, mean_frac = decode_destination_argmax(out.destination_params)
 
         # Compute post-move position in model-space
         friendly_positions = _get_model_space_positions(my_units, player)
@@ -645,10 +646,9 @@ def _batched_argmax_forward(
     move_indices = move_logits.argmax(dim=-1)                          # (B,)
     move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()      # (B, 4)
 
-    # Direction + distance heads (use means, not sample)
+    # Destination mixture head (use argmax component)
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)       # (B, 272)
-    direction_raw = model.direction_head(h_uf_m)                       # (B, 3)
-    distance_raw = model.distance_head(h_uf_m)                        # (B, 2)
+    dest_raw = model.destination_head(h_uf_m)                          # (B, 18)
 
     # Charge target — argmax, mask by alive AND chargeable
     charge_logits = model.charge_target_head(h_uf_m)                   # (B, 10)
@@ -657,20 +657,17 @@ def _batched_argmax_forward(
     no_enemies = ~enemy_batch.any(dim=-1)                              # (B,)
     charge_indices = charge_logits.argmax(dim=-1)                      # (B,)
 
-    # Decode direction means
-    raw_sin = direction_raw[:, 0]
-    raw_cos = direction_raw[:, 1]
-    dir_norm = torch.sqrt(raw_sin * raw_sin + raw_cos * raw_cos).clamp(min=1e-6)
-    angles = torch.atan2(raw_sin / dir_norm, raw_cos / dir_norm)      # (B,)
-
-    # Decode distance means (Beta mean = alpha / (alpha + beta))
-    alphas = F.softplus(distance_raw[:, 0]) + 1.01
-    betas = F.softplus(distance_raw[:, 1]) + 1.01
-    mean_fracs = alphas / (alphas + betas)                             # (B,)
+    # Decode destination argmax per sample
+    angles_list_raw: list[float] = []
+    fracs_list_raw: list[float] = []
+    for i in range(n):
+        a_i, f_i = decode_destination_argmax(dest_raw[i])
+        angles_list_raw.append(a_i)
+        fracs_list_raw.append(f_i)
 
     # Per-sample: compute post_move_position → post_move_rel
-    angles_list = angles.tolist()
-    fracs_list = mean_fracs.tolist()
+    angles_list = angles_list_raw
+    fracs_list = fracs_list_raw
     unit_list = unit_indices.tolist()
     move_list = move_indices.tolist()
 
@@ -1087,13 +1084,13 @@ def plan_activation(
 
     # --- Generate candidate actions ---
     # Each entry: (uid, move_type, sampled_angle, sampled_frac, target_ranking,
-    #              charge_target_idx, shoot_target_idx, action, goal, ct_idx, reason)
+    #              charge_target_idx, shoot_target_idx, action, goal, ct_idx, reason,
+    #              no_shoot)
     # Sampling respects the conditional head chain:
-    #   move_type  ~ P(mt  | h, unit_feat)
-    #   direction  ~ VonMises(angle, conc | h, unit_feat, mt)
-    #   distance   ~ Beta(alpha, beta | h, unit_feat, mt)
-    #   charge_tgt ~ P(ct  | h, unit_feat, mt)
-    #   shoot_tgt  ~ P(st  | h, unit_feat, mt, post_move_rel)
+    #   move_type   ~ P(mt  | h, unit_feat)
+    #   destination ~ MixtureModel(angle, dist | h, unit_feat, mt)
+    #   charge_tgt  ~ P(ct  | h, unit_feat, mt)
+    #   shoot_tgt   ~ P(st  | h, unit_feat, mt, post_move_rel)
     candidate_actions: list[tuple] = []
     _seen_keys: set[tuple] = set()  # dedup by resolved action
 
@@ -1126,7 +1123,7 @@ def plan_activation(
             move_logits[MOVE_CHARGE] = float('-inf')
         move_probs = torch.softmax(move_logits, dim=-1)
 
-        for _ in range(C):
+        for sample_i in range(C):
             # 1. Sample move type
             move_type = int(torch.multinomial(move_probs, 1).item())
             move_onehot = F.one_hot(
@@ -1135,22 +1132,26 @@ def plan_activation(
 
             h_uf_m = torch.cat([h_b, uf_b, move_onehot], dim=-1)  # (1, 272)
 
-            # 2. Sample direction (von Mises) and distance (Beta)
-            direction_raw = model.direction_head(h_uf_m).squeeze(0)
-            distance_raw = model.distance_head(h_uf_m).squeeze(0)
-            angle, concentration = decode_direction_params(direction_raw)
-            alpha, beta_val, mean_frac = decode_distance_params(distance_raw)
+            # 2. Decode destination mixture and pick a component
+            dest_raw = model.destination_head(h_uf_m).squeeze(0)  # (18,)
+            angles_k, concs_k, dist_means_k, dist_sigmas_k, _logits_k, probs_k = (
+                decode_destination_params(dest_raw))
 
             if move_type in (MOVE_ADVANCE, MOVE_RUSH):
-                sampled_angle = torch.distributions.VonMises(
-                    torch.tensor(angle), torch.tensor(concentration)
-                ).sample().item()
-                sampled_frac = torch.distributions.Beta(
-                    torch.tensor(alpha), torch.tensor(beta_val)
-                ).sample().item()
+                # Use mixture component (cycle through K components across samples)
+                comp_idx = sample_i % NUM_DEST_COMPONENTS
+                sampled_angle = angles_k[comp_idx]
+                # Map sigmoid of mu_dist to frac in [DEST_DIST_MIN, DEST_DIST_MAX], clamp to [0,1]
+                raw_frac = 1.0 / (1.0 + math.exp(-dist_means_k[comp_idx]))
+                sampled_frac = DEST_DIST_MIN + (DEST_DIST_MAX - DEST_DIST_MIN) * raw_frac
+                sampled_frac = max(0.0, min(1.0, sampled_frac))
             else:
-                sampled_angle = angle
-                sampled_frac = mean_frac
+                # Hold/charge: use argmax component
+                best_k = max(range(NUM_DEST_COMPONENTS), key=lambda i: probs_k[i])
+                sampled_angle = angles_k[best_k]
+                raw_frac = 1.0 / (1.0 + math.exp(-dist_means_k[best_k]))
+                sampled_frac = DEST_DIST_MIN + (DEST_DIST_MAX - DEST_DIST_MIN) * raw_frac
+                sampled_frac = max(0.0, min(1.0, sampled_frac))
 
             # 3. Compute post-move position in model-space
             unit_cx, unit_cy = friendly_positions[uid]
@@ -1221,10 +1222,15 @@ def plan_activation(
                 continue
             _seen_keys.add(dedup_key)
 
+            will_not_shoot = (
+                no_shootable
+                or move_type == MOVE_RUSH
+                or move_type == MOVE_CHARGE
+            )
             candidate_actions.append((
                 uid, move_type, sampled_angle, sampled_frac, target_ranking,
                 charge_target_idx, shoot_target_idx,
-                action, goal, ct_idx, reason,
+                action, goal, ct_idx, reason, will_not_shoot,
             ))
 
     # --- Evaluate candidates (chunked + batched) ---
@@ -1306,12 +1312,16 @@ def plan_activation(
         uid_c = ca[0]
         move_type_c = ca[1]
         ranking_c = ca[4]
+        no_shoot_c = ca[11]
         # Find top-ranked alive enemy for this candidate
-        top_target_name = None
-        for tidx in ranking_c:
-            if tidx < len(enemy_units) and enemy_units[tidx].models_alive > 0:
-                top_target_name = _eid_label[tidx]
-                break
+        if no_shoot_c:
+            top_target_name = "N/A"
+        else:
+            top_target_name = None
+            for tidx in ranking_c:
+                if tidx < len(enemy_units) and enemy_units[tidx].models_alive > 0:
+                    top_target_name = _eid_label[tidx]
+                    break
         planning_candidates.append({
             'unit_idx': uid_c,
             'unit_name': _uid_label[uid_c],
@@ -1363,9 +1373,9 @@ def plan_training_activation(
     format as sample_tactical_actions_no_grad, plus planning metadata.
 
     Returns:
-        (unit_idx, move_type, angle, dist_frac, charge_target_idx,
-         shoot_target_idx, target_ranking, post_move_rel, old_log_prob,
-         value, shoot_mask,
+        (unit_idx, move_type, angle, dist_frac, dest_component_idx,
+         charge_target_idx, shoot_target_idx, target_ranking,
+         post_move_rel, old_log_prob, value, shoot_mask,
          was_planned, planning_improved, planning_value_delta,
          planning_unit_values, planning_unit_indices)
     """
@@ -1450,22 +1460,24 @@ def plan_training_activation(
             ).float().unsqueeze(0)
             h_uf_m = torch.cat([h_b, uf_b, move_onehot], dim=-1)
 
-            # Direction + distance
-            direction_raw = model.direction_head(h_uf_m).squeeze(0)
-            distance_raw = model.distance_head(h_uf_m).squeeze(0)
-            angle, concentration = decode_direction_params(direction_raw)
-            alpha, beta_val, mean_frac = decode_distance_params(distance_raw)
+            # Destination mixture
+            dest_raw = model.destination_head(h_uf_m).squeeze(0)  # (18,)
+            angles_k, concs_k, dist_means_k, dist_sigmas_k, _logits_k, probs_k = (
+                decode_destination_params(dest_raw))
 
             if is_argmax_action:
-                # Argmax: use distribution modes
-                sampled_angle = angle
-                sampled_frac = mean_frac
+                # Argmax: use highest-weight component's mode
+                sampled_angle, sampled_frac = decode_destination_argmax(dest_raw)
             elif move_type in (MOVE_ADVANCE, MOVE_RUSH):
-                sampled_angle = float(np.random.vonmises(angle, concentration))
-                sampled_frac = float(np.random.beta(alpha, beta_val))
+                # Use mixture component (cycle through K components across samples)
+                comp_idx = si % NUM_DEST_COMPONENTS
+                sampled_angle = angles_k[comp_idx]
+                raw_frac = 1.0 / (1.0 + math.exp(-dist_means_k[comp_idx]))
+                sampled_frac = DEST_DIST_MIN + (DEST_DIST_MAX - DEST_DIST_MIN) * raw_frac
+                sampled_frac = max(0.0, min(1.0, sampled_frac))
             else:
-                sampled_angle = angle
-                sampled_frac = mean_frac
+                # Hold/charge: use argmax component
+                sampled_angle, sampled_frac = decode_destination_argmax(dest_raw)
 
             # Post-move position
             unit_cx, unit_cy = friendly_positions[uid]
@@ -1546,10 +1558,15 @@ def plan_training_activation(
                 continue
             _seen_keys.add(dedup_key)
 
+            will_not_shoot = (
+                no_shootable
+                or move_type == MOVE_RUSH
+                or move_type == MOVE_CHARGE
+            )
             candidate_actions.append((
                 uid, move_type, sampled_angle, sampled_frac, target_ranking,
                 charge_target_idx, shoot_target_idx,
-                action_str, goal, ct_idx, reason,
+                action_str, goal, ct_idx, reason, will_not_shoot,
             ))
             candidate_to_unit.append(uid)
             candidate_shoot_masks.append(shoot_range_mask)
@@ -1725,22 +1742,39 @@ def plan_training_activation(
     ).float().unsqueeze(0)
     h_uf_m_ch = torch.cat([h_b, uf_b, move_onehot_ch], dim=-1)
 
-    # Direction log-prob
-    dir_raw = model.direction_head(h_uf_m_ch).squeeze(0)
-    ch_angle, ch_conc = decode_direction_params(dir_raw)
-    _conc_t = torch.tensor(ch_conc)
-    _i0e_c = torch.special.i0e(_conc_t)
-    _log_i0_c = ch_conc + math.log(max(float(_i0e_c.item()), 1e-20))
-    dir_lp = (ch_conc * math.cos(chosen_angle - ch_angle)
-              - (math.log(2.0 * math.pi) + _log_i0_c))
+    # Destination mixture log-prob
+    dest_raw = model.destination_head(h_uf_m_ch).squeeze(0)  # (18,)
+    angles_k, concs_k, dist_means_k, dist_sigmas_k, _logits_k, probs_k = (
+        decode_destination_params(dest_raw))
 
-    # Distance log-prob
-    dist_raw = model.distance_head(h_uf_m_ch).squeeze(0)
-    ch_alpha, ch_beta, _ = decode_distance_params(dist_raw)
-    clamped_frac = max(1e-4, min(1.0 - 1e-4, chosen_frac))
-    dist_lp = max(-20.0, min(20.0, torch.distributions.Beta(
-        torch.tensor(ch_alpha), torch.tensor(ch_beta),
-    ).log_prob(torch.tensor(clamped_frac)).item()))
+    # Compute mixture log-prob: log(sum_k w_k * VonMises(angle|k) * N_sigmoid(dist|k))
+    _dest_log_components = []
+    for _k in range(NUM_DEST_COMPONENTS):
+        _log_w = math.log(max(probs_k[_k], eps))
+        # VonMises log-prob
+        _conc_k = concs_k[_k]
+        _conc_t = torch.tensor(_conc_k)
+        _i0e_c = torch.special.i0e(_conc_t)
+        _log_i0_c = _conc_k + math.log(max(float(_i0e_c.item()), 1e-20))
+        _vm_lp = (_conc_k * math.cos(chosen_angle - angles_k[_k])
+                  - (math.log(2.0 * math.pi) + _log_i0_c))
+        # Gaussian-sigmoid distance log-prob
+        _mu_k = dist_means_k[_k]
+        _sig_k = dist_sigmas_k[_k]
+        # Map chosen_frac back to unclamped, then to z via logit
+        _frac_unclamped = chosen_frac  # already in [0, 1]
+        _t = (_frac_unclamped - DEST_DIST_MIN) / (DEST_DIST_MAX - DEST_DIST_MIN)
+        _t = max(eps, min(1.0 - eps, _t))
+        _z_val = math.log(_t / (1.0 - _t))
+        _gauss_lp = (-0.5 * ((_z_val - _mu_k) / _sig_k) ** 2
+                     - math.log(_sig_k) - 0.5 * math.log(2 * math.pi))
+        _jacobian_lp = -math.log((DEST_DIST_MAX - DEST_DIST_MIN) * _t * (1.0 - _t))
+        _dist_lp = _gauss_lp + _jacobian_lp
+        _dest_log_components.append(_log_w + _vm_lp + _dist_lp)
+
+    _max_lc = max(_dest_log_components)
+    dest_lp = _max_lc + math.log(sum(math.exp(_lc - _max_lc) for _lc in _dest_log_components))
+    dest_lp = max(-20.0, min(20.0, dest_lp))
 
     # Charge log-prob — mask by alive AND chargeable
     charge_logits_ch = model.charge_target_head(h_uf_m_ch).squeeze(0)
@@ -1791,7 +1825,7 @@ def plan_training_activation(
     # Combine log-probs (same rules as sample_tactical_actions_no_grad)
     old_log_prob = chosen_unit_lp + move_lp
     if chosen_move_type in (MOVE_ADVANCE, MOVE_RUSH):
-        old_log_prob += dir_lp + dist_lp
+        old_log_prob += dest_lp
     if chosen_move_type in (MOVE_HOLD, MOVE_ADVANCE):
         old_log_prob += shoot_lp
     if chosen_move_type == MOVE_CHARGE:
@@ -1808,6 +1842,7 @@ def plan_training_activation(
 
     return (
         chosen_uid, chosen_move_type, chosen_angle, chosen_frac,
+        0,  # dest_component_idx (planning picks best candidate, default 0)
         chosen_charge_tgt, chosen_shoot_tgt, chosen_ranking,
         pmr_list, old_log_prob, value_est, shoot_mask_list,
         True,  # was_planned

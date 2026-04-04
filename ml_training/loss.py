@@ -12,8 +12,10 @@ import torch.nn.functional as F
 from ml_features import MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES, extract_can_charge_mask
 from ml_model_tactical import (
     TacticalModel, NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
-    NUM_OPPONENT_TYPES,
+    NUM_OPPONENT_TYPES, NUM_DEST_COMPONENTS, DEST_PARAMS_PER_COMPONENT,
 )
+from ml_integration_tactical import DEST_DIST_MAX, DEST_DIST_MIN
+from ml_features import _MODEL_OBJECTIVES
 
 from ml_training.config import TacticalActivationRecord
 from ml_training.entropy import EntropyTargetTuner
@@ -38,8 +40,7 @@ class FlatReplayResult:
     # Per-head entropies for entropy target tuning
     unit_entropies: torch.Tensor | None = None     # (N,)
     move_entropies: torch.Tensor | None = None     # (N,)
-    dir_entropies: torch.Tensor | None = None      # (N,)
-    dist_entropies: torch.Tensor | None = None     # (N,)
+    dest_entropies: torch.Tensor | None = None     # (N,) — destination mixture entropy
     charge_entropies: torch.Tensor | None = None   # (N,)
     shoot_entropies: torch.Tensor | None = None    # (N,)
     # Per-step masks for conditional heads
@@ -71,6 +72,10 @@ class FlatReplayResult:
     move_logits: torch.Tensor | None = None    # (N, 4) — move type logits conditioned on chosen unit
     charge_logits: torch.Tensor | None = None  # (N, 10) — charge target logits (masked)
     shoot_logits: torch.Tensor | None = None   # (N, 10) — shoot target logits (masked)
+    # Destination mixture component repulsion loss (per-step)
+    dest_repulsion: torch.Tensor | None = None  # (N,) — mean pairwise distance penalty
+    # 4th destination component: distance to nearest objective from hypothetical post-move position
+    dest_obj_proximity: torch.Tensor | None = None  # (N,) — min distance to any objective
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +156,9 @@ def replay_tactical_log_probs_flat(
 
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)  # (N, 272)
 
-    # === Direction + Distance heads (raw outputs) ===
-    direction_raw = model.direction_head(h_uf_m)                  # (N, 3)
-    direction_raw = torch.nan_to_num(direction_raw, nan=0.0, posinf=50.0, neginf=-50.0)
-    distance_raw = model.distance_head(h_uf_m)                    # (N, 2)
-    distance_raw = torch.nan_to_num(distance_raw, nan=0.0, posinf=50.0, neginf=-50.0)
+    # === Destination mixture head (raw outputs) ===
+    dest_raw = model.destination_head(h_uf_m)                     # (N, 18)
+    dest_raw = torch.nan_to_num(dest_raw, nan=0.0, posinf=50.0, neginf=-50.0)
 
     # === Charge target head — mask by alive AND chargeable ===
     charge_logits = model.charge_target_head(h_uf_m)              # (N, 10)
@@ -209,35 +212,137 @@ def replay_tactical_log_probs_flat(
     move_lp = move_dist.log_prob(move_indices)
     move_ent = move_dist.entropy()
 
-    # Direction (von Mises log-prob) — vectorized
+    # Destination mixture log-prob and entropy — vectorized
     stored_angles = torch.from_numpy(np.array([s.sampled_angle for s in flat_steps], dtype=np.float32))
-    raw_sin = direction_raw[:, 0]
-    raw_cos = direction_raw[:, 1]
-    log_conc = direction_raw[:, 2]
+    stored_fracs = torch.from_numpy(np.array([s.sampled_distance_frac for s in flat_steps], dtype=np.float32))
+
+    K = NUM_DEST_COMPONENTS
+    P = DEST_PARAMS_PER_COMPONENT
+
+    # Parse destination head outputs: K components × 5 params + K logits
+    comp_params = dest_raw[:, :K * P].reshape(n_steps, K, P)  # (N, K, 5)
+    mix_logits = dest_raw[:, K * P:]                            # (N, K)
+    mix_log_probs = F.log_softmax(mix_logits, dim=-1)           # (N, K)
+
+    # Per-component direction parameters
+    raw_sin = comp_params[:, :, 0]   # (N, K)
+    raw_cos = comp_params[:, :, 1]   # (N, K)
+    log_conc = comp_params[:, :, 2]  # (N, K)
+    mu_dist_raw = comp_params[:, :, 3]    # (N, K) — pre-sigmoid distance mean
+    log_sigma = comp_params[:, :, 4]      # (N, K) — pre-softplus distance sigma
+
+    # Direction: angles and concentrations per component
     norm = torch.sqrt(raw_sin * raw_sin + raw_cos * raw_cos).clamp(min=1e-6)
-    mean_angle = torch.atan2(raw_sin / norm, raw_cos / norm)
-    conc = (F.softplus(log_conc) + 0.1).clamp(max=80.0)
-    # VonMises log-prob: κ·cos(x - μ) - log(2π·I₀(κ))
-    # Use exponentially-scaled Bessel functions for numerical stability:
-    #   log I₀(κ) = κ + log(i0e(κ))  where i0e(κ) = I₀(κ)·e^(-κ)
+    mean_angles = torch.atan2(raw_sin / norm, raw_cos / norm)    # (N, K)
+    conc = (F.softplus(log_conc) + 0.1).clamp(max=80.0)         # (N, K)
+
+    # Distance: sigmoid parameterization
+    sigma = (F.softplus(log_sigma) + 0.01).clamp(max=5.0)       # (N, K)
+
+    # VonMises log-prob per component: κ·cos(x - μ) - log(2π·I₀(κ))
     i0e_conc = torch.special.i0e(conc)
     log_i0 = conc + torch.log(i0e_conc.clamp(min=1e-20))
-    log_norm = math.log(2.0 * math.pi) + log_i0
-    dir_lp = conc * torch.cos(stored_angles - mean_angle) - log_norm
-    # VonMises entropy: log(2π·I₀(κ)) - κ·I₁(κ)/I₀(κ)
-    # I₁/I₀ = i1e(κ)/i0e(κ)  (exponential factors cancel)
+    log_vm_norm = math.log(2.0 * math.pi) + log_i0              # (N, K)
+    angles_exp = stored_angles.unsqueeze(1).expand_as(mean_angles)  # (N, K)
+    vm_lp = conc * torch.cos(angles_exp - mean_angles) - log_vm_norm  # (N, K)
+
+    # Distance log-prob per component: Gaussian on logit-space with Jacobian
+    fracs_exp = stored_fracs.unsqueeze(1).expand_as(mu_dist_raw)  # (N, K)
+    # Map stored frac back to logit-space
+    t = (fracs_exp - DEST_DIST_MIN) / (DEST_DIST_MAX - DEST_DIST_MIN)
+    t = t.clamp(1e-4, 1.0 - 1e-4)
+    z = torch.log(t / (1.0 - t))                                 # (N, K) logit
+    # Gaussian log-prob on z
+    gauss_lp = -0.5 * ((z - mu_dist_raw) / sigma) ** 2 - torch.log(sigma) - 0.5 * math.log(2 * math.pi)
+    # Jacobian correction: dz/dfrac = 1/((MAX-MIN)*t*(1-t))
+    jacobian_lp = -torch.log((DEST_DIST_MAX - DEST_DIST_MIN) * t * (1.0 - t))
+    dist_lp = gauss_lp + jacobian_lp                              # (N, K)
+
+    # For clamped fracs (at 0 or 1), use CDF instead of density
+    # frac=1.0 (go max): P(frac >= 1) — common case
+    is_max = (stored_fracs >= 1.0 - 1e-4)
+    if is_max.any():
+        t_boundary = (1.0 - DEST_DIST_MIN) / (DEST_DIST_MAX - DEST_DIST_MIN)
+        z_boundary = math.log(t_boundary / (1.0 - t_boundary))
+        # log(1 - Phi((z_boundary - mu) / sigma)) = log(0.5 * erfc((z_boundary - mu) / (sigma * sqrt(2))))
+        cdf_arg = (z_boundary - mu_dist_raw) / (sigma * math.sqrt(2.0))
+        log_sf = torch.log(0.5 * torch.erfc(cdf_arg).clamp(min=1e-10))
+        dist_lp = torch.where(is_max.unsqueeze(1).expand_as(dist_lp), log_sf, dist_lp)
+
+    is_min = (stored_fracs <= 1e-4)
+    if is_min.any():
+        t_boundary = (0.0 - DEST_DIST_MIN) / (DEST_DIST_MAX - DEST_DIST_MIN)
+        t_boundary = max(t_boundary, 1e-6)
+        z_boundary = math.log(t_boundary / (1.0 - t_boundary))
+        cdf_arg = (z_boundary - mu_dist_raw) / (sigma * math.sqrt(2.0))
+        log_cdf = torch.log(0.5 * torch.erfc(-cdf_arg).clamp(min=1e-10))
+        dist_lp = torch.where(is_min.unsqueeze(1).expand_as(dist_lp), log_cdf, dist_lp)
+
+    # Mixture log-prob: log(sum_k w_k * VonMises_k * Gaussian_k)
+    log_components = mix_log_probs + vm_lp + dist_lp              # (N, K)
+    dest_lp = torch.logsumexp(log_components, dim=-1)             # (N,)
+    dest_lp = dest_lp.clamp(-20.0, 20.0)
+
+    # Destination mixture entropy (combined):
+    #   H(mixture) ≈ H(weights) + Σ_k w_k · [H(VonMises_k) + H(Gaussian_k)]
+    # This captures both "which component to pick" and "how spread each component is".
+    mix_weights = F.softmax(mix_logits, dim=-1)                    # (N, K)
+    cat_ent = torch.distributions.Categorical(logits=mix_logits).entropy()  # (N,)
+    # Per-component VonMises entropy: log(2π·I₀(κ)) - κ·I₁(κ)/I₀(κ)
     i1e_conc = torch.special.i1e(conc)
     ratio_i1_i0 = i1e_conc / i0e_conc.clamp(min=1e-10)
-    dir_ent = log_norm - conc * ratio_i1_i0
+    vm_ent = log_vm_norm - conc * ratio_i1_i0                     # (N, K)
+    # Per-component Gaussian entropy on logit-space: 0.5 * log(2πe·σ²) = 0.5 + log(σ) + 0.5*log(2π)
+    gauss_ent = 0.5 + torch.log(sigma) + 0.5 * math.log(2.0 * math.pi)  # (N, K)
+    # Weight-averaged component entropy
+    component_ent = (mix_weights * (vm_ent + gauss_ent)).sum(dim=-1)  # (N,)
+    dest_ent = cat_ent + component_ent                              # (N,)
 
-    # Distance (Beta log-prob) — vectorized
-    stored_fracs = torch.from_numpy(np.array([s.sampled_distance_frac for s in flat_steps], dtype=np.float32))
-    alpha = (F.softplus(distance_raw[:, 0]) + 1.01).clamp(max=100.0)
-    beta_val = (F.softplus(distance_raw[:, 1]) + 1.01).clamp(max=100.0)
-    clamped_fracs = stored_fracs.clamp(1e-4, 1.0 - 1e-4)
-    beta_dist = torch.distributions.Beta(alpha, beta_val)
-    dist_frac_lp = beta_dist.log_prob(clamped_fracs).clamp(-20.0, 20.0)
-    dist_frac_ent = beta_dist.entropy()
+    # Destination component repulsion: encourage diverse component positions.
+    # Compute pairwise "position distance" between components using their
+    # (angle, distance_frac) means, converted to approximate (x, y) on a unit circle.
+    # dist_frac_mean = sigmoid(mu_dist_raw) mapped to [DEST_DIST_MIN, DEST_DIST_MAX], clamped to [0,1]
+    dist_frac_means = torch.sigmoid(mu_dist_raw) * (DEST_DIST_MAX - DEST_DIST_MIN) + DEST_DIST_MIN  # (N, K)
+    dist_frac_means = dist_frac_means.clamp(0.0, 1.0)
+    # Convert each component to (x, y) = frac * (cos(angle), sin(angle))
+    comp_x = dist_frac_means * torch.cos(mean_angles)  # (N, K)
+    comp_y = dist_frac_means * torch.sin(mean_angles)  # (N, K)
+    # Pairwise squared distances between all K*(K-1)/2 pairs
+    # For K=3: pairs (0,1), (0,2), (1,2)
+    repulsion_loss = torch.zeros(n_steps)
+    _repulsion_eps = 0.15  # threshold below which repulsion activates (in board-fraction units)
+    for ki in range(K):
+        for kj in range(ki + 1, K):
+            dx = comp_x[:, ki] - comp_x[:, kj]
+            dy = comp_y[:, ki] - comp_y[:, kj]
+            pair_dist = torch.sqrt(dx * dx + dy * dy + 1e-8)  # (N,)
+            # Hinge: penalize when pair_dist < threshold
+            repulsion_loss = repulsion_loss + F.relu(_repulsion_eps - pair_dist)
+    # Average over pairs
+    n_pairs = K * (K - 1) // 2
+    repulsion_loss = repulsion_loss / n_pairs  # (N,)
+
+    # 4th destination component: objective proximity loss
+    # Extract 4th component (index 3) direction and distance, compute hypothetical
+    # post-move position, measure distance to nearest objective.
+    _obj_k = K - 1  # last component is the objective-seeking one
+    obj_dir_x = raw_cos[:, _obj_k] / norm[:, _obj_k]  # cos(angle), (N,)
+    obj_dir_y = raw_sin[:, _obj_k] / norm[:, _obj_k]  # sin(angle), (N,)
+    obj_frac = torch.sigmoid(mu_dist_raw[:, _obj_k]) * (DEST_DIST_MAX - DEST_DIST_MIN) + DEST_DIST_MIN
+    obj_frac = obj_frac.clamp(0.0, 1.0)  # (N,)
+    # Unit positions and budgets from stored records
+    _unit_cx = torch.tensor([s.unit_cx for s in flat_steps], dtype=torch.float32)
+    _unit_cy = torch.tensor([s.unit_cy for s in flat_steps], dtype=torch.float32)
+    _move_budget = torch.tensor([s.move_budget for s in flat_steps], dtype=torch.float32)
+    # Hypothetical post-move position from 4th component
+    obj_px = _unit_cx + obj_dir_x * obj_frac * _move_budget
+    obj_py = _unit_cy + obj_dir_y * obj_frac * _move_budget
+    # Distance to each of 5 objectives (same set in model-space for both players)
+    _obj_pos = torch.tensor(_MODEL_OBJECTIVES, dtype=torch.float32)  # (5, 2)
+    obj_dx = obj_px.unsqueeze(1) - _obj_pos[:, 0].unsqueeze(0)  # (N, 5)
+    obj_dy = obj_py.unsqueeze(1) - _obj_pos[:, 1].unsqueeze(0)  # (N, 5)
+    obj_dist_sq = obj_dx * obj_dx + obj_dy * obj_dy  # (N, 5)
+    obj_proximity = torch.sqrt(obj_dist_sq.min(dim=1).values + 1e-6)  # (N,)
 
     # Charge target — guard against all-dead rows before softmax
     charge_indices = torch.from_numpy(np.array([s.charge_target_idx for s in flat_steps], dtype=np.int64))
@@ -265,11 +370,11 @@ def replay_tactical_log_probs_flat(
     total_ent = unit_ent + move_ent
     n_heads = torch.full((n_steps,), 2.0)  # count active heads for entropy averaging
 
-    # Advance/rush: + direction + distance
+    # Advance/rush: + destination mixture
     is_adv_rush = (move_indices == MOVE_ADVANCE) | (move_indices == MOVE_RUSH)
-    total_lp = total_lp + torch.where(is_adv_rush, dir_lp + dist_frac_lp, torch.zeros_like(dir_lp))
-    total_ent = total_ent + torch.where(is_adv_rush, dir_ent + dist_frac_ent, torch.zeros_like(dir_ent))
-    n_heads = n_heads + torch.where(is_adv_rush, torch.tensor(2.0), torch.tensor(0.0))
+    total_lp = total_lp + torch.where(is_adv_rush, dest_lp, torch.zeros_like(dest_lp))
+    total_ent = total_ent + torch.where(is_adv_rush, dest_ent, torch.zeros_like(dest_ent))
+    n_heads = n_heads + torch.where(is_adv_rush, torch.tensor(1.0), torch.tensor(0.0))
 
     # Hold/advance: + shoot_target
     is_hold_adv = (move_indices == MOVE_HOLD) | (move_indices == MOVE_ADVANCE)
@@ -331,8 +436,7 @@ def replay_tactical_log_probs_flat(
         # Per-head entropies
         unit_entropies=unit_ent,
         move_entropies=move_ent,
-        dir_entropies=dir_ent,
-        dist_entropies=dist_frac_ent,
+        dest_entropies=dest_ent,
         charge_entropies=charge_ent,
         shoot_entropies=shoot_ent,
         # Conditional head masks
@@ -360,6 +464,8 @@ def replay_tactical_log_probs_flat(
         move_logits=move_logits,
         charge_logits=charge_logits,
         shoot_logits=shoot_logits,
+        dest_repulsion=repulsion_loss,
+        dest_obj_proximity=obj_proximity,
     )
 
 
@@ -380,6 +486,7 @@ def compute_loss_flat(
     flat_steps: list[TacticalActivationRecord] | None = None,
     entropy_tuner: EntropyTargetTuner | None = None,
     planning_distill_max_weight: float = 0.0,
+    dest_obj_proximity_coeff: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Vectorized PPO loss — no Python loops over individual steps.
 
@@ -449,8 +556,7 @@ def compute_loss_flat(
         for name, ent_t in [
             ("unit", flat_result.unit_entropies),
             ("move", flat_result.move_entropies),
-            ("dir", flat_result.dir_entropies),
-            ("dist", flat_result.dist_entropies),
+            ("dest", flat_result.dest_entropies),
             ("charge", flat_result.charge_entropies),
             ("shoot", flat_result.shoot_entropies),
         ]:
@@ -462,8 +568,7 @@ def compute_loss_flat(
         entropy_bonus = entropy_tuner.compute_entropy_bonus(
             flat_result.unit_entropies,
             flat_result.move_entropies,
-            flat_result.dir_entropies,
-            flat_result.dist_entropies,
+            flat_result.dest_entropies,
             flat_result.charge_entropies,
             flat_result.shoot_entropies,
             flat_result.is_adv_rush,
@@ -472,12 +577,17 @@ def compute_loss_flat(
         )
         loss = mean_policy_loss + value_coeff * mean_value_loss - entropy_bonus
 
+        # Destination component repulsion loss: penalize collapsed components
+        if flat_result.dest_repulsion is not None and flat_result.is_adv_rush is not None:
+            n_ar = flat_result.is_adv_rush.sum().clamp(min=1)
+            mean_repulsion = (flat_result.dest_repulsion * flat_result.is_adv_rush).sum() / n_ar
+            loss = loss + 0.1 * mean_repulsion  # fixed coefficient — small but meaningful
+
         # Alpha loss (caller backprops this separately through the alpha optimizer)
         alpha_loss = entropy_tuner.compute_alpha_loss(
             flat_result.unit_entropies,
             flat_result.move_entropies,
-            flat_result.dir_entropies,
-            flat_result.dist_entropies,
+            flat_result.dest_entropies,
             flat_result.charge_entropies,
             flat_result.shoot_entropies,
             flat_result.is_adv_rush,
@@ -491,7 +601,26 @@ def compute_loss_flat(
     else:
         # Legacy single-coefficient path
         loss = mean_policy_loss + value_coeff * mean_value_loss - entropy_coeff * mean_entropy
+        # Destination component repulsion loss (legacy path)
+        if flat_result.dest_repulsion is not None and flat_result.is_adv_rush is not None:
+            n_ar = flat_result.is_adv_rush.sum().clamp(min=1)
+            mean_repulsion = (flat_result.dest_repulsion * flat_result.is_adv_rush).sum() / n_ar
+            loss = loss + 0.1 * mean_repulsion
         alpha_loss = None
+
+    # --- 4th destination component: objective proximity loss (adaptive cap) ---
+    obj_prox_loss_val = 0.0
+    effective_obj_prox_coeff = 0.0
+    if dest_obj_proximity_coeff > 0 and flat_result.dest_obj_proximity is not None and flat_result.is_adv_rush is not None:
+        n_ar = flat_result.is_adv_rush.sum().clamp(min=1)
+        mean_obj_prox = (flat_result.dest_obj_proximity * flat_result.is_adv_rush.float()).sum() / n_ar
+        obj_prox_loss_val = mean_obj_prox.item()
+        policy_mag = abs(loss.item())
+        raw_prox_mag = abs(obj_prox_loss_val)
+        # Scale so proximity contributes at most dest_obj_proximity_coeff of policy magnitude
+        effective_obj_prox_coeff = dest_obj_proximity_coeff * policy_mag / max(raw_prox_mag, 1e-6)
+        effective_obj_prox_coeff = min(effective_obj_prox_coeff, dest_obj_proximity_coeff)
+        loss = loss + effective_obj_prox_coeff * mean_obj_prox
 
     # --- Auxiliary prediction losses (adaptive coefficient) ---
     aux_loss_val = 0.0
@@ -537,7 +666,8 @@ def compute_loss_flat(
                     planning_argmax_best += 1
 
     weighted_aux = effective_aux_coeff * aux_loss_val
-    non_aux_loss = loss.item() - weighted_aux - distill_loss_val
+    weighted_obj_prox = effective_obj_prox_coeff * obj_prox_loss_val
+    non_aux_loss = loss.item() - weighted_aux - distill_loss_val - weighted_obj_prox
     metrics = {
         "loss": loss.item(),
         "policy_loss": mean_policy_loss.item(),
@@ -548,6 +678,11 @@ def compute_loss_flat(
         "weighted_aux": weighted_aux,
         "non_aux_loss": non_aux_loss,
         "clip_frac": clip_frac,
+        "dest_repulsion": (
+            (flat_result.dest_repulsion * flat_result.is_adv_rush).sum()
+            / flat_result.is_adv_rush.sum().clamp(min=1)
+        ).item() if flat_result.dest_repulsion is not None and flat_result.is_adv_rush is not None else 0.0,
+        "dest_obj_proximity": obj_prox_loss_val,
         "per_head_entropy": per_head_entropy,
         "alpha_loss": alpha_loss_val,
         "_alpha_loss_tensor": alpha_loss,  # for backprop (not serialized)

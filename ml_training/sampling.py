@@ -10,14 +10,101 @@ import torch.nn.functional as F
 from ml_features import MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES, extract_can_charge_mask
 from ml_model_tactical import (
     TacticalModel, NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+    NUM_DEST_COMPONENTS, DEST_PARAMS_PER_COMPONENT,
 )
 from ml_integration_tactical import (
     compute_post_move_rel, compute_post_move_position,
-    decode_direction_params, decode_distance_params,
+    decode_destination_params, decode_destination_argmax,
     compute_in_range_mask, compute_in_range_mask_batched,
+    DEST_DIST_MAX, DEST_DIST_MIN,
 )
 
 from ml_training.config import _TacticalInferenceRequest, _TacticalSamplingResult
+
+
+def _sample_from_dest_mixture_single(
+    destination_raw: torch.Tensor,
+) -> tuple[float, float, int, float]:
+    """Sample one (angle, distance_frac, component_idx, log_prob) from the destination mixture.
+
+    Uses numpy for speed (single-sample path).
+    """
+    K = NUM_DEST_COMPONENTS
+    P = DEST_PARAMS_PER_COMPONENT
+    eps = 1e-8
+
+    angles, concentrations, dist_means, dist_sigmas, mixture_logits, probs = (
+        decode_destination_params(destination_raw))
+
+    # Sample component (normalize probs for numerical safety)
+    probs_arr = np.array(probs, dtype=np.float64)
+    probs_arr /= probs_arr.sum()
+    comp_idx = int(np.random.choice(K, p=probs_arr))
+
+    # Sample angle from VonMises for this component
+    sampled_angle = float(np.random.vonmises(angles[comp_idx], concentrations[comp_idx]))
+
+    # Sample distance: Gaussian in sigmoid-space, then map to [DEST_DIST_MIN, DEST_DIST_MAX]
+    mu_raw = dist_means[comp_idx]
+    sigma = dist_sigmas[comp_idx]
+    z = float(np.random.normal(mu_raw, sigma))
+    raw_frac = 1.0 / (1.0 + math.exp(-z))  # sigmoid
+    sampled_frac_unclamped = DEST_DIST_MIN + (DEST_DIST_MAX - DEST_DIST_MIN) * raw_frac
+    sampled_frac = max(0.0, min(1.0, sampled_frac_unclamped))
+
+    # Log-prob: log(sum_k w_k * VonMises(angle|k) * N_sigmoid(dist|k))
+    # We compute log-sum-exp over components
+    log_components = []
+    for k in range(K):
+        log_w = math.log(max(probs[k], eps))
+        # VonMises log-prob for this component
+        conc_k = concentrations[k]
+        _conc_t = torch.tensor(conc_k)
+        _i0e = torch.special.i0e(_conc_t)
+        _log_i0 = conc_k + math.log(max(float(_i0e.item()), 1e-20))
+        vm_lp = conc_k * math.cos(sampled_angle - angles[k]) - (math.log(2.0 * math.pi) + _log_i0)
+
+        # Gaussian log-prob on the pre-sigmoid value z, with Jacobian for sigmoid transform
+        # p(frac) = N(z | mu, sigma) / |d(frac)/dz| where d(frac)/dz = (MAX-MIN)*sigmoid'(z)
+        # But we stored the actual angle+frac, so we need to work backwards:
+        # z = logit((frac_unclamped - MIN) / (MAX - MIN))
+        # For clamped values at 0 or 1, use CDF
+        if sampled_frac_unclamped <= 0.0:
+            # P(frac <= 0) = P(z <= logit(-MIN/(MAX-MIN)))
+            z_boundary = math.log(max(-DEST_DIST_MIN / (DEST_DIST_MAX - DEST_DIST_MIN), eps)
+                                  / max(1.0 + DEST_DIST_MIN / (DEST_DIST_MAX - DEST_DIST_MIN), eps))
+            # CDF via erfc: Phi(x) = 0.5 * erfc(-x / sqrt(2))
+            _cdf_arg = (z_boundary - dist_means[k]) / (dist_sigmas[k] * math.sqrt(2.0))
+            _cdf_val = 0.5 * math.erfc(-_cdf_arg)
+            dist_lp = math.log(max(_cdf_val, eps))
+        elif sampled_frac_unclamped >= 1.0:
+            # P(frac >= 1) = P(z >= logit((1-MIN)/(MAX-MIN)))
+            t = (1.0 - DEST_DIST_MIN) / (DEST_DIST_MAX - DEST_DIST_MIN)
+            z_boundary = math.log(max(t, eps) / max(1.0 - t, eps))
+            # Survival function via erfc: 1 - Phi(x) = 0.5 * erfc(x / sqrt(2))
+            _sf_arg = (z_boundary - dist_means[k]) / (dist_sigmas[k] * math.sqrt(2.0))
+            _sf_val = 0.5 * math.erfc(_sf_arg)
+            dist_lp = math.log(max(_sf_val, eps))
+        else:
+            # Normal case: Gaussian density on z with Jacobian correction
+            mu_k = dist_means[k]
+            sig_k = dist_sigmas[k]
+            # z for this component's evaluation
+            t = (sampled_frac_unclamped - DEST_DIST_MIN) / (DEST_DIST_MAX - DEST_DIST_MIN)
+            t = max(eps, min(1.0 - eps, t))
+            z_val = math.log(t / (1.0 - t))
+            gauss_lp = -0.5 * ((z_val - mu_k) / sig_k) ** 2 - math.log(sig_k) - 0.5 * math.log(2 * math.pi)
+            # Jacobian: dz/dfrac = 1/((MAX-MIN)*t*(1-t))
+            jacobian_lp = -math.log((DEST_DIST_MAX - DEST_DIST_MIN) * t * (1.0 - t))
+            dist_lp = gauss_lp + jacobian_lp
+
+        log_components.append(log_w + vm_lp + dist_lp)
+
+    # Log-sum-exp
+    max_lc = max(log_components)
+    log_prob = max_lc + math.log(sum(math.exp(lc - max_lc) for lc in log_components))
+
+    return sampled_angle, sampled_frac, comp_idx, log_prob
 
 
 @torch.no_grad()
@@ -32,11 +119,11 @@ def sample_tactical_actions_no_grad(
     rush_distances: list[float],                    # per friendly slot
     max_weapon_ranges: list[float] | None = None,   # max ranged weapon range per friendly slot
     opponent_type_idx: int | None = None,          # index into NUM_OPPONENT_TYPES (for value head conditioning)
-) -> tuple[int, int, float, float, int, int, list[int], list[float], float, float, list[bool]]:
+) -> tuple[int, int, float, float, int, int, int, list[int], list[float], float, float, list[bool]]:
     """Sample tactical v2 actions with sequential conditioning (no gradient tracking).
 
     Returns (unit_idx, move_type, sampled_angle, sampled_distance_frac,
-             charge_target_idx, shoot_target_idx,
+             dest_component_idx, charge_target_idx, shoot_target_idx,
              target_ranking, post_move_rel, old_log_prob, value, shoot_mask).
     """
     eps = 1e-8
@@ -75,27 +162,9 @@ def sample_tactical_actions_no_grad(
     ).float().unsqueeze(0)
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
 
-    # --- Direction + Distance (sample from continuous) ---
-    direction_raw = model.direction_head(h_uf_m).squeeze(0)
-    distance_raw = model.distance_head(h_uf_m).squeeze(0)
-
-    angle, concentration = decode_direction_params(direction_raw)
-    alpha, beta_val, _ = decode_distance_params(distance_raw)
-
-    # Use numpy for single-sample — 14x faster than torch VonMises
-    sampled_angle = float(np.random.vonmises(angle, concentration))
-    # VonMises log-prob: κ·cos(x - μ) - log(2π·I₀(κ))  [i0e-based for numerical stability]
-    _conc_t = torch.tensor(concentration)
-    _i0e_c = torch.special.i0e(_conc_t)
-    _log_i0_c = concentration + math.log(max(float(_i0e_c.item()), 1e-20))
-    dir_lp = concentration * math.cos(sampled_angle - angle) - (math.log(2.0 * math.pi) + _log_i0_c)
-
-    sampled_frac = float(np.random.beta(alpha, beta_val))
-    clamped_frac = max(1e-4, min(1.0 - 1e-4, sampled_frac))
-    # Beta log-prob via torch (single scalar, fast enough)
-    dist_lp = max(-20.0, min(20.0, torch.distributions.Beta(
-        torch.tensor(alpha), torch.tensor(beta_val),
-    ).log_prob(torch.tensor(clamped_frac)).item()))
+    # --- Destination mixture (sample) ---
+    dest_raw = model.destination_head(h_uf_m).squeeze(0)
+    sampled_angle, sampled_frac, dest_comp_idx, dest_lp = _sample_from_dest_mixture_single(dest_raw)
 
     # Compute post-move position (model-space)
     unit_cx, unit_cy = friendly_positions[unit_idx]
@@ -154,19 +223,19 @@ def sample_tactical_actions_no_grad(
 
     # Log-prob: sum across active heads based on move_type
     # Always: unit + move_type
-    # Advance/rush: + direction + distance + shoot_target
+    # Advance/rush: + destination + shoot_target
     # Hold: + shoot_target
     # Charge: + charge_target
     old_log_prob = unit_lp + move_lp
     if move_type in (MOVE_ADVANCE, MOVE_RUSH):
-        old_log_prob += dir_lp + dist_lp
+        old_log_prob += dest_lp
     if move_type in (MOVE_HOLD, MOVE_ADVANCE):
         old_log_prob += shoot_lp
     if move_type == MOVE_CHARGE:
         old_log_prob += charge_lp
 
     return (unit_idx, move_type, sampled_angle, sampled_frac,
-            charge_target_idx, shoot_target_idx, target_ranking,
+            dest_comp_idx, charge_target_idx, shoot_target_idx, target_ranking,
             post_move_rel.numpy(), old_log_prob, value, shoot_mask_list)
 
 
@@ -182,8 +251,7 @@ def _batched_sample_tactical_no_grad(
     """Run batched forward pass with sampling for multiple concurrent games.
 
     The batched version handles discrete heads (unit, move_type, charge_target,
-    shoot_target) in parallel.  Continuous heads (direction, distance) are sampled
-    per-sample because VonMises/Beta don't batch well with per-sample parameters.
+    shoot_target) in parallel.  The destination mixture is sampled per-sample.
     """
     n = len(requests)
     if n == 0:
@@ -239,11 +307,9 @@ def _batched_sample_tactical_no_grad(
 
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)            # (N, 272)
 
-    # Direction + Distance (raw outputs, batched)
-    direction_raw = model.direction_head(h_uf_m)                            # (N, 3)
-    direction_raw = torch.nan_to_num(direction_raw, nan=0.0, posinf=50.0, neginf=-50.0)
-    distance_raw = model.distance_head(h_uf_m)                              # (N, 2)
-    distance_raw = torch.nan_to_num(distance_raw, nan=0.0, posinf=50.0, neginf=-50.0)
+    # Destination mixture (batched raw output, per-sample sampling)
+    dest_raw = model.destination_head(h_uf_m)                               # (N, 18)
+    dest_raw = torch.nan_to_num(dest_raw, nan=0.0, posinf=50.0, neginf=-50.0)
 
     # Charge target — mask by alive AND chargeable
     charge_logits = model.charge_target_head(h_uf_m)                        # (N, 10)
@@ -258,53 +324,35 @@ def _batched_sample_tactical_no_grad(
         charge_probs = torch.where(no_enemies.unsqueeze(-1), uniform_c, charge_probs)
     charge_indices = torch.multinomial(charge_probs, 1).squeeze(-1)
     charge_log_probs = torch.log_softmax(charge_logits, dim=-1)
-    # For no-enemy rows, log_softmax gives log(1/N) which is fine as a fallback
     charge_lp = charge_log_probs.gather(1, charge_indices.unsqueeze(1)).squeeze(1)
 
-    # Batched continuous sampling + per-sample post-move + batched shoot head
+    # Value
     unit_list = unit_indices.tolist()
     move_list = move_indices.tolist()
     charge_list = charge_indices.tolist()
     opp_type_indices = torch.tensor(
         [r.opponent_type_idx for r in requests], dtype=torch.long)
-    opp_embed_batch = model.opponent_embedding(opp_type_indices)  # (N, OPP_EMBED_DIM)
+    opp_embed_batch = model.opponent_embedding(opp_type_indices)
     values = model.value_head(h, round_onehot, opp_embed_batch)
 
-    # --- Batched VonMises sampling ---
-    raw_sin = direction_raw[:, 0]
-    raw_cos = direction_raw[:, 1]
-    log_conc = direction_raw[:, 2]
-    dir_norm = torch.sqrt(raw_sin * raw_sin + raw_cos * raw_cos).clamp(min=1e-6)
-    mean_angles = torch.atan2(raw_sin / dir_norm, raw_cos / dir_norm)
-    concentrations = (F.softplus(log_conc) + 0.1).clamp(max=80.0)
-    vm_batch = torch.distributions.VonMises(mean_angles, concentrations)
-    sampled_angles_t = vm_batch.sample()
-    # Stable VonMises log-prob using exponentially-scaled Bessel i0e
-    i0e_c = torch.special.i0e(concentrations)
-    log_i0_c = concentrations + torch.log(i0e_c.clamp(min=1e-20))
-    dir_lps_t = concentrations * torch.cos(sampled_angles_t - mean_angles) - (math.log(2.0 * math.pi) + log_i0_c)
-
-    # --- Batched Beta sampling ---
-    alphas = (F.softplus(distance_raw[:, 0]) + 1.01).clamp(max=100.0)
-    beta_vals = (F.softplus(distance_raw[:, 1]) + 1.01).clamp(max=100.0)
-    beta_batch = torch.distributions.Beta(alphas, beta_vals)
-    sampled_fracs_t = beta_batch.sample()
-    dist_lps_t = beta_batch.log_prob(sampled_fracs_t.clamp(1e-4, 1.0 - 1e-4)).clamp(-20.0, 20.0)
-
-    sampled_angles = sampled_angles_t.tolist()
-    sampled_fracs = sampled_fracs_t.tolist()
-    dir_lps = dir_lps_t.tolist()
-    dist_lps = dist_lps_t.tolist()
-
-    # --- Per-sample post-move positions + build post_move_rel tensors ---
+    # --- Per-sample destination sampling + post-move ---
+    sampled_angles: list[float] = []
+    sampled_fracs: list[float] = []
+    dest_comp_indices: list[int] = []
+    dest_lps: list[float] = []
     post_move_rels: list[list[float]] = []
     pmr_tensors: list[torch.Tensor] = []
+
     for i in range(n):
         req = requests[i]
         uid = unit_list[i]
         mt = move_list[i]
-        sa = sampled_angles[i]
-        sf = sampled_fracs[i]
+
+        sa, sf, comp_idx, dlp = _sample_from_dest_mixture_single(dest_raw[i])
+        sampled_angles.append(sa)
+        sampled_fracs.append(sf)
+        dest_comp_indices.append(comp_idx)
+        dest_lps.append(dlp)
 
         ucx, ucy = req.friendly_positions[uid]
         if mt == MOVE_ADVANCE:
@@ -331,11 +379,10 @@ def _batched_sample_tactical_no_grad(
     shoot_mask_batch = compute_in_range_mask_batched(pmr_batch, max_wr_t, enemy_alive_batch)
 
     shoot_logits_batch = shoot_logits_batch.masked_fill(~shoot_mask_batch, float('-inf'))
-    no_shootable = ~shoot_mask_batch.any(dim=-1)  # (N,) — no enemies in range
+    no_shootable = ~shoot_mask_batch.any(dim=-1)
     shoot_logits_batch = shoot_logits_batch.masked_fill(no_shootable.unsqueeze(-1), 0.0)
     shoot_logits_batch = torch.nan_to_num(shoot_logits_batch, nan=0.0, posinf=50.0, neginf=-50.0)
 
-    # Handle no-shootable case
     shoot_probs_batch = torch.softmax(shoot_logits_batch, dim=-1)
     if no_shootable.any():
         uniform_s = torch.full_like(shoot_probs_batch, 1.0 / n_units)
@@ -343,7 +390,6 @@ def _batched_sample_tactical_no_grad(
     shoot_indices_batch = torch.multinomial(shoot_probs_batch, 1).squeeze(-1)
     shoot_log_probs_batch = torch.log_softmax(shoot_logits_batch, dim=-1)
     shoot_lps_t = shoot_log_probs_batch.gather(1, shoot_indices_batch.unsqueeze(1)).squeeze(1)
-    # Zero out log-prob for no-shootable samples
     shoot_lps_t = shoot_lps_t.masked_fill(no_shootable, 0.0)
 
     shoot_indices_list = shoot_indices_batch.tolist()
@@ -364,7 +410,7 @@ def _batched_sample_tactical_no_grad(
         mt = move_list[i]
         total_lp = lp_list[i] + move_lp[i].item()
         if mt in (MOVE_ADVANCE, MOVE_RUSH):
-            total_lp += dir_lps[i] + dist_lps[i]
+            total_lp += dest_lps[i]
         if mt in (MOVE_HOLD, MOVE_ADVANCE):
             total_lp += shoot_lps[i]
         if mt == MOVE_CHARGE:
@@ -375,6 +421,7 @@ def _batched_sample_tactical_no_grad(
             move_type=mt,
             sampled_angle=sampled_angles[i],
             sampled_distance_frac=sampled_fracs[i],
+            dest_component_idx=dest_comp_indices[i],
             charge_target_idx=charge_list[i],
             shoot_target_idx=shoot_indices_list[i],
             target_ranking=rankings_list[i],

@@ -53,7 +53,10 @@ def compute_gae(
                     if i < chain_len - 1:
                         next_value = trajectory[chain[i + 1]].old_value
                     else:
-                        next_value = 0.0  # unit's last activation — terminal
+                        # Bootstrap from global state after unit's last action
+                        # (not 0.0) so sacrificial plays aren't penalised for dying
+                        last_t = chain[i]
+                        next_value = trajectory[last_t + 1].old_value if last_t < T - 1 else 0.0
                     delta = (trajectory[t].reward
                              + gamma * next_value
                              - trajectory[t].old_value)

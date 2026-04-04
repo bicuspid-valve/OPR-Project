@@ -21,7 +21,7 @@ class EntropyTargetTuner(nn.Module):
     """
 
     # Head names for logging/serialization
-    HEAD_NAMES = ("unit", "move", "dir", "dist", "charge", "shoot")
+    HEAD_NAMES = ("unit", "move", "dest", "charge", "shoot")
 
     def __init__(self, config: TrainingConfig) -> None:
         super().__init__()
@@ -33,8 +33,7 @@ class EntropyTargetTuner(nn.Module):
         })
         # Fixed targets for non-masked heads
         self.target_move = config.entropy_target_move
-        self.target_dir = config.entropy_target_dir
-        self.target_dist = config.entropy_target_dist
+        self.target_dest = config.entropy_target_dest
         # Fraction for dynamic masked-categorical targets
         self.target_fraction = config.entropy_target_fraction
 
@@ -51,11 +50,10 @@ class EntropyTargetTuner(nn.Module):
         self,
         unit_ent: torch.Tensor,      # (N,)
         move_ent: torch.Tensor,      # (N,)
-        dir_ent: torch.Tensor,       # (N,)
-        dist_ent: torch.Tensor,      # (N,)
+        dest_ent: torch.Tensor,      # (N,)
         charge_ent: torch.Tensor,    # (N,)
         shoot_ent: torch.Tensor,     # (N,)
-        is_adv_rush: torch.Tensor,   # (N,) bool — direction/distance active
+        is_adv_rush: torch.Tensor,   # (N,) bool — destination active
         is_hold_adv: torch.Tensor,   # (N,) bool — shoot active
         is_charge: torch.Tensor,     # (N,) bool — charge active
     ) -> torch.Tensor:
@@ -68,10 +66,9 @@ class EntropyTargetTuner(nn.Module):
         bonus = self.get_alpha("unit").detach() * unit_ent.mean()
         bonus = bonus + self.get_alpha("move").detach() * move_ent.mean()
 
-        # Direction + distance: only active for advance/rush
+        # Destination: only active for advance/rush
         n_adv_rush = is_adv_rush.sum().clamp(min=1)
-        bonus = bonus + self.get_alpha("dir").detach() * (dir_ent * is_adv_rush).sum() / n_adv_rush
-        bonus = bonus + self.get_alpha("dist").detach() * (dist_ent * is_adv_rush).sum() / n_adv_rush
+        bonus = bonus + self.get_alpha("dest").detach() * (dest_ent * is_adv_rush).sum() / n_adv_rush
 
         # Charge: only active for charge moves
         n_charge = is_charge.sum().clamp(min=1)
@@ -87,8 +84,7 @@ class EntropyTargetTuner(nn.Module):
         self,
         unit_ent: torch.Tensor,       # (N,)
         move_ent: torch.Tensor,       # (N,)
-        dir_ent: torch.Tensor,        # (N,)
-        dist_ent: torch.Tensor,       # (N,)
+        dest_ent: torch.Tensor,       # (N,)
         charge_ent: torch.Tensor,     # (N,)
         shoot_ent: torch.Tensor,      # (N,)
         is_adv_rush: torch.Tensor,    # (N,) bool
@@ -112,17 +108,11 @@ class EntropyTargetTuner(nn.Module):
         # Move type: fixed target
         loss = loss + self.get_alpha("move") * (move_ent.detach() - self.target_move).mean()
 
-        # Direction: fixed target, only for advance/rush steps
+        # Destination: fixed target, only for advance/rush steps
         if is_adv_rush.any():
             n_ar = is_adv_rush.sum().clamp(min=1)
-            mean_dir_ent = (dir_ent.detach() * is_adv_rush).sum() / n_ar
-            loss = loss + self.get_alpha("dir") * (mean_dir_ent - self.target_dir)
-
-        # Distance: fixed target, only for advance/rush steps
-        if is_adv_rush.any():
-            n_ar = is_adv_rush.sum().clamp(min=1)
-            mean_dist_ent = (dist_ent.detach() * is_adv_rush).sum() / n_ar
-            loss = loss + self.get_alpha("dist") * (mean_dist_ent - self.target_dist)
+            mean_dest_ent = (dest_ent.detach() * is_adv_rush).sum() / n_ar
+            loss = loss + self.get_alpha("dest") * (mean_dest_ent - self.target_dest)
 
         # Charge target: target = fraction * ln(num_enemy_alive), only for charge steps
         if is_charge.any():

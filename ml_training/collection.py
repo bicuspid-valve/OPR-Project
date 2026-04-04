@@ -38,7 +38,7 @@ from ml_training.checkpoint import _make_model
 _WORKER_COUNT = 6
 
 # Maximum number of shared-memory opponent model slots
-_MAX_SHARED_OPPONENTS = 5
+_MAX_SHARED_OPPONENTS = 20
 
 # ---------------------------------------------------------------------------
 # Shared-memory worker globals (set by _init_shared_worker in child processes)
@@ -335,6 +335,7 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                 if use_planning:
                     from ml_planning import plan_training_activation
                     (sel_idx, move_type_a, sampled_angle_a, sampled_frac_a,
+                     dest_comp_a,
                      charge_tgt_a, shoot_tgt_a, _a_tac_target_ranking,
                      pmr_a, old_lp, value_est, shoot_mask_a,
                      _was_planned, _planning_improved, _planning_value_delta,
@@ -359,6 +360,7 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                     )
                 else:
                     (sel_idx, move_type_a, sampled_angle_a, sampled_frac_a,
+                     dest_comp_a,
                      charge_tgt_a, shoot_tgt_a, _a_tac_target_ranking,
                      pmr_a, old_lp, value_est, shoot_mask_a) = sample_tactical_actions_no_grad(
                         model, state_vec, alive_mask, enemy_alive_mask,
@@ -375,10 +377,14 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                     move_type=move_type_a,
                     sampled_angle=sampled_angle_a,
                     sampled_distance_frac=sampled_frac_a,
+                    dest_component_idx=dest_comp_a,
                     charge_target_idx=charge_tgt_a,
                     shoot_target_idx=shoot_tgt_a,
                     shoot_mask=shoot_mask_a,
                     post_move_rel=pmr_a,
+                    unit_cx=a_friendly_pos[sel_idx][0],
+                    unit_cy=a_friendly_pos[sel_idx][1],
+                    move_budget=(a_adv_dists[sel_idx] if move_type_a == MOVE_ADVANCE else a_rush_dists[sel_idx]) if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) else 0.0,
                     old_log_prob=old_lp,
                     old_value=value_est,
                     opponent_type_idx=opponent_type_idx,
@@ -453,7 +459,7 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                         b_adv_dists, b_rush_dists = _get_movement_budgets(units_b)
                         b_max_wr = _get_max_weapon_ranges(units_b)
 
-                        (sel_b, mt_b, sa_b, sf_b, ct_b, st_b,
+                        (sel_b, mt_b, sa_b, sf_b, dc_b, ct_b, st_b,
                          _b_target_ranking, pmr_b, olp_b, val_b, sm_b) = sample_tactical_actions_no_grad(
                             model, b_state_vec, b_alive_mask, b_enemy_alive_mask,
                             b_friendly_pos, b_enemy_pos, b_adv_dists, b_rush_dists,
@@ -468,10 +474,14 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                             move_type=mt_b,
                             sampled_angle=sa_b,
                             sampled_distance_frac=sf_b,
+                            dest_component_idx=dc_b,
                             charge_target_idx=ct_b,
                             shoot_target_idx=st_b,
                             shoot_mask=sm_b,
                             post_move_rel=pmr_b,
+                            unit_cx=b_friendly_pos[sel_b][0],
+                            unit_cy=b_friendly_pos[sel_b][1],
+                            move_budget=(b_adv_dists[sel_b] if mt_b == MOVE_ADVANCE else b_rush_dists[sel_b]) if mt_b in (MOVE_ADVANCE, MOVE_RUSH) else 0.0,
                             old_log_prob=olp_b,
                             old_value=val_b,
                             opponent_type_idx=opponent_type_idx,
@@ -728,7 +738,8 @@ def _episode_tactical_generator(opponent_model,
                                 states_a_data, states_b_data, opponent_type,
                                 BOARD_OBJECTIVES, shaping_scale=1.0,
                                 army_type="random",
-                                planning_enabled=False):
+                                planning_enabled=False,
+                                has_tactical_opponent=False):
     """Generator version of _run_single_episode_tactical for batched inference.
 
     Yields _TacticalInferenceRequest at each ML decision point.
@@ -914,10 +925,14 @@ def _episode_tactical_generator(opponent_model,
                     move_type=move_type_a,
                     sampled_angle=sampled_angle_a,
                     sampled_distance_frac=sampled_frac_a,
+                    dest_component_idx=_inf_result.dest_component_idx,
                     charge_target_idx=charge_tgt_a,
                     shoot_target_idx=shoot_tgt_a,
                     shoot_mask=shoot_mask_a,
                     post_move_rel=pmr_a,
+                    unit_cx=a_friendly_pos[sel_idx][0],
+                    unit_cy=a_friendly_pos[sel_idx][1],
+                    move_budget=(a_adv_dists[sel_idx] if move_type_a == MOVE_ADVANCE else a_rush_dists[sel_idx]) if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) else 0.0,
                     old_log_prob=old_lp,
                     old_value=value_est,
                     opponent_type_idx=opponent_type_idx,
@@ -1012,10 +1027,14 @@ def _episode_tactical_generator(opponent_model,
                                 move_type=_b_inf.move_type,
                                 sampled_angle=_b_inf.sampled_angle,
                                 sampled_distance_frac=_b_inf.sampled_distance_frac,
+                                dest_component_idx=_b_inf.dest_component_idx,
                                 charge_target_idx=_b_inf.charge_target_idx,
                                 shoot_target_idx=_b_inf.shoot_target_idx,
                                 shoot_mask=_b_inf.shoot_mask,
                                 post_move_rel=_b_inf.post_move_rel,
+                                unit_cx=b_friendly_pos[sel_b][0],
+                                unit_cy=b_friendly_pos[sel_b][1],
+                                move_budget=(b_adv_dists[sel_b] if _b_inf.move_type == MOVE_ADVANCE else b_rush_dists[sel_b]) if _b_inf.move_type in (MOVE_ADVANCE, MOVE_RUSH) else 0.0,
                                 old_log_prob=_b_inf.old_log_prob,
                                 old_value=_b_inf.value,
                                 opponent_type_idx=opponent_type_idx,
@@ -1042,7 +1061,7 @@ def _episode_tactical_generator(opponent_model,
 
                     _opp_tac_decision = active is not None
 
-                elif opponent_model is not None:
+                elif opponent_model is not None or has_tactical_opponent:
                     # Build B's masks and encode state, then yield
                     b_alive_list = []
                     for i in range(MAX_UNITS_PER_SIDE):
@@ -1343,6 +1362,7 @@ def _run_games_batched_tactical(
             shaping_scale=shaping_scale,
             army_type=army_type,
             planning_enabled=(planning_rate > 0),
+            has_tactical_opponent=(opp_model is not None),
         )
         generators.append(gen)
         game_army_types.append(army_type)
@@ -1390,7 +1410,8 @@ def _run_games_batched_tactical(
             from ml_planning import plan_training_activation
             for gid, req in zip(main_gids, main_reqs):
                 if req.planning_units_a is not None:
-                    (uid, mt, ang, frac, ct, st, ranking,
+                    (uid, mt, ang, frac, dc,
+                     ct, st, ranking,
                      pmr, olp, val, sm,
                      wp, pi, pvd, puv, pui,
                      pmv, pmi, pcv, pci, psv, psi,
@@ -1415,6 +1436,7 @@ def _run_games_batched_tactical(
                     all_results[gid] = _TacticalSamplingResult(
                         unit_idx=uid, move_type=mt,
                         sampled_angle=ang, sampled_distance_frac=frac,
+                        dest_component_idx=dc,
                         charge_target_idx=ct, shoot_target_idx=st,
                         target_ranking=ranking, post_move_rel=pmr,
                         old_log_prob=olp, value=val, shoot_mask=sm,

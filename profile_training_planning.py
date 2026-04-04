@@ -32,7 +32,7 @@ from ml_features import encode_state_tactical, precompute_damage, MAX_UNITS_PER_
 from ml_integration_tactical import (
     _get_model_space_positions, _get_movement_budgets, _get_max_weapon_ranges,
     execute_decoded_decision, compute_post_move_rel, compute_in_range_mask,
-    decode_direction_params, decode_distance_params, compute_post_move_position,
+    decode_destination_params, decode_destination_argmax, compute_post_move_position,
 )
 from ml_planning import plan_training_activation, _run_chunk_batched
 from evolution import resolve_army, _make_unit_states, make_entry
@@ -214,12 +214,8 @@ def test_components(model, hof_data, n_trials=10):
                     mt = int(mp.argmax().item()) if is_am else int(torch.multinomial(mp, 1).item())
                     moh = F.one_hot(torch.tensor(mt), NUM_MOVE_TYPES).float().unsqueeze(0)
                     h_uf_m = torch.cat([h_b, uf_b, moh], dim=-1)
-                    dr = model.direction_head(h_uf_m).squeeze(0)
-                    dsr = model.distance_head(h_uf_m).squeeze(0)
-                    ang, conc = decode_direction_params(dr)
-                    alp, bet, mf = decode_distance_params(dsr)
-                    sa = ang if is_am else (float(np.random.vonmises(ang, conc)) if mt in (1,2) else ang)
-                    sf = mf if is_am else (float(np.random.beta(alp, bet)) if mt in (1,2) else mf)
+                    dest_r = model.destination_head(h_uf_m).squeeze(0)
+                    sa, sf = decode_destination_argmax(dest_r)
                     cx, cy = fp[uid]
                     if mt == 1: px,py = compute_post_move_position(cx,cy,sa,sf*ad[uid])
                     elif mt == 2: px,py = compute_post_move_position(cx,cy,sa,sf*rd[uid])
@@ -276,8 +272,7 @@ def test_components(model, hof_data, n_trials=10):
             model.move_type_head(h_uf2)
             moh2 = F.one_hot(torch.tensor(ch[1]), NUM_MOVE_TYPES).float().unsqueeze(0)
             h_uf_m2 = torch.cat([h_b, uf2_b, moh2], dim=-1)
-            model.direction_head(h_uf_m2)
-            model.distance_head(h_uf_m2)
+            model.destination_head(h_uf_m2)
             model.charge_target_head(h_uf_m2)
             pmr2 = compute_post_move_rel(fp[ch[0]][0], fp[ch[0]][1], ep)
             si2 = torch.cat([h_b, uf2_b, moh2, pmr2.unsqueeze(0)], -1)

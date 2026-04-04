@@ -113,8 +113,7 @@ class TrainingConfig:
     use_entropy_targets: bool = True   # if True, use per-head adaptive entropy; else use entropy_coeff
     entropy_target_fraction: float = 0.25  # fraction of max entropy for masked categoricals
     entropy_target_move: float = 0.25 * math.log(4)      # ~0.347
-    entropy_target_dir: float = 0.75                       # von Mises direction
-    entropy_target_dist: float = -0.25                     # Beta distance
+    entropy_target_dest: float = 1.5                        # combined destination mixture: H(weights) + Σ w_k·H(component_k)
     entropy_alpha_lr: float = 1e-4                         # learning rate for entropy alpha params
     # Planning-augmented training (Expert Iteration)
     planning_rate: float = 0.0                # probability of planning per activation (0 = disabled)
@@ -126,6 +125,8 @@ class TrainingConfig:
     training_planning_N: int = 3              # lookahead activations (reduced from 4)
     # Unit-local advantage blending
     unit_local_advantage_blend: float = 0.0   # 0 = pure global GAE, 0.2-0.3 = blend in unit-local GAE
+    # 4th destination component: objective proximity auxiliary loss
+    dest_obj_proximity_coeff: float = 0.05    # weight for "move toward nearest objective" loss on 4th dest component
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +146,15 @@ class TacticalActivationRecord:
     unit_idx: int                         # which unit was selected
     move_type: int                        # 0=hold, 1=advance, 2=rush, 3=charge
     sampled_angle: float                  # direction in radians (for advance/rush)
-    sampled_distance_frac: float          # 0-1 fraction of movement budget
+    sampled_distance_frac: float          # 0-1 fraction of movement budget (clamped, may exceed 1 before clamp)
+    dest_component_idx: int               # which mixture component was selected
     charge_target_idx: int                # enemy slot for charge
     shoot_target_idx: int                 # enemy slot for shooting (hold/advance)
     shoot_mask: list[bool]                # enemy alive AND in weapon range (10 bools)
     post_move_rel: np.ndarray              # (30,) post-move relative features
+    unit_cx: float = 0.0                  # model-space x of selected unit
+    unit_cy: float = 0.0                  # model-space y of selected unit
+    move_budget: float = 0.0              # advance/rush distance for selected unit (0 for hold/charge)
     reward: float = 0.0
     old_log_prob: float = 0.0             # sum of log-probs under collection policy
     old_value: float = 0.0                # value estimate under collection policy
@@ -216,7 +221,8 @@ class _TacticalSamplingResult:
     unit_idx: int
     move_type: int              # 0-3
     sampled_angle: float        # radians
-    sampled_distance_frac: float  # 0-1
+    sampled_distance_frac: float  # 0-1 (clamped from mixture)
+    dest_component_idx: int     # which mixture component was selected
     charge_target_idx: int      # enemy slot
     shoot_target_idx: int       # enemy slot
     target_ranking: list        # shoot target ranking for compat
