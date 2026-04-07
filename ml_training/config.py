@@ -113,7 +113,7 @@ class TrainingConfig:
     use_entropy_targets: bool = True   # if True, use per-head adaptive entropy; else use entropy_coeff
     entropy_target_fraction: float = 0.25  # fraction of max entropy for masked categoricals
     entropy_target_move: float = 0.25 * math.log(4)      # ~0.347
-    entropy_target_dest: float = 1.5                        # combined destination mixture: H(weights) + Σ w_k·H(component_k)
+    entropy_target_dest_fraction: float = 0.25               # target 25% of max entropy for destination pointer (normalised by ln(N_valid))
     entropy_alpha_lr: float = 1e-4                         # learning rate for entropy alpha params
     # Planning-augmented training (Expert Iteration)
     planning_rate: float = 0.0                # probability of planning per activation (0 = disabled)
@@ -125,8 +125,6 @@ class TrainingConfig:
     training_planning_N: int = 3              # lookahead activations (reduced from 4)
     # Unit-local advantage blending
     unit_local_advantage_blend: float = 0.0   # 0 = pure global GAE, 0.2-0.3 = blend in unit-local GAE
-    # 4th destination component: objective proximity auxiliary loss
-    dest_obj_proximity_coeff: float = 0.05    # weight for "move toward nearest objective" loss on 4th dest component
 
 
 # ---------------------------------------------------------------------------
@@ -135,26 +133,29 @@ class TrainingConfig:
 
 @dataclass
 class TacticalActivationRecord:
-    """Serializable trajectory data for one activation (tactical v2 model).
+    """Serializable trajectory data for one activation (tactical model with destination pointer).
 
-    Stores the sequential decisions: unit, move_type, direction+distance
-    (continuous), charge_target, shoot_target, plus masks and value.
+    Stores the sequential decisions: unit, move_type, destination pointer
+    (discrete), charge_target, shoot_target, plus masks and value.
     """
     state_vec: np.ndarray                 # flattened encoded state (4016 float32)
     alive_mask: list[bool]                # which friendly slots were alive+unactivated
     enemy_alive_mask: list[bool]          # which enemy slots were alive
     unit_idx: int                         # which unit was selected
     move_type: int                        # 0=hold, 1=advance, 2=rush, 3=charge
-    sampled_angle: float                  # direction in radians (for advance/rush)
-    sampled_distance_frac: float          # 0-1 fraction of movement budget (clamped, may exceed 1 before clamp)
-    dest_component_idx: int               # which mixture component was selected
-    charge_target_idx: int                # enemy slot for charge
-    shoot_target_idx: int                 # enemy slot for shooting (hold/advance)
-    shoot_mask: list[bool]                # enemy alive AND in weapon range (10 bools)
-    post_move_rel: np.ndarray              # (30,) post-move relative features
-    unit_cx: float = 0.0                  # model-space x of selected unit
-    unit_cy: float = 0.0                  # model-space y of selected unit
-    move_budget: float = 0.0              # advance/rush distance for selected unit (0 for hold/charge)
+    # Destination pointer (replaces sampled_angle, sampled_distance_frac)
+    dest_candidates: np.ndarray | list    # (N, 2) int32 — actual candidates (unpadded)
+    dest_mask: list[bool] | None = None   # (N,) — all True (unpadded); legacy, can be derived
+    dest_features: np.ndarray | list | None = None  # (N, DEST_FEATURE_DIM) — None when recomputed during replay
+    # Ingredients for recomputing dest_features during PPO replay (avoids storing
+    # ~60 KB of features per activation).  Matchup arrays are references to
+    # per-game data so they don't duplicate memory across activations.
+    dest_recomp: dict | None = None
+    dest_selected_idx: int = -1            # index into candidates
+    charge_target_idx: int = -1            # enemy slot for charge
+    shoot_target_idx: int = -1             # enemy slot for shooting (hold/advance)
+    shoot_mask: list[bool] | None = None   # enemy alive AND in weapon range (10 bools)
+    post_move_rel: np.ndarray | None = None  # (30,) post-move relative features
     reward: float = 0.0
     old_log_prob: float = 0.0             # sum of log-probs under collection policy
     old_value: float = 0.0                # value estimate under collection policy
@@ -199,6 +200,22 @@ class _TacticalInferenceRequest:
     rush_distances: list[float]                    # per friendly slot
     max_weapon_ranges: list[float]                 # max ranged weapon range per friendly slot
     opponent_type_idx: int = 0                     # index into NUM_OPPONENT_TYPES (for value head conditioning)
+    # Destination pointer inputs: per-unit candidate sets (precomputed by caller).
+    # Keyed by unit slot index. The batched sampling code looks up the selected
+    # unit's candidates after unit selection.
+    dest_candidates_per_unit: dict | None = None   # {slot: (MAX_DEST_CANDIDATES, 2) int ndarray}
+    dest_mask_per_unit: dict | None = None         # {slot: (MAX_DEST_CANDIDATES,) bool ndarray}
+    dest_features_per_unit: dict | None = None     # {slot: (MAX_DEST_CANDIDATES, DEST_FEATURE_DIM) float ndarray}
+    # Lazy dest feature computation: raw ingredients passed so sampling code
+    # can compute features only for the selected unit (instead of all alive units).
+    dest_lazy_units: list | None = None            # friendly UnitState list
+    dest_lazy_enemy_units: list | None = None      # enemy UnitState list
+    dest_lazy_enemy_alive: object | None = None    # np.ndarray (10,) bool
+    dest_lazy_fr_matchups: object | None = None    # friendly ranged matchups
+    dest_lazy_er_matchups: object | None = None    # enemy ranged matchups
+    dest_lazy_melee_matchups: object | None = None # enemy melee matchups
+    dest_lazy_player: str = "A"
+    dest_lazy_enemy_cache: object | None = None    # _DestEnemyCache
     # Planning support — populated for Player A requests when planning is enabled.
     # These are references (same process), not copies.
     planning_units_a: list | None = None       # list[UnitState]
@@ -220,9 +237,10 @@ class _TacticalSamplingResult:
     """Sent back to episode generator with batched sampling outputs."""
     unit_idx: int
     move_type: int              # 0-3
-    sampled_angle: float        # radians
-    sampled_distance_frac: float  # 0-1 (clamped from mixture)
-    dest_component_idx: int     # which mixture component was selected
+    dest_candidates: np.ndarray | list  # (N, 2) int32 unpadded candidates
+    dest_mask: list[bool]              # (N,) all True
+    dest_features: np.ndarray | list   # (N, DEST_FEATURE_DIM) float32 unpadded
+    dest_selected_idx: int             # index into candidates
     charge_target_idx: int      # enemy slot
     shoot_target_idx: int       # enemy slot
     target_ranking: list        # shoot target ranking for compat

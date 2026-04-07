@@ -33,7 +33,8 @@ class EntropyTargetTuner(nn.Module):
         })
         # Fixed targets for non-masked heads
         self.target_move = config.entropy_target_move
-        self.target_dest = config.entropy_target_dest
+        # Destination pointer: target is a fraction of max entropy (normalised by ln(N_valid))
+        self.target_dest_fraction = config.entropy_target_dest_fraction
         # Fraction for dynamic masked-categorical targets
         self.target_fraction = config.entropy_target_fraction
 
@@ -93,6 +94,7 @@ class EntropyTargetTuner(nn.Module):
         alive_mask: torch.Tensor,     # (N, 10) — for unit target
         enemy_alive_mask: torch.Tensor,  # (N, 10) — for charge target
         shoot_mask: torch.Tensor,     # (N, 10) — for shoot target
+        dest_n_valid: torch.Tensor | None = None,  # (N,) int — number of valid dest candidates
     ) -> torch.Tensor:
         """Compute the dual alpha loss that drives entropy toward targets.
 
@@ -108,11 +110,14 @@ class EntropyTargetTuner(nn.Module):
         # Move type: fixed target
         loss = loss + self.get_alpha("move") * (move_ent.detach() - self.target_move).mean()
 
-        # Destination: fixed target, only for advance/rush steps
-        if is_adv_rush.any():
+        # Destination pointer: normalised entropy = dest_ent / ln(N_valid)
+        # Target is target_dest_fraction (e.g. 0.25 = 25% of max entropy)
+        if is_adv_rush.any() and dest_n_valid is not None:
             n_ar = is_adv_rush.sum().clamp(min=1)
-            mean_dest_ent = (dest_ent.detach() * is_adv_rush).sum() / n_ar
-            loss = loss + self.get_alpha("dest") * (mean_dest_ent - self.target_dest)
+            ln_n_valid = torch.log(dest_n_valid.float().clamp(min=1.0))  # (N,)
+            normalised_ent = dest_ent.detach() / ln_n_valid.clamp(min=1.0)  # (N,)
+            mean_norm_ent = (normalised_ent * is_adv_rush).sum() / n_ar
+            loss = loss + self.get_alpha("dest") * (mean_norm_ent - self.target_dest_fraction)
 
         # Charge target: target = fraction * ln(num_enemy_alive), only for charge steps
         if is_charge.any():

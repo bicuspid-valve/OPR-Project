@@ -3,11 +3,12 @@
 Trunk architecture: feedforward compression 4016 → 2048 → 1024 → 512
 + 2 residual layers.
 
-Sequential head chain with free movement:
+Sequential head chain with destination pointer:
     h                            → unit_selection_head   → (10,)
     h ++ unit_feat(200)          → move_type_head        → (4,) hold/advance/rush/charge
-    h ++ unit_feat ++ move(4)    → destination_head      → (NUM_DEST_COMPONENTS * 5 + NUM_DEST_COMPONENTS,)
-                                   3 components × (sin, cos, log_κ, μ_dist, log_σ_dist) + 3 mixture logits
+    h ++ unit_feat ++ move(4)    → dest_query_proj       → (64,) query for pointer attention
+    dest_features(512×75)        → dest_embed            → (512, 64) keys
+                                   scaled dot-product attention → (512,) logits → masked softmax
     h ++ unit_feat ++ move(4)    → charge_target_head    → (10,)
     h ++ unit_feat ++ move(4)
       ++ post_move_rel(30)       → shoot_target_head     → (10,)
@@ -25,6 +26,7 @@ import torch.nn.functional as F
 from ml_features import (
     TACTICAL_TOTAL_FEATURES, MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES,
     GLOBAL_FEATURES, extract_can_charge_mask,
+    DEST_FEATURE_DIM, DEST_EMBED_DIM, MAX_DEST_CANDIDATES,
 )
 
 # ---------------------------------------------------------------------------
@@ -40,11 +42,6 @@ N_TOTAL_UNITS = N_FRIENDLY + N_ENEMY  # 20
 NUM_MOVE_TYPES = 4                # 0=hold, 1=advance, 2=rush, 3=charge
 POST_MOVE_REL_FEATURES = N_ENEMY * 3  # 30: (sin θ, cos θ, dist) per enemy from post-move pos
 NUM_ROUNDS = 4                       # game has 4 rounds (one-hot in global features)
-NUM_DEST_COMPONENTS = 4              # number of destination mixture components (4th is objective-seeking)
-# Per-component: (sin, cos, log_κ, μ_dist, log_σ_dist)
-DEST_PARAMS_PER_COMPONENT = 5
-# Total destination head output: components * params + mixture logits
-DEST_HEAD_OUTPUT = NUM_DEST_COMPONENTS * DEST_PARAMS_PER_COMPONENT + NUM_DEST_COMPONENTS  # 18
 NUM_OPPONENT_TYPES = 5               # heuristic, selfplay_mirror, selfplay_hof, selfplay_ml, selfplay_random
 OPP_EMBED_DIM = 8                    # opponent-type embedding dimension
 
@@ -112,7 +109,7 @@ class FiLMValueHead(nn.Module):
             zeros = torch.zeros(*h_modulated.shape[:-1], self.opp_embed_dim,
                                 device=h_modulated.device, dtype=h_modulated.dtype)
             h_modulated = torch.cat([h_modulated, zeros], dim=-1)
-        return self.value_proj(h_modulated).squeeze(-1)
+        return self.value_proj(h_modulated).squeeze(-1).tanh()
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +120,7 @@ class FiLMValueHead(nn.Module):
 class TacticalModelOutput:
     unit_logits: torch.Tensor | None      # (10,) raw logits, masked; None from forward_per_unit
     move_logits: torch.Tensor             # (4,) hold/advance/rush/charge
-    destination_params: torch.Tensor      # (18,) 3 components × 5 params + 3 mixture logits
+    dest_logits: torch.Tensor | None      # (MAX_DEST_CANDIDATES,) — None for hold/charge in single inference
     charge_target_logits: torch.Tensor    # (10,) masked by enemy_alive_mask
     shoot_target_logits: torch.Tensor     # (10,) masked by enemy_alive + in range
     value: torch.Tensor                   # scalar
@@ -181,9 +178,13 @@ class TacticalModel(nn.Module):
         # 2) Movement type: h + unit_feat → 4 logits
         self.move_type_head = nn.Linear(H + UF, NUM_MOVE_TYPES)
 
-        # 3a) Destination mixture: h + unit_feat + move_onehot → 18
-        #     3 components × (sin, cos, log_κ, μ_dist, log_σ_dist) + 3 mixture logits
-        self.destination_head = nn.Linear(H + UF + NUM_MOVE_TYPES, DEST_HEAD_OUTPUT)
+        # 3a) Destination pointer: cross-attention over candidate hex features
+        self.dest_embed = nn.Sequential(
+            nn.Linear(DEST_FEATURE_DIM, 64),
+            nn.ReLU(),
+            nn.Linear(64, DEST_EMBED_DIM),
+        )
+        self.dest_query_proj = nn.Linear(H + UF + NUM_MOVE_TYPES, DEST_EMBED_DIM)
 
         # 3b) Charge target: h + unit_feat + move_onehot → 10 logits
         self.charge_target_head = nn.Linear(H + UF + NUM_MOVE_TYPES, N_ENEMY)
@@ -271,6 +272,33 @@ class TacticalModel(nn.Module):
         """
         return units[..., unit_idx, :]
 
+    def compute_dest_logits(
+        self,
+        h_uf_m: torch.Tensor,
+        dest_features: torch.Tensor,
+        dest_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute destination pointer logits via scaled dot-product cross-attention.
+
+        Parameters
+        ----------
+        h_uf_m : (..., TRUNK_WIDTH + UF + NUM_MOVE_TYPES) — query input
+        dest_features : (..., MAX_DEST_CANDIDATES, DEST_FEATURE_DIM)
+        dest_mask : (..., MAX_DEST_CANDIDATES) bool — True for valid candidates
+
+        Returns (..., MAX_DEST_CANDIDATES) logits, invalid candidates masked to -inf.
+        """
+        dest_keys = self.dest_embed(dest_features)           # (..., MAX_DEST_CANDIDATES, DEST_EMBED_DIM)
+        dest_query = self.dest_query_proj(h_uf_m)            # (..., DEST_EMBED_DIM)
+
+        scale = DEST_EMBED_DIM ** 0.5
+        # Scaled dot-product: query (unsqueeze to row) @ keys^T
+        dest_logits = (dest_query.unsqueeze(-2) @ dest_keys.transpose(-1, -2)).squeeze(-2) / scale
+        # (..., MAX_DEST_CANDIDATES)
+
+        dest_logits = dest_logits.masked_fill(~dest_mask, float('-inf'))
+        return dest_logits
+
     def _run_conditioned_heads(
         self,
         h: torch.Tensor,
@@ -278,22 +306,19 @@ class TacticalModel(nn.Module):
         enemy_alive_mask: torch.Tensor | None,
         post_move_rel: torch.Tensor | None,
         can_charge_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Run move_type → destination/charge_target → shoot_target chain.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run move_type → charge_target → shoot_target chain.
 
-        All heads run unconditionally; the caller decides which outputs matter
-        based on the chosen move type.
+        The destination pointer is NOT run here — it requires external candidate
+        features and is handled by the caller (forward / integration layer).
 
         Parameters
         ----------
         post_move_rel : (batch, 30) or (30,) — post-move relative features.
             If None, zeros are used (argmax forward pass computes this externally).
         can_charge_mask : (batch, 10) or (10,) bool — True for chargeable enemies.
-            If provided, masks the charge move type when no enemy is chargeable,
-            and masks non-chargeable enemies in the charge target head.
 
-        Returns (move_logits, destination_params,
-                 charge_target_logits, shoot_target_logits).
+        Returns (move_logits, charge_target_logits, shoot_target_logits).
         """
         unit_features = unit_features.detach()
 
@@ -313,11 +338,8 @@ class TacticalModel(nn.Module):
             move_logits.detach().argmax(dim=-1), NUM_MOVE_TYPES
         ).float()
 
-        # --- Common input for destination/charge ---
+        # --- Common input for charge ---
         h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
-
-        # --- Destination mixture head ---
-        destination_params = self.destination_head(h_uf_m)
 
         # --- Charge target head ---
         charge_target_logits = self.charge_target_head(h_uf_m)
@@ -337,7 +359,7 @@ class TacticalModel(nn.Module):
         if enemy_alive_mask is not None:
             shoot_target_logits = shoot_target_logits.masked_fill(~enemy_alive_mask, float('-inf'))
 
-        return move_logits, destination_params, charge_target_logits, shoot_target_logits
+        return move_logits, charge_target_logits, shoot_target_logits
 
     def forward(
         self,
@@ -348,6 +370,8 @@ class TacticalModel(nn.Module):
         forced_unit_idx: int | None = None,
         post_move_rel: torch.Tensor | None = None,
         opponent_type: int | None = None,
+        dest_features: torch.Tensor | None = None,
+        dest_mask: torch.Tensor | None = None,
     ) -> TacticalModelOutput:
         """Forward pass with sequential conditioning.
 
@@ -361,6 +385,9 @@ class TacticalModel(nn.Module):
             If None, zeros are used (caller should compute externally for argmax mode).
         opponent_type : index into NUM_OPPONENT_TYPES for value head conditioning.
             None uses mean embedding (eval/planning default).
+        dest_features : (batch, MAX_DEST_CANDIDATES, DEST_FEATURE_DIM) — per-hex features.
+            If None, destination pointer is skipped (dest_logits=None).
+        dest_mask : (batch, MAX_DEST_CANDIDATES) bool — True for valid candidates.
         """
         single = x.dim() == 1
         if single:
@@ -371,6 +398,10 @@ class TacticalModel(nn.Module):
                 enemy_alive_mask = enemy_alive_mask.unsqueeze(0)
             if post_move_rel is not None and post_move_rel.dim() == 1:
                 post_move_rel = post_move_rel.unsqueeze(0)
+            if dest_features is not None and dest_features.dim() == 2:
+                dest_features = dest_features.unsqueeze(0)
+            if dest_mask is not None and dest_mask.dim() == 1:
+                dest_mask = dest_mask.unsqueeze(0)
 
         h, units, round_onehot = self.trunk(x)
 
@@ -389,11 +420,20 @@ class TacticalModel(nn.Module):
         # Extract can_charge mask for the selected unit from the state vector
         can_charge_mask = extract_can_charge_mask(x, chosen_idx)
 
-        # --- Conditioned head chain ---
-        move_logits, destination_params, charge_logits, shoot_logits = (
+        # --- Conditioned head chain (move, charge, shoot) ---
+        move_logits, charge_logits, shoot_logits = (
             self._run_conditioned_heads(h, unit_features, enemy_alive_mask, post_move_rel,
                                         can_charge_mask)
         )
+
+        # --- Destination pointer (only if features provided) ---
+        dest_logits = None
+        if dest_features is not None and dest_mask is not None:
+            move_onehot = F.one_hot(
+                move_logits.detach().argmax(dim=-1), NUM_MOVE_TYPES
+            ).float()
+            h_uf_m = torch.cat([h, unit_features.detach(), move_onehot], dim=-1)
+            dest_logits = self.compute_dest_logits(h_uf_m, dest_features, dest_mask)
 
         # --- Value (round + opponent conditioned) ---
         opp_embed = self._get_opp_embed(h, opponent_type)
@@ -403,7 +443,7 @@ class TacticalModel(nn.Module):
             return TacticalModelOutput(
                 unit_logits=unit_logits.squeeze(0),
                 move_logits=move_logits.squeeze(0),
-                destination_params=destination_params.squeeze(0),
+                dest_logits=dest_logits.squeeze(0) if dest_logits is not None else None,
                 charge_target_logits=charge_logits.squeeze(0),
                 shoot_target_logits=shoot_logits.squeeze(0),
                 value=value.squeeze(0),
@@ -412,7 +452,7 @@ class TacticalModel(nn.Module):
         return TacticalModelOutput(
             unit_logits=unit_logits,
             move_logits=move_logits,
-            destination_params=destination_params,
+            dest_logits=dest_logits,
             charge_target_logits=charge_logits,
             shoot_target_logits=shoot_logits,
             value=value,
@@ -428,6 +468,8 @@ class TacticalModel(nn.Module):
         round_onehot: torch.Tensor | None = None,
         opponent_type: int | None = None,
         can_charge_masks: list[torch.Tensor] | None = None,
+        dest_features_list: list[torch.Tensor] | None = None,
+        dest_mask_list: list[torch.Tensor] | None = None,
     ) -> list[TacticalModelOutput]:
         """Run conditioned heads for multiple candidate units from a single trunk pass.
 
@@ -442,7 +484,8 @@ class TacticalModel(nn.Module):
         opponent_type : index into NUM_OPPONENT_TYPES for value head conditioning.
             None uses mean embedding (eval/planning default).
         can_charge_masks : per-unit (10,) bool masks, one per unit_indices entry.
-            If None, no charge masking is applied.
+        dest_features_list : per-unit (MAX_DEST_CANDIDATES, DEST_FEATURE_DIM) tensors.
+        dest_mask_list : per-unit (MAX_DEST_CANDIDATES,) bool tensors.
 
         Returns
         -------
@@ -458,14 +501,24 @@ class TacticalModel(nn.Module):
             unit_features = self._extract_unit_features(units, uid)
             ccm = can_charge_masks[k] if can_charge_masks is not None else None
 
-            move_logits, destination_params, charge_logits, shoot_logits = (
+            move_logits, charge_logits, shoot_logits = (
                 self._run_conditioned_heads(h, unit_features, enemy_alive_mask, post_move_rel, ccm)
             )
+
+            # Destination pointer
+            dest_logits = None
+            if dest_features_list is not None and dest_mask_list is not None:
+                move_onehot = F.one_hot(
+                    move_logits.detach().argmax(dim=-1), NUM_MOVE_TYPES
+                ).float()
+                h_uf_m = torch.cat([h, unit_features.detach(), move_onehot], dim=-1)
+                dest_logits = self.compute_dest_logits(
+                    h_uf_m, dest_features_list[k], dest_mask_list[k])
 
             results.append(TacticalModelOutput(
                 unit_logits=None,
                 move_logits=move_logits,
-                destination_params=destination_params,
+                dest_logits=dest_logits,
                 charge_target_logits=charge_logits,
                 shoot_target_logits=shoot_logits,
                 value=value,

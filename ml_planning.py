@@ -37,6 +37,7 @@ from combat import evaluate_target
 from ml_features import (
     MAX_UNITS_PER_SIDE,
     TACTICAL_UNIT_FEATURES,
+    MAX_DEST_CANDIDATES, DEST_FEATURE_DIM,
     encode_state_tactical,
     precompute_damage,
     extract_can_charge_mask,
@@ -45,16 +46,13 @@ from ml_features import (
 from ml_integration_tactical import (
     execute_decoded_decision, pick_target_from_ranking,
     compute_post_move_rel, compute_in_range_mask, compute_in_range_mask_batched,
-    decode_destination_params, decode_destination_argmax,
-    DEST_DIST_MAX, DEST_DIST_MIN,
-    compute_post_move_position,
+    compute_destination_candidates, compute_destination_features,
     _get_model_space_positions, _get_movement_budgets,
     _get_max_weapon_ranges, MOVE_TYPE_NAMES,
 )
 from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
     NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
-    NUM_DEST_COMPONENTS, DEST_PARAMS_PER_COMPONENT,
 )
 from simulation import start_round, end_round, score_game
 
@@ -418,34 +416,61 @@ def simulate_forward(
             total_friendly_points=my_pts, total_enemy_points=opp_pts_,
         )
 
-        # Pass 1: get unit selection, move type, direction/distance
+        import numpy as np
+
+        # Pass 1: get unit selection, move type, destination
+        # Build destination candidates if advance/rush so we can pass them
+        # to the model's forward pass.
         out = model(state_vec, alive_mask, enemy_alive_mask)
 
         selected_idx = int(out.unit_logits.argmax().item())
         selected_unit = my_units[selected_idx]
         move_type = int(out.move_logits.argmax().item())
 
-        # Decode destination (argmax of mixture components)
-        angle, mean_frac = decode_destination_argmax(out.destination_params)
-
-        # Compute post-move position in model-space
         friendly_positions = _get_model_space_positions(my_units, player)
-        enemy_positions = _get_model_space_positions(opp_units, player)
+        enemy_positions_ms = _get_model_space_positions(opp_units, player)
         unit_cx, unit_cy = friendly_positions[selected_idx]
 
-        if move_type == MOVE_ADVANCE:
-            budget = float(selected_unit.unit.advance_distance)
-            post_x, post_y = compute_post_move_position(
-                unit_cx, unit_cy, angle, mean_frac * budget)
-        elif move_type == MOVE_RUSH:
-            budget = float(selected_unit.unit.rush_distance)
-            post_x, post_y = compute_post_move_position(
-                unit_cx, unit_cy, angle, mean_frac * budget)
+        dest = None
+        if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+            enemy_pos_set = _collect_enemy_positions(opp_units)
+            candidates, cand_mask = compute_destination_candidates(
+                selected_unit, move_type, board, enemy_pos_set, player)
+            eam_np = np.array(
+                [(i < len(opp_units) and opp_units[i].models_alive > 0)
+                 for i in range(MAX_UNITS_PER_SIDE)], dtype=np.bool_)
+            budget = (float(selected_unit.unit.advance_distance)
+                      if move_type == MOVE_ADVANCE
+                      else float(selected_unit.unit.rush_distance))
+            _n_f = len(my_units)
+            _n_e = len(opp_units)
+            _fr_matchup = np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32)
+            _er_matchup = np.zeros((_n_e, MAX_UNITS_PER_SIDE, 7), dtype=np.float32)
+            _mm_matchup = np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32)
+            dest_feats_np = compute_destination_features(
+                candidates, cand_mask, selected_unit, selected_idx, player,
+                opp_units, eam_np, _fr_matchup, _er_matchup, _mm_matchup, budget)
+            dest_features_t = torch.from_numpy(dest_feats_np).unsqueeze(0)
+            dest_mask_t = torch.from_numpy(cand_mask.astype(np.bool_)).unsqueeze(0)
+
+            # Re-run forward with dest_features to get dest_logits
+            out = model(state_vec, alive_mask, enemy_alive_mask,
+                        forced_unit_idx=selected_idx,
+                        dest_features=dest_features_t, dest_mask=dest_mask_t)
+            best_cand = int(out.dest_logits.squeeze(0).argmax().item())
+            dest_col, dest_row = int(candidates[best_cand, 0]), int(candidates[best_cand, 1])
+            dest = (dest_col, dest_row)
+
+            # Post-move position in model-space for shoot head
+            post_x, post_y = float(dest_col), float(dest_row)
+            if player == "B":
+                post_x = _flip_x(post_x)
+                post_y = _flip_y(post_y)
         else:
             post_x, post_y = unit_cx, unit_cy
 
         # Compute post-move relative features for shoot head
-        post_move_rel = compute_post_move_rel(post_x, post_y, enemy_positions)
+        post_move_rel = compute_post_move_rel(post_x, post_y, enemy_positions_ms)
 
         # Pass 2: re-run with post_move_rel for conditioned shoot/charge targets
         out2 = model(state_vec, alive_mask, enemy_alive_mask,
@@ -461,15 +486,6 @@ def simulate_forward(
         masked_shoot_logits = out2.shoot_target_logits.masked_fill(~shoot_range_mask, float('-inf'))
         shoot_target_idx = int(masked_shoot_logits.argmax().item()) if shoot_range_mask.any() else 0
         target_ranking = torch.argsort(masked_shoot_logits, descending=True).tolist()
-
-        # Convert to game-space destination
-        dest = None
-        if move_type in (MOVE_ADVANCE, MOVE_RUSH):
-            gx, gy = post_x, post_y
-            if player == "B":
-                gx = _flip_x(gx)
-                gy = _flip_y(gy)
-            dest = (gx, gy)
 
         action, goal, charge_target, reason = execute_decoded_decision(
             selected_unit, opp_units, move_type, dest,
@@ -527,8 +543,8 @@ class _PlanningInferenceResult:
     """Sent back to rollout generator with batched argmax outputs."""
     unit_idx: int
     move_type: int
-    angle: float
-    dist_frac: float
+    dest_col: int
+    dest_row: int
     charge_target_idx: int
     shoot_target_idx: int
     target_ranking: list
@@ -646,9 +662,9 @@ def _batched_argmax_forward(
     move_indices = move_logits.argmax(dim=-1)                          # (B,)
     move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()      # (B, 4)
 
-    # Destination mixture head (use argmax component)
+    # Destination pointer: no Board available in batched rollouts, so use
+    # centroid fallback (unit stays at current position for post-move calcs).
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)       # (B, 272)
-    dest_raw = model.destination_head(h_uf_m)                          # (B, 18)
 
     # Charge target — argmax, mask by alive AND chargeable
     charge_logits = model.charge_target_head(h_uf_m)                   # (B, 10)
@@ -657,38 +673,24 @@ def _batched_argmax_forward(
     no_enemies = ~enemy_batch.any(dim=-1)                              # (B,)
     charge_indices = charge_logits.argmax(dim=-1)                      # (B,)
 
-    # Decode destination argmax per sample
-    angles_list_raw: list[float] = []
-    fracs_list_raw: list[float] = []
-    for i in range(n):
-        a_i, f_i = decode_destination_argmax(dest_raw[i])
-        angles_list_raw.append(a_i)
-        fracs_list_raw.append(f_i)
-
-    # Per-sample: compute post_move_position → post_move_rel
-    angles_list = angles_list_raw
-    fracs_list = fracs_list_raw
+    # Per-sample: use unit centroid as post-move position (centroid fallback)
     unit_list = unit_indices.tolist()
     move_list = move_indices.tolist()
 
+    # Store centroid game-space coords for dest_col/dest_row
+    dest_cols: list[int] = []
+    dest_rows: list[int] = []
     pmr_tensors: list[torch.Tensor] = []
     for i in range(n):
         uid = unit_list[i]
-        mt = move_list[i]
-        ucx, ucy = requests[i].friendly_positions[uid]
-        if mt == MOVE_ADVANCE:
-            budget = requests[i].advance_distances[uid]
-            px, py = compute_post_move_position(
-                ucx, ucy, angles_list[i], fracs_list[i] * budget)
-        elif mt == MOVE_RUSH:
-            budget = requests[i].rush_distances[uid]
-            px, py = compute_post_move_position(
-                ucx, ucy, angles_list[i], fracs_list[i] * budget)
-        else:
-            px, py = ucx, ucy
-
+        # Use unit's current centroid position (model-space) as destination
+        px, py = requests[i].friendly_positions[uid]
         pmr = compute_post_move_rel(px, py, requests[i].enemy_positions)
         pmr_tensors.append(pmr)
+        # Store centroid as game-space coords (just round the model-space pos;
+        # for player B the flip is applied when converting to game dest later)
+        dest_cols.append(int(round(px)))
+        dest_rows.append(int(round(py)))
 
     # Batched shoot target head
     pmr_batch = torch.stack(pmr_tensors)                               # (B, 30)
@@ -720,8 +722,8 @@ def _batched_argmax_forward(
         results.append(_PlanningInferenceResult(
             unit_idx=unit_list[i],
             move_type=move_list[i],
-            angle=angles_list[i],
-            dist_frac=fracs_list[i],
+            dest_col=dest_cols[i],
+            dest_row=dest_rows[i],
             charge_target_idx=charge_list[i],
             shoot_target_idx=shoot_list[i],
             target_ranking=ranking,
@@ -835,13 +837,12 @@ def _rollout_generator(
         selected_unit = my_units[result.unit_idx]
         mt = result.move_type
 
-        # Compute game-space destination
+        # Compute game-space destination from pointer result.
+        # In batched rollouts (centroid fallback), dest_col/dest_row are
+        # model-space centroid coords; flip to game-space for player B.
         dest = None
         if mt in (MOVE_ADVANCE, MOVE_RUSH):
-            ucx, ucy = f_pos[result.unit_idx]
-            budget = adv_dists[result.unit_idx] if mt == MOVE_ADVANCE else rush_dists[result.unit_idx]
-            gx, gy = compute_post_move_position(
-                ucx, ucy, result.angle, result.dist_frac * budget)
+            gx, gy = float(result.dest_col), float(result.dest_row)
             if la_player == "B":
                 gx = _flip_x(gx)
                 gy = _flip_y(gy)
@@ -1083,24 +1084,29 @@ def plan_activation(
     _pts_b = pts_b if pts_b else (total_enemy_points if player == "A" else total_friendly_points) or 0
 
     # --- Generate candidate actions ---
-    # Each entry: (uid, move_type, sampled_angle, sampled_frac, target_ranking,
+    # Each entry: (uid, move_type, dest_col, dest_row, target_ranking,
     #              charge_target_idx, shoot_target_idx, action, goal, ct_idx, reason,
     #              no_shoot)
     # Sampling respects the conditional head chain:
     #   move_type   ~ P(mt  | h, unit_feat)
-    #   destination ~ MixtureModel(angle, dist | h, unit_feat, mt)
+    #   destination ~ Pointer(candidates | h, unit_feat, mt)
     #   charge_tgt  ~ P(ct  | h, unit_feat, mt)
     #   shoot_tgt   ~ P(st  | h, unit_feat, mt, post_move_rel)
+    import numpy as np
     candidate_actions: list[tuple] = []
     _seen_keys: set[tuple] = set()  # dedup by resolved action
 
-    h_b = h.unsqueeze(0)  # (1, 128) for head inputs
+    h_b = h.unsqueeze(0)  # (1, H) for head inputs
 
     # Get model-space positions for post-move computation
     friendly_positions = _get_model_space_positions(friendly_units, player)
     enemy_positions = _get_model_space_positions(enemy_units, player)
 
     no_enemies = not enemy_alive_mask.any()
+    enemy_pos_set = _collect_enemy_positions(enemy_units)
+    eam_np = np.array(
+        [(i < len(enemy_units) and enemy_units[i].models_alive > 0)
+         for i in range(MAX_UNITS_PER_SIDE)], dtype=np.bool_)
 
     for uid in candidate_units:
         unit = friendly_units[uid]
@@ -1123,6 +1129,41 @@ def plan_activation(
             move_logits[MOVE_CHARGE] = float('-inf')
         move_probs = torch.softmax(move_logits, dim=-1)
 
+        # Precompute destination candidates for advance/rush (shared across samples)
+        _dest_cache: dict[int, tuple] = {}  # move_type → (candidates, mask, features, logits)
+        for mt_candidate in (MOVE_ADVANCE, MOVE_RUSH):
+            if move_probs[mt_candidate].item() > 0:
+                cands, cmask = compute_destination_candidates(
+                    unit, mt_candidate, board, enemy_pos_set, player)
+                budget = (float(unit.unit.advance_distance)
+                          if mt_candidate == MOVE_ADVANCE
+                          else float(unit.unit.rush_distance))
+                _n_f = len(friendly_units)
+                _n_e = len(enemy_units)
+                _fr_m = (np.array(friendly_ranged_matchups, dtype=np.float32)
+                         if friendly_ranged_matchups is not None
+                         else np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+                _er_m = (np.array(enemy_ranged_matchups, dtype=np.float32)
+                         if enemy_ranged_matchups is not None
+                         else np.zeros((_n_e, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+                _mm_m = (np.array(friendly_melee_matchups, dtype=np.float32).reshape(_n_f, -1)[:, :MAX_UNITS_PER_SIDE]
+                         if friendly_melee_matchups is not None
+                         else np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32))
+                dest_feats_np = compute_destination_features(
+                    cands, cmask, unit, uid, player,
+                    enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget)
+                dest_features_t = torch.from_numpy(dest_feats_np).unsqueeze(0)
+                dest_mask_t = torch.from_numpy(cmask.astype(np.bool_)).unsqueeze(0)
+
+                # Compute logits using move-type-specific h_uf_m
+                mt_onehot = F.one_hot(
+                    torch.tensor(mt_candidate), NUM_MOVE_TYPES
+                ).float().unsqueeze(0)
+                h_uf_m_cand = torch.cat([h_b, uf_b, mt_onehot], dim=-1)
+                dest_logits = model.compute_dest_logits(
+                    h_uf_m_cand, dest_features_t, dest_mask_t).squeeze(0)
+                _dest_cache[mt_candidate] = (cands, cmask, dest_feats_np, dest_logits)
+
         for sample_i in range(C):
             # 1. Sample move type
             move_type = int(torch.multinomial(move_probs, 1).item())
@@ -1132,41 +1173,30 @@ def plan_activation(
 
             h_uf_m = torch.cat([h_b, uf_b, move_onehot], dim=-1)  # (1, 272)
 
-            # 2. Decode destination mixture and pick a component
-            dest_raw = model.destination_head(h_uf_m).squeeze(0)  # (18,)
-            angles_k, concs_k, dist_means_k, dist_sigmas_k, _logits_k, probs_k = (
-                decode_destination_params(dest_raw))
-
-            if move_type in (MOVE_ADVANCE, MOVE_RUSH):
-                # Use mixture component (cycle through K components across samples)
-                comp_idx = sample_i % NUM_DEST_COMPONENTS
-                sampled_angle = angles_k[comp_idx]
-                # Map sigmoid of mu_dist to frac in [DEST_DIST_MIN, DEST_DIST_MAX], clamp to [0,1]
-                raw_frac = 1.0 / (1.0 + math.exp(-dist_means_k[comp_idx]))
-                sampled_frac = DEST_DIST_MIN + (DEST_DIST_MAX - DEST_DIST_MIN) * raw_frac
-                sampled_frac = max(0.0, min(1.0, sampled_frac))
-            else:
-                # Hold/charge: use argmax component
-                best_k = max(range(NUM_DEST_COMPONENTS), key=lambda i: probs_k[i])
-                sampled_angle = angles_k[best_k]
-                raw_frac = 1.0 / (1.0 + math.exp(-dist_means_k[best_k]))
-                sampled_frac = DEST_DIST_MIN + (DEST_DIST_MAX - DEST_DIST_MIN) * raw_frac
-                sampled_frac = max(0.0, min(1.0, sampled_frac))
-
-            # 3. Compute post-move position in model-space
+            # 2. Destination pointer: sample or cycle through top-K candidates
             unit_cx, unit_cy = friendly_positions[uid]
-            if move_type == MOVE_ADVANCE:
-                budget = float(unit.unit.advance_distance)
-                post_x, post_y = compute_post_move_position(
-                    unit_cx, unit_cy, sampled_angle, sampled_frac * budget)
-            elif move_type == MOVE_RUSH:
-                budget = float(unit.unit.rush_distance)
-                post_x, post_y = compute_post_move_position(
-                    unit_cx, unit_cy, sampled_angle, sampled_frac * budget)
+            dest_col, dest_row = int(round(unit_cx)), int(round(unit_cy))  # default: centroid
+
+            if move_type in (MOVE_ADVANCE, MOVE_RUSH) and move_type in _dest_cache:
+                cands, cmask, _, dest_logits = _dest_cache[move_type]
+                n_valid = int(cmask.sum())
+                if n_valid > 0:
+                    # Cycle through top candidates across samples for diversity
+                    dest_probs = torch.softmax(dest_logits, dim=-1)
+                    _, top_dest = torch.topk(dest_probs, min(C, n_valid))
+                    pick_idx = top_dest[sample_i % len(top_dest)].item()
+                    dest_col = int(cands[pick_idx, 0])
+                    dest_row = int(cands[pick_idx, 1])
+
+                # Compute post-move position in model-space
+                post_x, post_y = float(dest_col), float(dest_row)
+                if player == "B":
+                    post_x = _flip_x(post_x)
+                    post_y = _flip_y(post_y)
             else:
                 post_x, post_y = unit_cx, unit_cy
 
-            # 4. Sample charge target (conditioned on h + unit_feat + move)
+            # 3. Sample charge target (conditioned on h + unit_feat + move)
             charge_logits = model.charge_target_head(h_uf_m).squeeze(0)
             charge_logits = charge_logits.masked_fill(~enemy_alive_mask, float('-inf'))
             charge_logits = charge_logits.masked_fill(~can_charge_mask, float('-inf'))
@@ -1177,7 +1207,7 @@ def plan_activation(
                 charge_probs = torch.softmax(charge_logits, dim=-1)
                 charge_target_idx = int(torch.multinomial(charge_probs, 1).item())
 
-            # 5. Compute post_move_rel and sample shoot target
+            # 4. Compute post_move_rel and sample shoot target
             post_move_rel = compute_post_move_rel(post_x, post_y, enemy_positions)
             shoot_input = torch.cat([h_b, uf_b, move_onehot, post_move_rel.unsqueeze(0)], dim=-1)
             shoot_logits = model.shoot_target_head(shoot_input).squeeze(0)
@@ -1196,11 +1226,7 @@ def plan_activation(
             # Convert to game-space destination
             dest = None
             if move_type in (MOVE_ADVANCE, MOVE_RUSH):
-                gx, gy = post_x, post_y
-                if player == "B":
-                    gx = _flip_x(gx)
-                    gy = _flip_y(gy)
-                dest = (gx, gy)
+                dest = (dest_col, dest_row)
 
             # Resolve the candidate action
             action, goal, charge_target_unit, reason = execute_decoded_decision(
@@ -1228,7 +1254,7 @@ def plan_activation(
                 or move_type == MOVE_CHARGE
             )
             candidate_actions.append((
-                uid, move_type, sampled_angle, sampled_frac, target_ranking,
+                uid, move_type, dest_col, dest_row, target_ranking,
                 charge_target_idx, shoot_target_idx,
                 action, goal, ct_idx, reason, will_not_shoot,
             ))
@@ -1326,8 +1352,8 @@ def plan_activation(
             'unit_idx': uid_c,
             'unit_name': _uid_label[uid_c],
             'move_type': MOVE_TYPE_NAMES[move_type_c],
-            'direction_angle': ca[2],
-            'distance_frac': ca[3],
+            'dest_col': ca[2],
+            'dest_row': ca[3],
             'action': ca[7],
             'goal': ca[8],
             'reason': ca[10],
@@ -1373,7 +1399,7 @@ def plan_training_activation(
     format as sample_tactical_actions_no_grad, plus planning metadata.
 
     Returns:
-        (unit_idx, move_type, angle, dist_frac, dest_component_idx,
+        (unit_idx, move_type, dest_col, dest_row, dest_cand_idx,
          charge_target_idx, shoot_target_idx, target_ranking,
          post_move_rel, old_log_prob, value, shoot_mask,
          was_planned, planning_improved, planning_value_delta,
@@ -1389,6 +1415,16 @@ def plan_training_activation(
 
     eps = 1e-8
     no_enemies = not enemy_alive_mask.any()
+
+    # Derive per-side matchups for destination features
+    if player == "A":
+        friendly_ranged_matchups = fr_a
+        friendly_melee_matchups = fm_a
+        enemy_ranged_matchups = fr_b
+    else:
+        friendly_ranged_matchups = fr_b
+        friendly_melee_matchups = fm_b
+        enemy_ranged_matchups = fr_a
 
     # --- Single trunk pass ---
     x = state_vec.unsqueeze(0)
@@ -1416,12 +1452,17 @@ def plan_training_activation(
     h_b = h  # (1, H)
 
     # --- Generate candidate actions ---
-    # Same format as plan_activation: (uid, move_type, angle, frac, ranking,
+    # Same format as plan_activation: (uid, move_type, dest_col, dest_row, ranking,
     #   charge_tgt_idx, shoot_tgt_idx, action, goal, ct_idx, reason)
     candidate_actions: list[tuple] = []
     candidate_to_unit: list[int] = []  # maps candidate idx -> unit slot
     candidate_shoot_masks: list[torch.Tensor] = []  # per-candidate shoot range masks
     _seen_keys: set[tuple] = set()
+
+    enemy_pos_set = _collect_enemy_positions(enemy_units)
+    eam_np = np.array(
+        [(i < len(enemy_units) and enemy_units[i].models_alive > 0)
+         for i in range(MAX_UNITS_PER_SIDE)], dtype=np.bool_)
 
     for ui, uid in enumerate(candidate_units):
         unit = friendly_units[uid]
@@ -1444,6 +1485,40 @@ def plan_training_activation(
             move_logits[MOVE_CHARGE] = float('-inf')
         move_probs = torch.softmax(move_logits, dim=-1)
 
+        # Precompute destination candidates for advance/rush
+        _dest_cache: dict[int, tuple] = {}
+        for mt_candidate in (MOVE_ADVANCE, MOVE_RUSH):
+            if move_probs[mt_candidate].item() > 0:
+                cands, cmask = compute_destination_candidates(
+                    unit, mt_candidate, board, enemy_pos_set, player)
+                budget = (advance_distances[uid]
+                          if mt_candidate == MOVE_ADVANCE
+                          else rush_distances[uid])
+                _n_f = len(friendly_units)
+                _n_e = len(enemy_units)
+                _fr_m = (np.array(friendly_ranged_matchups, dtype=np.float32)
+                         if friendly_ranged_matchups is not None
+                         else np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+                _er_m = (np.array(enemy_ranged_matchups, dtype=np.float32)
+                         if enemy_ranged_matchups is not None
+                         else np.zeros((_n_e, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+                _mm_m = (np.array(friendly_melee_matchups, dtype=np.float32).reshape(_n_f, -1)[:, :MAX_UNITS_PER_SIDE]
+                         if friendly_melee_matchups is not None
+                         else np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32))
+                dest_feats_np = compute_destination_features(
+                    cands, cmask, unit, uid, player,
+                    enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget)
+                dest_features_t = torch.from_numpy(dest_feats_np).unsqueeze(0)
+                dest_mask_t = torch.from_numpy(cmask.astype(np.bool_)).unsqueeze(0)
+
+                mt_onehot = F.one_hot(
+                    torch.tensor(mt_candidate), NUM_MOVE_TYPES
+                ).float().unsqueeze(0)
+                h_uf_m_cand = torch.cat([h_b, uf_b, mt_onehot], dim=-1)
+                dest_logits = model.compute_dest_logits(
+                    h_uf_m_cand, dest_features_t, dest_mask_t).squeeze(0)
+                _dest_cache[mt_candidate] = (cands, cmask, dest_logits)
+
         # Argmax unit: 1 argmax action + C-1 sampled actions; others: C sampled
         n_samples = C
 
@@ -1460,35 +1535,27 @@ def plan_training_activation(
             ).float().unsqueeze(0)
             h_uf_m = torch.cat([h_b, uf_b, move_onehot], dim=-1)
 
-            # Destination mixture
-            dest_raw = model.destination_head(h_uf_m).squeeze(0)  # (18,)
-            angles_k, concs_k, dist_means_k, dist_sigmas_k, _logits_k, probs_k = (
-                decode_destination_params(dest_raw))
-
-            if is_argmax_action:
-                # Argmax: use highest-weight component's mode
-                sampled_angle, sampled_frac = decode_destination_argmax(dest_raw)
-            elif move_type in (MOVE_ADVANCE, MOVE_RUSH):
-                # Use mixture component (cycle through K components across samples)
-                comp_idx = si % NUM_DEST_COMPONENTS
-                sampled_angle = angles_k[comp_idx]
-                raw_frac = 1.0 / (1.0 + math.exp(-dist_means_k[comp_idx]))
-                sampled_frac = DEST_DIST_MIN + (DEST_DIST_MAX - DEST_DIST_MIN) * raw_frac
-                sampled_frac = max(0.0, min(1.0, sampled_frac))
-            else:
-                # Hold/charge: use argmax component
-                sampled_angle, sampled_frac = decode_destination_argmax(dest_raw)
-
-            # Post-move position
+            # Destination pointer
             unit_cx, unit_cy = friendly_positions[uid]
-            if move_type == MOVE_ADVANCE:
-                budget = advance_distances[uid]
-                post_x, post_y = compute_post_move_position(
-                    unit_cx, unit_cy, sampled_angle, sampled_frac * budget)
-            elif move_type == MOVE_RUSH:
-                budget = rush_distances[uid]
-                post_x, post_y = compute_post_move_position(
-                    unit_cx, unit_cy, sampled_angle, sampled_frac * budget)
+            dest_col, dest_row = int(round(unit_cx)), int(round(unit_cy))
+
+            if move_type in (MOVE_ADVANCE, MOVE_RUSH) and move_type in _dest_cache:
+                cands, cmask, dest_logits = _dest_cache[move_type]
+                n_valid = int(cmask.sum())
+                if n_valid > 0:
+                    if is_argmax_action:
+                        pick_idx = int(dest_logits.argmax().item())
+                    else:
+                        dest_probs = torch.softmax(dest_logits, dim=-1)
+                        _, top_dest = torch.topk(dest_probs, min(C, n_valid))
+                        pick_idx = top_dest[si % len(top_dest)].item()
+                    dest_col = int(cands[pick_idx, 0])
+                    dest_row = int(cands[pick_idx, 1])
+
+                post_x, post_y = float(dest_col), float(dest_row)
+                if player == "B":
+                    post_x = _flip_x(post_x)
+                    post_y = _flip_y(post_y)
             else:
                 post_x, post_y = unit_cx, unit_cy
 
@@ -1534,11 +1601,7 @@ def plan_training_activation(
             # Resolve to game-space action
             dest = None
             if move_type in (MOVE_ADVANCE, MOVE_RUSH):
-                gx, gy = post_x, post_y
-                if player == "B":
-                    gx = _flip_x(gx)
-                    gy = _flip_y(gy)
-                dest = (gx, gy)
+                dest = (dest_col, dest_row)
 
             action_str, goal, charge_target_unit, reason = \
                 execute_decoded_decision(
@@ -1564,7 +1627,7 @@ def plan_training_activation(
                 or move_type == MOVE_CHARGE
             )
             candidate_actions.append((
-                uid, move_type, sampled_angle, sampled_frac, target_ranking,
+                uid, move_type, dest_col, dest_row, target_ranking,
                 charge_target_idx, shoot_target_idx,
                 action_str, goal, ct_idx, reason, will_not_shoot,
             ))
@@ -1668,8 +1731,8 @@ def plan_training_activation(
     chosen = candidate_actions[chosen_idx]
     chosen_uid = chosen[0]
     chosen_move_type = chosen[1]
-    chosen_angle = chosen[2]
-    chosen_frac = chosen[3]
+    chosen_dest_col = chosen[2]
+    chosen_dest_row = chosen[3]
     chosen_ranking = chosen[4]
     chosen_charge_tgt = chosen[5]
     chosen_shoot_tgt = chosen[6]
@@ -1742,39 +1805,44 @@ def plan_training_activation(
     ).float().unsqueeze(0)
     h_uf_m_ch = torch.cat([h_b, uf_b, move_onehot_ch], dim=-1)
 
-    # Destination mixture log-prob
-    dest_raw = model.destination_head(h_uf_m_ch).squeeze(0)  # (18,)
-    angles_k, concs_k, dist_means_k, dist_sigmas_k, _logits_k, probs_k = (
-        decode_destination_params(dest_raw))
-
-    # Compute mixture log-prob: log(sum_k w_k * VonMises(angle|k) * N_sigmoid(dist|k))
-    _dest_log_components = []
-    for _k in range(NUM_DEST_COMPONENTS):
-        _log_w = math.log(max(probs_k[_k], eps))
-        # VonMises log-prob
-        _conc_k = concs_k[_k]
-        _conc_t = torch.tensor(_conc_k)
-        _i0e_c = torch.special.i0e(_conc_t)
-        _log_i0_c = _conc_k + math.log(max(float(_i0e_c.item()), 1e-20))
-        _vm_lp = (_conc_k * math.cos(chosen_angle - angles_k[_k])
-                  - (math.log(2.0 * math.pi) + _log_i0_c))
-        # Gaussian-sigmoid distance log-prob
-        _mu_k = dist_means_k[_k]
-        _sig_k = dist_sigmas_k[_k]
-        # Map chosen_frac back to unclamped, then to z via logit
-        _frac_unclamped = chosen_frac  # already in [0, 1]
-        _t = (_frac_unclamped - DEST_DIST_MIN) / (DEST_DIST_MAX - DEST_DIST_MIN)
-        _t = max(eps, min(1.0 - eps, _t))
-        _z_val = math.log(_t / (1.0 - _t))
-        _gauss_lp = (-0.5 * ((_z_val - _mu_k) / _sig_k) ** 2
-                     - math.log(_sig_k) - 0.5 * math.log(2 * math.pi))
-        _jacobian_lp = -math.log((DEST_DIST_MAX - DEST_DIST_MIN) * _t * (1.0 - _t))
-        _dist_lp = _gauss_lp + _jacobian_lp
-        _dest_log_components.append(_log_w + _vm_lp + _dist_lp)
-
-    _max_lc = max(_dest_log_components)
-    dest_lp = _max_lc + math.log(sum(math.exp(_lc - _max_lc) for _lc in _dest_log_components))
-    dest_lp = max(-20.0, min(20.0, dest_lp))
+    # Destination pointer log-prob (categorical over candidate hexes)
+    dest_lp = 0.0
+    if chosen_move_type in (MOVE_ADVANCE, MOVE_RUSH):
+        # Recompute candidates for the chosen unit + move type
+        chosen_unit = friendly_units[chosen_uid]
+        cands_ch, cmask_ch = compute_destination_candidates(
+            chosen_unit, chosen_move_type, board, enemy_pos_set, player)
+        budget_ch = (advance_distances[chosen_uid]
+                     if chosen_move_type == MOVE_ADVANCE
+                     else rush_distances[chosen_uid])
+        _n_f = len(friendly_units)
+        _n_e = len(enemy_units)
+        _fr_m = (np.array(friendly_ranged_matchups, dtype=np.float32)
+                 if friendly_ranged_matchups is not None
+                 else np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+        _er_m = (np.array(enemy_ranged_matchups, dtype=np.float32)
+                 if enemy_ranged_matchups is not None
+                 else np.zeros((_n_e, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+        _mm_m = (np.array(friendly_melee_matchups, dtype=np.float32).reshape(_n_f, -1)[:, :MAX_UNITS_PER_SIDE]
+                 if friendly_melee_matchups is not None
+                 else np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32))
+        dest_feats_ch = compute_destination_features(
+            cands_ch, cmask_ch, chosen_unit, chosen_uid, player,
+            enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget_ch)
+        dest_features_ch_t = torch.from_numpy(dest_feats_ch).unsqueeze(0)
+        dest_mask_ch_t = torch.from_numpy(cmask_ch.astype(np.bool_)).unsqueeze(0)
+        dest_logits_ch = model.compute_dest_logits(
+            h_uf_m_ch, dest_features_ch_t, dest_mask_ch_t).squeeze(0)
+        dest_log_probs = torch.log_softmax(dest_logits_ch, dim=-1)
+        # Find which candidate index matches chosen_dest_col, chosen_dest_row
+        chosen_cand_idx = 0  # default to centroid
+        for ci_ch in range(int(cmask_ch.sum())):
+            if (int(cands_ch[ci_ch, 0]) == chosen_dest_col
+                    and int(cands_ch[ci_ch, 1]) == chosen_dest_row):
+                chosen_cand_idx = ci_ch
+                break
+        dest_lp = float(dest_log_probs[chosen_cand_idx].item())
+        dest_lp = max(-20.0, min(20.0, dest_lp))
 
     # Charge log-prob — mask by alive AND chargeable
     charge_logits_ch = model.charge_target_head(h_uf_m_ch).squeeze(0)
@@ -1792,14 +1860,11 @@ def plan_training_activation(
 
     # Shoot log-prob (need post-move position for chosen action)
     unit_cx, unit_cy = friendly_positions[chosen_uid]
-    if chosen_move_type == MOVE_ADVANCE:
-        budget = advance_distances[chosen_uid]
-        ch_px, ch_py = compute_post_move_position(
-            unit_cx, unit_cy, chosen_angle, chosen_frac * budget)
-    elif chosen_move_type == MOVE_RUSH:
-        budget = rush_distances[chosen_uid]
-        ch_px, ch_py = compute_post_move_position(
-            unit_cx, unit_cy, chosen_angle, chosen_frac * budget)
+    if chosen_move_type in (MOVE_ADVANCE, MOVE_RUSH):
+        ch_px, ch_py = float(chosen_dest_col), float(chosen_dest_row)
+        if player == "B":
+            ch_px = _flip_x(ch_px)
+            ch_py = _flip_y(ch_py)
     else:
         ch_px, ch_py = unit_cx, unit_cy
 
@@ -1841,8 +1906,8 @@ def plan_training_activation(
     pmr_list = ch_pmr.tolist()
 
     return (
-        chosen_uid, chosen_move_type, chosen_angle, chosen_frac,
-        0,  # dest_component_idx (planning picks best candidate, default 0)
+        chosen_uid, chosen_move_type, chosen_dest_col, chosen_dest_row,
+        0,  # dest_cand_idx (planning picks best candidate, default 0)
         chosen_charge_tgt, chosen_shoot_tgt, chosen_ranking,
         pmr_list, old_log_prob, value_est, shoot_mask_list,
         True,  # was_planned

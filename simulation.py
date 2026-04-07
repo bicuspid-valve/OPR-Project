@@ -82,6 +82,13 @@ def execute_activation(
         skip shooting entirely (e.g. rush, or no resolver available).
     """
     active.activated = True
+
+    # Shaken units must hold and recover
+    if active.shaken:
+        action = "hold"
+        goal = None
+        charge_target = None
+
     al = _label(active, labels, unit_to_idx)
 
     desc_parts: list[str] = []

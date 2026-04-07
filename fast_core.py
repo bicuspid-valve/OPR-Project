@@ -10,7 +10,10 @@ The global USE_C_EXT can be toggled at runtime:
 from __future__ import annotations
 
 import array
+import heapq
 import struct
+
+import numpy as np
 
 try:
     import _fast_core
@@ -244,3 +247,115 @@ def fast_encode_distances(
 
     target_bytes = _doubles_to_bytes(targets)
     return _fast_core.c_encode_distances(cx, cy, target_bytes, len(targets), inv_diag)
+
+
+# ---------------------------------------------------------------------------
+# fast_dijkstra_reachable_set
+# ---------------------------------------------------------------------------
+
+def fast_dijkstra_reachable_set(
+    start: tuple[int, int],
+    budget: float,
+    occupancy: bytearray,
+    enemy_positions: set[tuple[int, int]],
+    is_charge: bool = False,
+    flying: bool = False,
+    exclusion_grid: bytearray | None = None,
+    cols: int = 72,
+    rows: int = 48,
+) -> np.ndarray:
+    """Return all reachable (col, row) cells within movement budget.
+
+    Returns (N, 2) int32 numpy array.  Falls back to pure-Python Dijkstra
+    when the C extension is unavailable.
+    """
+    col, row = start
+
+    # Already adjacent to enemies?
+    if exclusion_grid is not None:
+        already_adjacent = bool(exclusion_grid[row * cols + col])
+    else:
+        already_adjacent = False
+        for dc in range(-1, 2):
+            for dr in range(-1, 2):
+                if dc == 0 and dr == 0:
+                    continue
+                if (col + dc, row + dr) in enemy_positions:
+                    already_adjacent = True
+                    break
+            if already_adjacent:
+                break
+
+    # Build exclusion grid if needed
+    if exclusion_grid is None:
+        from movement import build_exclusion_grid
+        exclusion_grid = build_exclusion_grid(enemy_positions)
+
+    if USE_C_EXT and _HAS_C_EXT:
+        enemy_bytes = _positions_to_int_bytes(enemy_positions)
+        n_enemies = len(enemy_positions)
+
+        raw = _fast_core.c_dijkstra_reachable_set(
+            col, row, budget,
+            bytes(occupancy), bytes(exclusion_grid), enemy_bytes,
+            n_enemies, cols, rows,
+            int(is_charge), int(flying), int(already_adjacent),
+        )
+        if len(raw) == 0:
+            return np.empty((0, 2), dtype=np.int32)
+        return np.frombuffer(raw, dtype=np.int32).reshape(-1, 2).copy()
+
+    # --- Pure-Python fallback: Dijkstra collecting all reachable cells ---
+    check_exclusion = not is_charge and not already_adjacent
+    no_enemies = not enemy_positions
+    total = cols * rows
+    INF_COST = 999999999
+
+    cost_arr = [INF_COST] * total
+    start_idx = row * cols + col
+    cost_arr[start_idx] = 0
+
+    budget_milli = int(budget * 1000 + 0.5)
+    pq: list[tuple[int, int, int]] = [(0, col, row)]
+
+    _DIRS = [(1,0,1000), (-1,0,1000), (0,1,1000), (0,-1,1000),
+             (1,1,1414), (1,-1,1414), (-1,1,1414), (-1,-1,1414)]
+
+    while pq:
+        c, cc, cr = heapq.heappop(pq)
+        cidx = cr * cols + cc
+        if c > cost_arr[cidx]:
+            continue
+        for ddc, ddr, step_cost in _DIRS:
+            nc = cc + ddc
+            nr = cr + ddr
+            if nc < 0 or nc >= cols or nr < 0 or nr >= rows:
+                continue
+            new_cost = c + step_cost
+            if new_cost > budget_milli + 10:
+                continue
+            if not flying and not no_enemies and (nc, nr) in enemy_positions:
+                continue
+            if check_exclusion and exclusion_grid[nr * cols + nc]:
+                continue
+            nidx = nr * cols + nc
+            if new_cost < cost_arr[nidx]:
+                cost_arr[nidx] = new_cost
+                heapq.heappush(pq, (new_cost, nc, nr))
+
+    # Collect results
+    result = []
+    for idx in range(total):
+        if cost_arr[idx] >= INF_COST:
+            continue
+        cc = idx % cols
+        cr = idx // cols
+        if occupancy[idx]:
+            continue
+        if not no_enemies and (cc, cr) in enemy_positions:
+            continue
+        result.append((cc, cr))
+
+    if not result:
+        return np.empty((0, 2), dtype=np.int32)
+    return np.array(result, dtype=np.int32)

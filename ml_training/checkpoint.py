@@ -76,12 +76,14 @@ def load_model_state_dict(path) -> dict:
     if "opponent_embedding.weight" not in state_dict:
         state_dict = {k: v for k, v in state_dict.items()
                       if not k.startswith("value_head.")}
-    # Checkpoint compat: old checkpoints have direction_head/distance_head
-    # instead of destination_head. Drop them so destination_head reinitialises.
-    if "direction_head.weight" in state_dict:
+    # Checkpoint compat: old checkpoints have direction_head/distance_head or
+    # destination_head instead of dest_embed/dest_query_proj. Drop them so
+    # the new pointer layers reinitialise.
+    if "direction_head.weight" in state_dict or "destination_head.weight" in state_dict:
         state_dict = {k: v for k, v in state_dict.items()
                       if not k.startswith("direction_head.")
-                      and not k.startswith("distance_head.")}
+                      and not k.startswith("distance_head.")
+                      and not k.startswith("destination_head.")}
     return state_dict
 
 

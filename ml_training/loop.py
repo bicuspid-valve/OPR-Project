@@ -86,12 +86,13 @@ def run_training(
             if verbose:
                 print(f"Resumed from {final_path} (batch {start_batch})")
         else:
-            # No final_model.pt — try the newest checkpoint by creation time
+            # No final_model.pt — try the checkpoint with the highest batch number
+            import re
             ckpt_dir = Path(config.checkpoint_dir)
             if ckpt_dir.exists():
                 checkpoints = sorted(
                     ckpt_dir.glob("checkpoint_batch_*.pt"),
-                    key=lambda p: p.stat().st_mtime,
+                    key=lambda p: int(m.group(1)) if (m := re.search(r"checkpoint_batch_(\d+)", p.stem)) else -1,
                 )
             else:
                 checkpoints = []
@@ -99,9 +100,9 @@ def run_training(
                 newest = checkpoints[-1]
                 sd = load_model_state_dict(newest)
                 model.load_state_dict(sd, strict=False)
-                _ckpt = torch.load(newest, map_location="cpu", weights_only=False)
-                if isinstance(_ckpt, dict) and "batch_num" in _ckpt:
-                    start_batch = _ckpt["batch_num"]
+                m = re.search(r"checkpoint_batch_(\d+)", newest.stem)
+                if m:
+                    start_batch = int(m.group(1))
                 if verbose:
                     print(f"No final_model.pt — resumed from newest checkpoint {newest.name} (batch {start_batch})")
             elif verbose:
@@ -150,7 +151,7 @@ def run_training(
         if verbose:
             print(f"Entropy targets: fraction={config.entropy_target_fraction}, "
                   f"move={config.entropy_target_move:.3f}, "
-                  f"dest={config.entropy_target_dest:.3f}")
+                  f"dest_frac={config.entropy_target_dest_fraction:.3f}")
     if verbose and config.ppo_minibatch_games > 0:
         print(f"PPO minibatching: {config.ppo_minibatch_games} games per minibatch, "
               f"{config.ppo_epochs} epochs")
@@ -195,15 +196,15 @@ def run_training(
             "plan_argmax_rate",
             "plan_dl_unit", "plan_dl_move",
             "plan_dl_charge", "plan_dl_shoot",
-            "dest_obj_prox",
         ])
     _log_writer.writerow([datetime.now().isoformat(), "---",
                           f"Training started (start_batch={start_batch})",
                           "", "", "", "", "", "", "", "", "", ""])
     _log_file.flush()
 
-    # Save initial checkpoint
-    checkpoint_pool.save(model, 0)
+    # Save initial checkpoint (use start_batch so resumed runs don't
+    # overwrite the batch-number signal with 0)
+    checkpoint_pool.save(model, start_batch)
 
     start_time = time.time()
     batch_times: list[float] = []
@@ -432,7 +433,6 @@ def run_training(
                             planning_distill_max_weight=(
                                 config.planning_distill_max_weight
                                 if config.planning_rate > 0 else 0.0),
-                            dest_obj_proximity_coeff=config.dest_obj_proximity_coeff,
                         )
 
                     optimizer.zero_grad()
@@ -519,7 +519,6 @@ def run_training(
                         planning_distill_max_weight=(
                             config.planning_distill_max_weight
                             if config.planning_rate > 0 else 0.0),
-                        dest_obj_proximity_coeff=config.dest_obj_proximity_coeff,
                     )
 
                 optimizer.zero_grad()
@@ -645,7 +644,6 @@ def run_training(
             f"{loss_metrics.get('planning_argmax_rate', 0.0):.4f}",
             *[f"{loss_metrics.get('planning_distill_sub', {}).get(k, 0.0):.6f}"
               for k in ("unit", "move", "charge", "shoot")],
-            f"{loss_metrics.get('dest_obj_proximity', 0.0):.4f}",
         ])
         _log_file.flush()
 

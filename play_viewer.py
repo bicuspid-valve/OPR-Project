@@ -879,18 +879,25 @@ class PlayViewer:
                 ttk.Button(self.btn_frame, text="Replay", command=self._open_replay).pack(side=tk.LEFT, padx=3)
 
         elif self.phase == PHASE_CHOOSE_ACTION:
+            is_shaken = self._active_unit is not None and self._active_unit.shaken
             can_charge = False
-            if self._active_unit is not None:
+            if self._active_unit is not None and not is_shaken:
                 for enemy in self.units_b:
                     if enemy.models_alive > 0 and _can_charge(self._active_unit, enemy):
                         can_charge = True
                         break
             ttk.Button(self.btn_frame, text="Hold", command=lambda: self._choose_action("hold")).pack(side=tk.LEFT, padx=3)
-            ttk.Button(self.btn_frame, text="Advance", command=lambda: self._choose_action("advance")).pack(side=tk.LEFT, padx=3)
-            ttk.Button(self.btn_frame, text="Rush", command=lambda: self._choose_action("rush")).pack(side=tk.LEFT, padx=3)
+            adv_btn = ttk.Button(self.btn_frame, text="Advance", command=lambda: self._choose_action("advance"))
+            adv_btn.pack(side=tk.LEFT, padx=3)
+            if is_shaken:
+                adv_btn.configure(state=tk.DISABLED)
+            rush_btn = ttk.Button(self.btn_frame, text="Rush", command=lambda: self._choose_action("rush"))
+            rush_btn.pack(side=tk.LEFT, padx=3)
+            if is_shaken:
+                rush_btn.configure(state=tk.DISABLED)
             charge_btn = ttk.Button(self.btn_frame, text="Charge", command=lambda: self._choose_action("charge"))
             charge_btn.pack(side=tk.LEFT, padx=3)
-            if not can_charge:
+            if not can_charge or is_shaken:
                 charge_btn.configure(state=tk.DISABLED)
             ttk.Button(self.btn_frame, text="Cancel", command=self._cancel_to_select).pack(side=tk.LEFT, padx=10)
 

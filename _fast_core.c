@@ -490,6 +490,145 @@ static PyObject* py_pathfind_move(PyObject* self, PyObject* args) {
 
 
 /* -----------------------------------------------------------------------
+ * c_dijkstra_reachable_set — Return all reachable cells within budget
+ *
+ * Reuses the Dijkstra loop from py_pathfind_move.  After exploration,
+ * iterates over all cells with dist < INF and applies occupancy/exclusion
+ * filters.  Returns a flat int32 buffer [c0,r0, c1,r1, ...].
+ * ----------------------------------------------------------------------- */
+
+static PyObject* py_dijkstra_reachable_set(PyObject* self, PyObject* args) {
+    int start_col, start_row;
+    double budget;
+    Py_buffer occ_buf, excl_buf, enemy_buf;
+    int n_enemies, cols, rows;
+    int is_charge, flying, already_adjacent;
+
+    if (!PyArg_ParseTuple(args, "iidy*y*y*iiiiii",
+            &start_col, &start_row, &budget,
+            &occ_buf, &excl_buf, &enemy_buf,
+            &n_enemies, &cols, &rows,
+            &is_charge, &flying, &already_adjacent))
+        return NULL;
+
+    const unsigned char *occupancy = (const unsigned char *)occ_buf.buf;
+    const unsigned char *exclusion = (const unsigned char *)excl_buf.buf;
+    const int *enemies = (const int *)enemy_buf.buf;
+
+    int check_exclusion = !is_charge && !already_adjacent;
+    int no_enemies = (n_enemies == 0);
+    int total_cells = cols * rows;
+
+    int budget_milli = (int)(budget * 1000 + 0.5);
+
+    /* Dijkstra cost array */
+    static int drs_dist_arr[MAX_CELLS];
+    for (int i = 0; i < total_cells; i++)
+        drs_dist_arr[i] = 999999999;
+
+    int start_idx = start_row * cols + start_col;
+    drs_dist_arr[start_idx] = 0;
+
+    /* Binary min-heap */
+    static HEntry drs_heap[HEAP_CAP];
+    int heap_size = 0;
+
+    drs_heap[heap_size++] = (HEntry){0, start_idx};
+
+    while (heap_size > 0) {
+        HEntry cur = drs_heap[0];
+        drs_heap[0] = drs_heap[--heap_size];
+        if (heap_size > 0) heap_sift_down(drs_heap, heap_size, 0);
+
+        if (cur.cost_milli > drs_dist_arr[cur.idx])
+            continue;
+
+        int cc = cur.idx % cols;
+        int cr = cur.idx / cols;
+
+        for (int d = 0; d < 8; d++) {
+            int nc = cc + DIRS_DC[d];
+            int nr = cr + DIRS_DR[d];
+            if (nc < 0 || nc >= cols || nr < 0 || nr >= rows)
+                continue;
+
+            int new_cost = cur.cost_milli + DIRS_COST_MILLI[d];
+            if (new_cost > budget_milli + 10)
+                continue;
+
+            /* Enemy position check (unless flying) */
+            if (!flying && !no_enemies) {
+                int blocked = 0;
+                for (int e = 0; e < n_enemies; e++) {
+                    if (enemies[e * 2] == nc && enemies[e * 2 + 1] == nr) {
+                        blocked = 1;
+                        break;
+                    }
+                }
+                if (blocked) continue;
+            }
+
+            /* Exclusion zone check */
+            if (check_exclusion && exclusion[nr * cols + nc])
+                continue;
+
+            int nidx = nr * cols + nc;
+            if (new_cost < drs_dist_arr[nidx]) {
+                drs_dist_arr[nidx] = new_cost;
+                if (heap_size < HEAP_CAP) {
+                    drs_heap[heap_size] = (HEntry){new_cost, nidx};
+                    heap_sift_up(drs_heap, heap_size);
+                    heap_size++;
+                }
+            }
+        }
+    }
+
+    /* Collect all reachable, non-occupied cells into result buffer.
+     * Pre-allocate for worst case (all cells reachable). */
+    static int result_buf[MAX_CELLS * 2];
+    int n_results = 0;
+
+    for (int idx = 0; idx < total_cells; idx++) {
+        if (drs_dist_arr[idx] >= 999999999)
+            continue;
+
+        int cc = idx % cols;
+        int cr = idx / cols;
+
+        /* Skip occupied cells (but the start cell is always allowed — handled by caller) */
+        if (occupancy[idx])
+            continue;
+
+        /* Skip enemy positions */
+        if (!no_enemies) {
+            int is_enemy = 0;
+            for (int e = 0; e < n_enemies; e++) {
+                if (enemies[e * 2] == cc && enemies[e * 2 + 1] == cr) {
+                    is_enemy = 1;
+                    break;
+                }
+            }
+            if (is_enemy) continue;
+        }
+
+        result_buf[n_results * 2] = cc;
+        result_buf[n_results * 2 + 1] = cr;
+        n_results++;
+    }
+
+    PyBuffer_Release(&occ_buf);
+    PyBuffer_Release(&excl_buf);
+    PyBuffer_Release(&enemy_buf);
+
+    /* Return as bytes object (caller reshapes via numpy) */
+    return PyBytes_FromStringAndSize(
+        (const char *)result_buf,
+        (Py_ssize_t)(n_results * 2 * sizeof(int)));
+}
+
+
+/* -----------------------------------------------------------------------
  * Module definition
  * ----------------------------------------------------------------------- */
 static PyMethodDef FastCoreMethods[] = {
@@ -503,6 +642,8 @@ static PyMethodDef FastCoreMethods[] = {
      "Min squared distance from each attacker to nearest target."},
     {"c_encode_distances", py_encode_distances, METH_VARARGS,
      "Compute normalised Euclidean distances from a point to N targets."},
+    {"c_dijkstra_reachable_set", py_dijkstra_reachable_set, METH_VARARGS,
+     "Return all reachable cells within movement budget via Dijkstra."},
     {NULL, NULL, 0, NULL}
 };
 

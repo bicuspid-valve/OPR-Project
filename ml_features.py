@@ -66,6 +66,11 @@ _MAX_TOUGH = 24
 _MAX_MODELS = 10
 _MAX_SPEED = 24.0
 
+# Destination pointer constants
+DEST_FEATURE_DIM = 75       # per-hex feature vector size
+DEST_EMBED_DIM = 64         # embedding dimension for pointer cross-attention
+MAX_DEST_CANDIDATES = 512   # padded candidate set size
+
 # Pre-allocated zero arrays for missing unit slots (never mutated)
 _ZERO_RANGED_ROW = np.zeros((MAX_UNITS_PER_SIDE, NUM_RANGE_THRESHOLDS), dtype=np.float32)
 _ZERO_MELEE_ROW = np.zeros(MAX_UNITS_PER_SIDE, dtype=np.float32)
@@ -661,6 +666,29 @@ def extract_can_charge_mask(
     offsets = torch.arange(MAX_UNITS_PER_SIDE, device=state_vec.device)
     indices = bases.unsqueeze(1) + offsets.unsqueeze(0)  # (N, 10)
     return state_vec.gather(1, indices) > 0.5
+
+
+def extract_is_shaken(
+    state_vec: torch.Tensor,
+    unit_idx: int | torch.Tensor,
+) -> torch.Tensor:
+    """Extract the is_shaken flag for a friendly unit from the state vector.
+
+    Parameters
+    ----------
+    state_vec : (feat,) or (N, feat) — encoded state
+    unit_idx : int (single) or (N,) long tensor (batched)
+
+    Returns
+    -------
+    scalar bool or (N,) bool — True if the unit is Shaken.
+    """
+    if isinstance(unit_idx, int):
+        idx = unit_idx * TACTICAL_UNIT_FEATURES + _TOFF_SHAKEN
+        return state_vec[..., idx] > 0.5
+    # Batched: unit_idx is (N,) tensor
+    indices = unit_idx.long() * TACTICAL_UNIT_FEATURES + _TOFF_SHAKEN
+    return state_vec.gather(1, indices.unsqueeze(1)).squeeze(1) > 0.5
 
 
 # ---------------------------------------------------------------------------

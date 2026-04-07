@@ -442,7 +442,10 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                     active, opp_units, board, mode=mode,
 )
 
-            if action == "charge" and charge_target is not None:
+            # Shaken units must hold and recover — no shooting, no charging
+            if active.shaken:
+                active.shaken = False
+            elif action == "charge" and charge_target is not None:
                 # Full charge sequence
                 enemy_positions = _collect_enemy_positions(opp_units)
                 execute_charge_movement(active, charge_target, board, enemy_positions)
@@ -497,26 +500,8 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                                  flying=active.unit.flying,
                                  range_target=rt, weapon_range=wr)
 
-                # Execute shooting (not if rushing or shaken)
+                # Execute shooting (not if rushing)
                 if action != "rush":
-                    if active.shaken:
-                        active.shaken = False
-                    else:
-                        if _ml_tac_decision:
-                            target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
-                        else:
-                            target = pick_target(active, opp_units,
-                             )
-                        if target is not None:
-                            resolve_shooting(active, target)
-                            check_morale(target)
-                            _sync_dead_models(target, board)
-
-            elif action == "hold":
-                # Execute shooting
-                if active.shaken:
-                    active.shaken = False
-                else:
                     if _ml_tac_decision:
                         target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                     else:
@@ -526,6 +511,18 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                         resolve_shooting(active, target)
                         check_morale(target)
                         _sync_dead_models(target, board)
+
+            elif action == "hold":
+                # Execute shooting
+                if _ml_tac_decision:
+                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                else:
+                    target = pick_target(active, opp_units,
+                     )
+                if target is not None:
+                    resolve_shooting(active, target)
+                    check_morale(target)
+                    _sync_dead_models(target, board)
 
             # Check if opponent army destroyed
             opp_alive = any(u.models_alive > 0 for u in opp_units)
@@ -719,7 +716,10 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                     active, opp_units, board, mode=mode,
 )
 
-            if action == "charge" and charge_target is not None:
+            # Shaken units must hold and recover — no shooting, no charging
+            if active.shaken:
+                active.shaken = False
+            elif action == "charge" and charge_target is not None:
                 enemy_positions = _collect_enemy_positions(opp_units)
                 execute_charge_movement(active, charge_target, board, enemy_positions)
                 execute_counter_charge(charge_target, active, board)
@@ -759,22 +759,6 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                                  flying=active.unit.flying,
                                  range_target=rt, weapon_range=wr)
                 if action != "rush":
-                    if active.shaken:
-                        active.shaken = False
-                    else:
-                        if _ml_tac_decision:
-                            target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
-                        else:
-                            target = pick_target(active, opp_units,
-                             )
-                        if target is not None:
-                            resolve_shooting(active, target)
-                            check_morale(target)
-                            _sync_dead_models(target, board)
-            elif action == "hold":
-                if active.shaken:
-                    active.shaken = False
-                else:
                     if _ml_tac_decision:
                         target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                     else:
@@ -784,6 +768,16 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                         resolve_shooting(active, target)
                         check_morale(target)
                         _sync_dead_models(target, board)
+            elif action == "hold":
+                if _ml_tac_decision:
+                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                else:
+                    target = pick_target(active, opp_units,
+                     )
+                if target is not None:
+                    resolve_shooting(active, target)
+                    check_morale(target)
+                    _sync_dead_models(target, board)
 
             opp_alive = any(u.models_alive > 0 for u in opp_units)
             if not opp_alive:
@@ -1058,7 +1052,12 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
             desc_parts = [f"{active_label} {ACTION_VERBS.get(action, action)} ({ai_reason})"]
             combat_stats = None
 
-            if action == "charge" and charge_target is not None:
+            # Shaken units must hold and recover — no shooting, no charging
+            if active.shaken:
+                active.shaken = False
+                desc_parts = [f"{active_label} Holds ({ai_reason}) (was Shaken, recovers)"]
+
+            elif action == "charge" and charge_target is not None:
                 target_idx = unit_to_idx[id(charge_target)]
                 target_label = labels[target_idx]
 
@@ -1152,38 +1151,6 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                 desc_parts = [f"{active_label} {ACTION_VERBS.get(action, action)} {move_dist:.0f}\" ({ai_reason})"]
 
                 if action != "rush":
-                    if active.shaken:
-                        active.shaken = False
-                        desc_parts.append("(was Shaken, recovers)")
-                    else:
-                        if _ml_tac_decision:
-                            target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
-                        else:
-                            target = pick_target(active, opp_units,
-                             )
-                        if target is not None:
-                            target_idx = unit_to_idx[id(target)]
-                            target_label = labels[target_idx]
-                            before = target.models_alive
-                            combat_stats = resolve_shooting(active, target, recorded=True)
-                            check_morale(target)
-                            _sync_dead_models(target, board)
-                            killed = before - target.models_alive
-                            if killed > 0:
-                                if target.models_alive <= 0:
-                                    desc_parts.append(f"and shoots {target_label}, destroying the unit!")
-                                else:
-                                    desc_parts.append(f"and shoots {target_label}, killing {killed} model{'s' if killed != 1 else ''}")
-                            else:
-                                desc_parts.append(f"and shoots {target_label}, no casualties")
-                        else:
-                            desc_parts.append("(no targets in range)")
-
-            elif action == "hold":
-                if active.shaken:
-                    active.shaken = False
-                    desc_parts.append("(was Shaken, recovers)")
-                else:
                     if _ml_tac_decision:
                         target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
                     else:
@@ -1206,6 +1173,30 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                             desc_parts.append(f"and shoots {target_label}, no casualties")
                     else:
                         desc_parts.append("(no targets in range)")
+
+            elif action == "hold":
+                if _ml_tac_decision:
+                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                else:
+                    target = pick_target(active, opp_units,
+                     )
+                if target is not None:
+                    target_idx = unit_to_idx[id(target)]
+                    target_label = labels[target_idx]
+                    before = target.models_alive
+                    combat_stats = resolve_shooting(active, target, recorded=True)
+                    check_morale(target)
+                    _sync_dead_models(target, board)
+                    killed = before - target.models_alive
+                    if killed > 0:
+                        if target.models_alive <= 0:
+                            desc_parts.append(f"and shoots {target_label}, destroying the unit!")
+                        else:
+                            desc_parts.append(f"and shoots {target_label}, killing {killed} model{'s' if killed != 1 else ''}")
+                    else:
+                        desc_parts.append(f"and shoots {target_label}, no casualties")
+                else:
+                    desc_parts.append("(no targets in range)")
 
             opp_alive = any(u.models_alive > 0 for u in opp_units)
 

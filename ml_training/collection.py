@@ -3,21 +3,29 @@ from __future__ import annotations
 
 import random
 
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from board import Board
 from models import ResolvedUnit, UnitState
-from ml_features import MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES, encode_state_tactical, precompute_damage, extract_can_charge_mask
+from ml_features import (
+    MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES, encode_state_tactical,
+    precompute_damage, extract_can_charge_mask,
+    MAX_DEST_CANDIDATES, DEST_FEATURE_DIM,
+    _flip_x, _flip_y,
+)
 from ml_model_tactical import (
     TacticalModel, NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
 )
 from ml_integration_tactical import (
     MOVE_TYPE_NAMES, execute_decoded_decision, pick_target_from_ranking,
-    compute_post_move_rel, compute_post_move_position,
+    compute_post_move_rel,
+    compute_destination_candidates, compute_destination_features,
+    build_dest_enemy_cache,
     _get_model_space_positions, _get_movement_budgets, _get_max_weapon_ranges,
 )
-from ml_features import _flip_x, _flip_y
 
 from ml_training.config import (
     TacticalActivationRecord, _TacticalInferenceRequest, _TacticalSamplingResult,
@@ -332,10 +340,31 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                     and random.random() < planning_rate
                 )
 
+                # Pre-compute destination candidates (rush budget = superset)
+                # for all alive units so we can pass the right one after unit selection.
+                a_enemy_occ = _collect_enemy_positions(units_b)
+                _a_enemy_alive_np = np.array(enemy_alive_mask_list, dtype=np.bool_)
+                _a_per_unit_cands = {}
+                _a_per_unit_mask = {}
+                _a_per_unit_feats = {}
+                for _ui in range(min(len(units_a), MAX_UNITS_PER_SIDE)):
+                    if alive_mask_list[_ui]:
+                        _uc, _um = compute_destination_candidates(
+                            units_a[_ui], MOVE_RUSH, board, a_enemy_occ, "A",
+                        )
+                        _uf = compute_destination_features(
+                            _uc, _um, units_a[_ui], _ui, "A",
+                            units_b, _a_enemy_alive_np,
+                            fr_a, fr_b, fm_b, a_rush_dists[_ui],
+                        )
+                        _a_per_unit_cands[_ui] = _uc
+                        _a_per_unit_mask[_ui] = _um
+                        _a_per_unit_feats[_ui] = _uf
+
                 if use_planning:
                     from ml_planning import plan_training_activation
-                    (sel_idx, move_type_a, sampled_angle_a, sampled_frac_a,
-                     dest_comp_a,
+                    (sel_idx, move_type_a, _plan_dest_col, _plan_dest_row,
+                     _plan_dest_cand_idx,
                      charge_tgt_a, shoot_tgt_a, _a_tac_target_ranking,
                      pmr_a, old_lp, value_est, shoot_mask_a,
                      _was_planned, _planning_improved, _planning_value_delta,
@@ -358,15 +387,63 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                         planning_params=planning_params,
                         opponent_type=opponent_type_idx,
                     )
+                    # Build dest data from planning result
+                    if sel_idx in _a_per_unit_cands:
+                        _p_cands = _a_per_unit_cands[sel_idx]
+                        _p_mask = _a_per_unit_mask[sel_idx]
+                        _p_feats = _a_per_unit_feats[sel_idx]
+                        _n_valid = int(_p_mask.sum())
+                        dest_cands_a = _p_cands[:_n_valid].tolist()
+                        dest_mask_a = [True] * _n_valid
+                        dest_feats_a = _p_feats[:_n_valid].tolist()
+                        dest_sel_a = 0
+                        for _ci in range(_n_valid):
+                            if int(_p_cands[_ci, 0]) == _plan_dest_col and int(_p_cands[_ci, 1]) == _plan_dest_row:
+                                dest_sel_a = _ci
+                                break
+                    else:
+                        dest_cands_a, dest_mask_a, dest_feats_a, dest_sel_a = [], [], [], -1
                 else:
-                    (sel_idx, move_type_a, sampled_angle_a, sampled_frac_a,
-                     dest_comp_a,
+                    # Sample without candidates first (pointer skipped, dest_lp=0),
+                    # then run the pointer post-hoc for the selected unit.
+                    (sel_idx, move_type_a,
+                     _, _, _, _,
                      charge_tgt_a, shoot_tgt_a, _a_tac_target_ranking,
                      pmr_a, old_lp, value_est, shoot_mask_a) = sample_tactical_actions_no_grad(
                         model, state_vec, alive_mask, enemy_alive_mask,
                         a_friendly_pos, a_enemy_pos, a_adv_dists, a_rush_dists,
                         a_max_wr, opponent_type_idx=opponent_type_idx,
                     )
+                    # Run pointer post-hoc if advance/rush
+                    dest_cands_a, dest_mask_a, dest_feats_a, dest_sel_a = [], [], [], -1
+                    if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) and sel_idx in _a_per_unit_cands:
+                        _sel_cands = _a_per_unit_cands[sel_idx]
+                        _sel_mask = _a_per_unit_mask[sel_idx]
+                        _sel_feats = _a_per_unit_feats[sel_idx]
+                        _n_valid = int(_sel_mask.sum())
+                        # Run pointer via model
+                        with torch.no_grad():
+                            _x = state_vec.unsqueeze(0)
+                            _h, _units, _ = model.trunk(_x)
+                            _uf = model._extract_unit_features(_units, sel_idx).detach()
+                            _mo = F.one_hot(torch.tensor(move_type_a), NUM_MOVE_TYPES).float().unsqueeze(0)
+                            _h_uf_m = torch.cat([_h, _uf, _mo], dim=-1)
+                            _df_t = torch.from_numpy(_sel_feats).float().unsqueeze(0)
+                            _dm_t = torch.from_numpy(_sel_mask).unsqueeze(0)
+                            _dlogits = model.compute_dest_logits(_h_uf_m, _df_t, _dm_t).squeeze(0)
+                            _ddist = torch.distributions.Categorical(logits=_dlogits)
+                            dest_sel_a = int(_ddist.sample().item())
+                            _dest_lp = _ddist.log_prob(torch.tensor(dest_sel_a)).item()
+                            old_lp += _dest_lp
+                        dest_cands_a = _sel_cands[:_n_valid].tolist()
+                        dest_mask_a = [True] * _n_valid
+                        dest_feats_a = _sel_feats[:_n_valid].tolist()
+                        # Recompute post_move_rel from selected hex
+                        _dcol = int(_sel_cands[dest_sel_a, 0])
+                        _drow = int(_sel_cands[dest_sel_a, 1])
+                        pmr_a = compute_post_move_rel(
+                            float(_dcol), float(_drow), a_enemy_pos,
+                        ).numpy()
 
                 # Record for PPO replay
                 step = TacticalActivationRecord(
@@ -375,16 +452,14 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                     enemy_alive_mask=enemy_alive_mask_list,
                     unit_idx=sel_idx,
                     move_type=move_type_a,
-                    sampled_angle=sampled_angle_a,
-                    sampled_distance_frac=sampled_frac_a,
-                    dest_component_idx=dest_comp_a,
+                    dest_candidates=dest_cands_a,
+                    dest_mask=dest_mask_a,
+                    dest_features=dest_feats_a,
+                    dest_selected_idx=dest_sel_a,
                     charge_target_idx=charge_tgt_a,
                     shoot_target_idx=shoot_tgt_a,
                     shoot_mask=shoot_mask_a,
                     post_move_rel=pmr_a,
-                    unit_cx=a_friendly_pos[sel_idx][0],
-                    unit_cy=a_friendly_pos[sel_idx][1],
-                    move_budget=(a_adv_dists[sel_idx] if move_type_a == MOVE_ADVANCE else a_rush_dists[sel_idx]) if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) else 0.0,
                     old_log_prob=old_lp,
                     old_value=value_est,
                     opponent_type_idx=opponent_type_idx,
@@ -408,14 +483,11 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                 active = units_a[sel_idx]
                 active.activated = True
 
-                # Compute destination in game-space
+                # Compute destination in game-space from selected candidate hex
                 _a_dest = None
-                if move_type_a in (MOVE_ADVANCE, MOVE_RUSH):
-                    ucx, ucy = a_friendly_pos[sel_idx]
-                    budget = a_adv_dists[sel_idx] if move_type_a == MOVE_ADVANCE else a_rush_dists[sel_idx]
-                    px, py = compute_post_move_position(ucx, ucy, sampled_angle_a, sampled_frac_a * budget)
-                    # Convert model-space → game-space
-                    _a_dest = (px, py)  # Player A: model-space == game-space
+                if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) and dest_sel_a >= 0 and len(dest_cands_a) > 0:
+                    _dest_hex = dest_cands_a[dest_sel_a]
+                    _a_dest = (float(_dest_hex[0]), float(_dest_hex[1]))  # game-space (Player A: model==game)
 
                 _a_tac_action, _a_tac_goal, _a_tac_charge_target, _a_reason = execute_decoded_decision(
                     active, units_b, move_type_a, _a_dest, charge_tgt_a, shoot_tgt_a,
@@ -459,12 +531,64 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                         b_adv_dists, b_rush_dists = _get_movement_budgets(units_b)
                         b_max_wr = _get_max_weapon_ranges(units_b)
 
-                        (sel_b, mt_b, sa_b, sf_b, dc_b, ct_b, st_b,
-                         _b_target_ranking, pmr_b, olp_b, val_b, sm_b) = sample_tactical_actions_no_grad(
+                        # Pre-compute dest candidates for all alive B units
+                        b_enemy_occ = _collect_enemy_positions(units_a)
+                        _b_enemy_alive_np = np.array(b_enemy_alive_list, dtype=np.bool_)
+                        _b_per_unit_cands = {}
+                        _b_per_unit_mask = {}
+                        _b_per_unit_feats = {}
+                        for _bui in range(min(len(units_b), MAX_UNITS_PER_SIDE)):
+                            if b_alive_list[_bui]:
+                                _bc, _bm = compute_destination_candidates(
+                                    units_b[_bui], MOVE_RUSH, board, b_enemy_occ, "B",
+                                )
+                                _bf = compute_destination_features(
+                                    _bc, _bm, units_b[_bui], _bui, "B",
+                                    units_a, _b_enemy_alive_np,
+                                    fr_b, fr_a, fm_a, b_rush_dists[_bui],
+                                )
+                                _b_per_unit_cands[_bui] = _bc
+                                _b_per_unit_mask[_bui] = _bm
+                                _b_per_unit_feats[_bui] = _bf
+
+                        # Sample without candidates, then run pointer post-hoc
+                        (sel_b, mt_b,
+                         _, _, _, _,
+                         ct_b, st_b, _b_target_ranking,
+                         pmr_b, olp_b, val_b, sm_b) = sample_tactical_actions_no_grad(
                             model, b_state_vec, b_alive_mask, b_enemy_alive_mask,
                             b_friendly_pos, b_enemy_pos, b_adv_dists, b_rush_dists,
                             b_max_wr, opponent_type_idx=opponent_type_idx,
                         )
+                        # Run pointer post-hoc for B
+                        dest_cands_b, dest_mask_b, dest_feats_b, dest_sel_b = [], [], [], -1
+                        if mt_b in (MOVE_ADVANCE, MOVE_RUSH) and sel_b in _b_per_unit_cands:
+                            _bsc = _b_per_unit_cands[sel_b]
+                            _bsm = _b_per_unit_mask[sel_b]
+                            _bsf = _b_per_unit_feats[sel_b]
+                            _bn_valid = int(_bsm.sum())
+                            with torch.no_grad():
+                                _bx = b_state_vec.unsqueeze(0)
+                                _bh, _bunits, _ = model.trunk(_bx)
+                                _buf = model._extract_unit_features(_bunits, sel_b).detach()
+                                _bmo = F.one_hot(torch.tensor(mt_b), NUM_MOVE_TYPES).float().unsqueeze(0)
+                                _bh_uf_m = torch.cat([_bh, _buf, _bmo], dim=-1)
+                                _bdf_t = torch.from_numpy(_bsf).float().unsqueeze(0)
+                                _bdm_t = torch.from_numpy(_bsm).unsqueeze(0)
+                                _bdlogits = model.compute_dest_logits(_bh_uf_m, _bdf_t, _bdm_t).squeeze(0)
+                                _bddist = torch.distributions.Categorical(logits=_bdlogits)
+                                dest_sel_b = int(_bddist.sample().item())
+                                _bdest_lp = _bddist.log_prob(torch.tensor(dest_sel_b)).item()
+                                olp_b += _bdest_lp
+                            dest_cands_b = _bsc[:_bn_valid].tolist()
+                            dest_mask_b = [True] * _bn_valid
+                            dest_feats_b = _bsf[:_bn_valid].tolist()
+                            # Recompute post_move_rel from selected hex (model-space for B)
+                            _bdcol = int(_bsc[dest_sel_b, 0])
+                            _bdrow = int(_bsc[dest_sel_b, 1])
+                            pmr_b = compute_post_move_rel(
+                                _flip_x(float(_bdcol)), _flip_y(float(_bdrow)), b_enemy_pos,
+                            ).numpy()
 
                         step_b = TacticalActivationRecord(
                             state_vec=b_state_vec_np,
@@ -472,16 +596,14 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                             enemy_alive_mask=b_enemy_alive_list,
                             unit_idx=sel_b,
                             move_type=mt_b,
-                            sampled_angle=sa_b,
-                            sampled_distance_frac=sf_b,
-                            dest_component_idx=dc_b,
+                            dest_candidates=dest_cands_b,
+                            dest_mask=dest_mask_b,
+                            dest_features=dest_feats_b,
+                            dest_selected_idx=dest_sel_b,
                             charge_target_idx=ct_b,
                             shoot_target_idx=st_b,
                             shoot_mask=sm_b,
                             post_move_rel=pmr_b,
-                            unit_cx=b_friendly_pos[sel_b][0],
-                            unit_cy=b_friendly_pos[sel_b][1],
-                            move_budget=(b_adv_dists[sel_b] if mt_b == MOVE_ADVANCE else b_rush_dists[sel_b]) if mt_b in (MOVE_ADVANCE, MOVE_RUSH) else 0.0,
                             old_log_prob=olp_b,
                             old_value=val_b,
                             opponent_type_idx=opponent_type_idx,
@@ -494,13 +616,12 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                         active = units_b[sel_b]
                         active.activated = True
 
-                        # Compute B destination in game-space
+                        # Compute B destination in game-space from selected hex
                         _b_dest = None
-                        if mt_b in (MOVE_ADVANCE, MOVE_RUSH):
-                            bcx, bcy = b_friendly_pos[sel_b]
-                            bgt = b_adv_dists[sel_b] if mt_b == MOVE_ADVANCE else b_rush_dists[sel_b]
-                            bpx, bpy = compute_post_move_position(bcx, bcy, sa_b, sf_b * bgt)
-                            _b_dest = (_flip_x(bpx), _flip_y(bpy))  # model-space → game-space for B
+                        if mt_b in (MOVE_ADVANCE, MOVE_RUSH) and dest_sel_b >= 0 and dest_cands_b:
+                            _bdhex = dest_cands_b[dest_sel_b]
+                            # Candidates are in game-space already
+                            _b_dest = (float(_bdhex[0]), float(_bdhex[1]))
 
                         _b_action, _b_goal, _b_charge_target, _ = execute_decoded_decision(
                             active, units_a, mt_b, _b_dest, ct_b, st_b,
@@ -563,7 +684,10 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                     for obj_pos in _OBJECTIVES_FOR_REWARD
                 ]
 
-            if action == "charge" and charge_target is not None:
+            # Shaken units must hold and recover — no shooting, no charging
+            if active.shaken:
+                active.shaken = False
+            elif action == "charge" and charge_target is not None:
                 enemy_positions = _collect_enemy_positions(opp_units)
                 execute_charge_movement(active, charge_target, board, enemy_positions)
                 execute_counter_charge(charge_target, active, board)
@@ -607,22 +731,6 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                                  flying=active.unit.flying)
 
                 if action != "rush":
-                    if active.shaken:
-                        active.shaken = False
-                    else:
-                        if current_is_a or _opp_tac_decision:
-                            target = pick_target_from_ranking(active, opp_units, _active_target_ranking)
-                        else:
-                            target = pick_target(active, opp_units, target_multipliers=my_mults)
-                        if target is not None:
-                            resolve_shooting(active, target)
-                            check_morale(target)
-                            _sync_dead_models(target, board)
-
-            elif action == "hold":
-                if active.shaken:
-                    active.shaken = False
-                else:
                     if current_is_a or _opp_tac_decision:
                         target = pick_target_from_ranking(active, opp_units, _active_target_ranking)
                     else:
@@ -631,6 +739,16 @@ def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
                         resolve_shooting(active, target)
                         check_morale(target)
                         _sync_dead_models(target, board)
+
+            elif action == "hold":
+                if current_is_a or _opp_tac_decision:
+                    target = pick_target_from_ranking(active, opp_units, _active_target_ranking)
+                else:
+                    target = pick_target(active, opp_units, target_multipliers=my_mults)
+                if target is not None:
+                    resolve_shooting(active, target)
+                    check_morale(target)
+                    _sync_dead_models(target, board)
 
             # Per-activation objective capture reward
             if _pre_move_friendly_on_objs is not None and active is not None and active.models_alive > 0:
@@ -883,12 +1001,38 @@ def _episode_tactical_generator(opponent_model,
                 a_adv_dists, a_rush_dists = _get_movement_budgets(units_a)
                 a_max_wr = _get_max_weapon_ranges(units_a)
 
+                # Pre-compute dest candidates (rush budget) for all alive A units
+                # Features are computed lazily in sampling after unit selection.
+                _ga_enemy_occ = _collect_enemy_positions(units_b)
+                _ga_enemy_alive_np = np.array(enemy_alive_mask_list, dtype=np.bool_)
+                _ga_cands_dict = {}
+                _ga_mask_dict = {}
+                for _gui in range(min(len(units_a), MAX_UNITS_PER_SIDE)):
+                    if alive_mask_list[_gui]:
+                        _gc, _gm = compute_destination_candidates(
+                            units_a[_gui], MOVE_RUSH, board, _ga_enemy_occ, "A",
+                        )
+                        _ga_cands_dict[_gui] = _gc
+                        _ga_mask_dict[_gui] = _gm
+                _ga_enemy_cache = build_dest_enemy_cache(units_b, _ga_enemy_alive_np, "A")
+
                 # >>> YIELD for batched inference (or planning, decided by coordinator) <<<
                 _req = _TacticalInferenceRequest(
                     state_vec, alive_mask, enemy_alive_mask, "main",
                     a_friendly_pos, a_enemy_pos, a_adv_dists, a_rush_dists,
                     a_max_wr, opponent_type_idx=opponent_type_idx,
                 )
+                _req.dest_candidates_per_unit = _ga_cands_dict
+                _req.dest_mask_per_unit = _ga_mask_dict
+                _req.dest_features_per_unit = None  # computed lazily
+                _req.dest_lazy_units = units_a
+                _req.dest_lazy_enemy_units = units_b
+                _req.dest_lazy_enemy_alive = _ga_enemy_alive_np
+                _req.dest_lazy_fr_matchups = fr_a
+                _req.dest_lazy_er_matchups = fr_b
+                _req.dest_lazy_melee_matchups = fm_b
+                _req.dest_lazy_player = "A"
+                _req.dest_lazy_enemy_cache = _ga_enemy_cache
                 if planning_enabled:
                     _req.planning_units_a = units_a
                     _req.planning_units_b = units_b
@@ -907,8 +1051,6 @@ def _episode_tactical_generator(opponent_model,
 
                 sel_idx = _inf_result.unit_idx
                 move_type_a = _inf_result.move_type
-                sampled_angle_a = _inf_result.sampled_angle
-                sampled_frac_a = _inf_result.sampled_distance_frac
                 charge_tgt_a = _inf_result.charge_target_idx
                 shoot_tgt_a = _inf_result.shoot_target_idx
                 _a_tac_target_ranking = _inf_result.target_ranking
@@ -916,6 +1058,25 @@ def _episode_tactical_generator(opponent_model,
                 old_lp = _inf_result.old_log_prob
                 value_est = _inf_result.value
                 shoot_mask_a = _inf_result.shoot_mask
+                dest_cands_a = _inf_result.dest_candidates
+                dest_sel_a = _inf_result.dest_selected_idx
+
+                # Build recomputation data for PPO replay (avoids storing ~60KB features)
+                _sel_unit = units_a[sel_idx]
+                _sel_cx, _sel_cy = _sel_unit.centre()
+                # Store model-space centre for replay
+                if True:  # player == "A" — model-space == game-space
+                    _sel_mcx, _sel_mcy = _sel_cx, _sel_cy
+                _a_recomp = {
+                    'player': 'A',
+                    'unit_cx': _sel_mcx, 'unit_cy': _sel_mcy,
+                    'unit_alive_frac': _sel_unit.models_alive / max(_sel_unit.unit.models, 1),
+                    'move_budget': a_rush_dists[sel_idx],
+                    'enemy_cache': _ga_enemy_cache,
+                    'enemy_alive_mask': _ga_enemy_alive_np,
+                    'fr_matchups': fr_a, 'er_matchups': fr_b,
+                    'melee_matchups': fm_b,
+                }
 
                 step = TacticalActivationRecord(
                     state_vec=state_vec_np,
@@ -923,16 +1084,13 @@ def _episode_tactical_generator(opponent_model,
                     enemy_alive_mask=enemy_alive_mask_list,
                     unit_idx=sel_idx,
                     move_type=move_type_a,
-                    sampled_angle=sampled_angle_a,
-                    sampled_distance_frac=sampled_frac_a,
-                    dest_component_idx=_inf_result.dest_component_idx,
+                    dest_candidates=dest_cands_a,
+                    dest_selected_idx=dest_sel_a,
+                    dest_recomp=_a_recomp,
                     charge_target_idx=charge_tgt_a,
                     shoot_target_idx=shoot_tgt_a,
                     shoot_mask=shoot_mask_a,
                     post_move_rel=pmr_a,
-                    unit_cx=a_friendly_pos[sel_idx][0],
-                    unit_cy=a_friendly_pos[sel_idx][1],
-                    move_budget=(a_adv_dists[sel_idx] if move_type_a == MOVE_ADVANCE else a_rush_dists[sel_idx]) if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) else 0.0,
                     old_log_prob=old_lp,
                     old_value=value_est,
                     opponent_type_idx=opponent_type_idx,
@@ -956,12 +1114,11 @@ def _episode_tactical_generator(opponent_model,
                 active = units_a[sel_idx]
                 active.activated = True
 
+                # Compute destination in game-space from selected candidate hex
                 _a_dest = None
-                if move_type_a in (MOVE_ADVANCE, MOVE_RUSH):
-                    ucx, ucy = a_friendly_pos[sel_idx]
-                    budget = a_adv_dists[sel_idx] if move_type_a == MOVE_ADVANCE else a_rush_dists[sel_idx]
-                    px, py = compute_post_move_position(ucx, ucy, sampled_angle_a, sampled_frac_a * budget)
-                    _a_dest = (px, py)
+                if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) and dest_sel_a >= 0 and len(dest_cands_a) > 0:
+                    _dest_hex = dest_cands_a[dest_sel_a]
+                    _a_dest = (float(_dest_hex[0]), float(_dest_hex[1]))  # game-space (Player A: model==game)
 
                 _a_tac_action, _a_tac_goal, _a_tac_charge_target, _a_reason = execute_decoded_decision(
                     active, units_b, move_type_a, _a_dest, charge_tgt_a, shoot_tgt_a,
@@ -1005,12 +1162,38 @@ def _episode_tactical_generator(opponent_model,
                         b_adv_dists, b_rush_dists = _get_movement_budgets(units_b)
                         b_max_wr = _get_max_weapon_ranges(units_b)
 
+                        # Pre-compute dest candidates for all alive B units (features lazy)
+                        _gb_enemy_occ = _collect_enemy_positions(units_a)
+                        _gb_enemy_alive_np = np.array(b_enemy_alive_list, dtype=np.bool_)
+                        _gb_cands_dict = {}
+                        _gb_mask_dict = {}
+                        for _gbui in range(min(len(units_b), MAX_UNITS_PER_SIDE)):
+                            if b_alive_list[_gbui]:
+                                _gbc, _gbm = compute_destination_candidates(
+                                    units_b[_gbui], MOVE_RUSH, board, _gb_enemy_occ, "B",
+                                )
+                                _gb_cands_dict[_gbui] = _gbc
+                                _gb_mask_dict[_gbui] = _gbm
+                        _gb_enemy_cache = build_dest_enemy_cache(units_a, _gb_enemy_alive_np, "B")
+
                         # >>> YIELD for batched main-model inference (mirror B) <<<
-                        _b_inf = yield _TacticalInferenceRequest(
+                        _gb_req = _TacticalInferenceRequest(
                             b_state_vec, b_alive_mask, b_enemy_alive_mask, "main",
                             b_friendly_pos, b_enemy_pos, b_adv_dists, b_rush_dists,
                             b_max_wr, opponent_type_idx=opponent_type_idx,
                         )
+                        _gb_req.dest_candidates_per_unit = _gb_cands_dict
+                        _gb_req.dest_mask_per_unit = _gb_mask_dict
+                        _gb_req.dest_features_per_unit = None
+                        _gb_req.dest_lazy_units = units_b
+                        _gb_req.dest_lazy_enemy_units = units_a
+                        _gb_req.dest_lazy_enemy_alive = _gb_enemy_alive_np
+                        _gb_req.dest_lazy_fr_matchups = fr_b
+                        _gb_req.dest_lazy_er_matchups = fr_a
+                        _gb_req.dest_lazy_melee_matchups = fm_a
+                        _gb_req.dest_lazy_player = "B"
+                        _gb_req.dest_lazy_enemy_cache = _gb_enemy_cache
+                        _b_inf = yield _gb_req
 
                         sel_b = _b_inf.unit_idx
                         if (sel_b < len(units_b)
@@ -1019,22 +1202,32 @@ def _episode_tactical_generator(opponent_model,
                             active = units_b[sel_b]
                             _b_target_ranking = _b_inf.target_ranking
 
+                            _selb = units_b[sel_b]
+                            _selb_cx, _selb_cy = _selb.centre()
+                            _selb_mcx, _selb_mcy = _flip_x(_selb_cx), _flip_y(_selb_cy)
+                            _b_recomp_m = {
+                                'player': 'B',
+                                'unit_cx': _selb_mcx, 'unit_cy': _selb_mcy,
+                                'unit_alive_frac': _selb.models_alive / max(_selb.unit.models, 1),
+                                'move_budget': b_rush_dists[sel_b],
+                                'enemy_cache': _gb_enemy_cache,
+                                'enemy_alive_mask': _gb_enemy_alive_np,
+                                'fr_matchups': fr_b, 'er_matchups': fr_a,
+                                'melee_matchups': fm_a,
+                            }
                             step_b = TacticalActivationRecord(
                                 state_vec=b_state_vec_np,
                                 alive_mask=b_alive_list,
                                 enemy_alive_mask=b_enemy_alive_list,
                                 unit_idx=sel_b,
                                 move_type=_b_inf.move_type,
-                                sampled_angle=_b_inf.sampled_angle,
-                                sampled_distance_frac=_b_inf.sampled_distance_frac,
-                                dest_component_idx=_b_inf.dest_component_idx,
+                                dest_candidates=_b_inf.dest_candidates,
+                                dest_selected_idx=_b_inf.dest_selected_idx,
+                                dest_recomp=_b_recomp_m,
                                 charge_target_idx=_b_inf.charge_target_idx,
                                 shoot_target_idx=_b_inf.shoot_target_idx,
                                 shoot_mask=_b_inf.shoot_mask,
                                 post_move_rel=_b_inf.post_move_rel,
-                                unit_cx=b_friendly_pos[sel_b][0],
-                                unit_cy=b_friendly_pos[sel_b][1],
-                                move_budget=(b_adv_dists[sel_b] if _b_inf.move_type == MOVE_ADVANCE else b_rush_dists[sel_b]) if _b_inf.move_type in (MOVE_ADVANCE, MOVE_RUSH) else 0.0,
                                 old_log_prob=_b_inf.old_log_prob,
                                 old_value=_b_inf.value,
                                 opponent_type_idx=opponent_type_idx,
@@ -1045,11 +1238,12 @@ def _episode_tactical_generator(opponent_model,
                             _traj_b_counts.append((_b_act_total, _a_act_total))
 
                             _b_dest = None
-                            if _b_inf.move_type in (MOVE_ADVANCE, MOVE_RUSH):
-                                bcx, bcy = b_friendly_pos[sel_b]
-                                bgt = b_adv_dists[sel_b] if _b_inf.move_type == MOVE_ADVANCE else b_rush_dists[sel_b]
-                                bpx, bpy = compute_post_move_position(bcx, bcy, _b_inf.sampled_angle, _b_inf.sampled_distance_frac * bgt)
-                                _b_dest = (_flip_x(bpx), _flip_y(bpy))
+                            if (_b_inf.move_type in (MOVE_ADVANCE, MOVE_RUSH)
+                                    and _b_inf.dest_selected_idx >= 0
+                                    and len(_b_inf.dest_candidates) > 0):
+                                _bdhex = _b_inf.dest_candidates[_b_inf.dest_selected_idx]
+                                # Candidates are in game-space
+                                _b_dest = (float(_bdhex[0]), float(_bdhex[1]))
 
                             _b_action, _b_goal, _b_charge_target, _ = execute_decoded_decision(
                                 active, units_a, _b_inf.move_type, _b_dest,
@@ -1092,12 +1286,42 @@ def _episode_tactical_generator(opponent_model,
                         b_adv_dists_opp, b_rush_dists_opp = _get_movement_budgets(units_b)
                         b_max_wr_opp = _get_max_weapon_ranges(units_b)
 
+                        # Pre-compute dest candidates for opponent B units (features lazy)
+                        _gopp_enemy_occ = _collect_enemy_positions(units_a)
+                        _gopp_enemy_alive_np = np.array(
+                            [(i < len(units_a) and units_a[i].models_alive > 0)
+                             for i in range(MAX_UNITS_PER_SIDE)],
+                            dtype=np.bool_,
+                        )
+                        _gopp_cands_dict = {}
+                        _gopp_mask_dict = {}
+                        for _goppi in range(min(len(units_b), MAX_UNITS_PER_SIDE)):
+                            if b_alive_list[_goppi]:
+                                _goppc, _goppm = compute_destination_candidates(
+                                    units_b[_goppi], MOVE_RUSH, board, _gopp_enemy_occ, "B",
+                                )
+                                _gopp_cands_dict[_goppi] = _goppc
+                                _gopp_mask_dict[_goppi] = _goppm
+                        _gopp_enemy_cache = build_dest_enemy_cache(units_a, _gopp_enemy_alive_np, "B")
+
                         # >>> YIELD for batched opponent-model inference <<<
-                        _b_inf = yield _TacticalInferenceRequest(
+                        _gopp_req = _TacticalInferenceRequest(
                             b_state_vec, b_alive_mask, b_enemy_alive_mask, "opponent",
                             b_friendly_pos_opp, b_enemy_pos_opp, b_adv_dists_opp, b_rush_dists_opp,
                             b_max_wr_opp,
                         )
+                        _gopp_req.dest_candidates_per_unit = _gopp_cands_dict
+                        _gopp_req.dest_mask_per_unit = _gopp_mask_dict
+                        _gopp_req.dest_features_per_unit = None
+                        _gopp_req.dest_lazy_units = units_b
+                        _gopp_req.dest_lazy_enemy_units = units_a
+                        _gopp_req.dest_lazy_enemy_alive = _gopp_enemy_alive_np
+                        _gopp_req.dest_lazy_fr_matchups = fr_b
+                        _gopp_req.dest_lazy_er_matchups = fr_a
+                        _gopp_req.dest_lazy_melee_matchups = fm_a
+                        _gopp_req.dest_lazy_player = "B"
+                        _gopp_req.dest_lazy_enemy_cache = _gopp_enemy_cache
+                        _b_inf = yield _gopp_req
 
                         sel_b = _b_inf.unit_idx
                         if (sel_b < len(units_b)
@@ -1106,11 +1330,12 @@ def _episode_tactical_generator(opponent_model,
                             active = units_b[sel_b]
                             _b_target_ranking = _b_inf.target_ranking
                             _b_dest_opp = None
-                            if _b_inf.move_type in (MOVE_ADVANCE, MOVE_RUSH):
-                                bcx, bcy = b_friendly_pos_opp[sel_b]
-                                bgt = b_adv_dists_opp[sel_b] if _b_inf.move_type == MOVE_ADVANCE else b_rush_dists_opp[sel_b]
-                                bpx, bpy = compute_post_move_position(bcx, bcy, _b_inf.sampled_angle, _b_inf.sampled_distance_frac * bgt)
-                                _b_dest_opp = (_flip_x(bpx), _flip_y(bpy))
+                            if (_b_inf.move_type in (MOVE_ADVANCE, MOVE_RUSH)
+                                    and _b_inf.dest_selected_idx >= 0
+                                    and len(_b_inf.dest_candidates) > 0):
+                                _bdhex_opp = _b_inf.dest_candidates[_b_inf.dest_selected_idx]
+                                # Candidates are in game-space
+                                _b_dest_opp = (float(_bdhex_opp[0]), float(_bdhex_opp[1]))
                             _b_action, _b_goal, _b_charge_target, _ = execute_decoded_decision(
                                 active, units_a, _b_inf.move_type, _b_dest_opp,
                                 _b_inf.charge_target_idx, _b_inf.shoot_target_idx,
@@ -1163,7 +1388,10 @@ def _episode_tactical_generator(opponent_model,
                     for obj_pos in _OBJECTIVES_FOR_REWARD
                 ]
 
-            if action == "charge" and charge_target is not None:
+            # Shaken units must hold and recover — no shooting, no charging
+            if active.shaken:
+                active.shaken = False
+            elif action == "charge" and charge_target is not None:
                 enemy_positions = _collect_enemy_positions(opp_units)
                 execute_charge_movement(active, charge_target, board, enemy_positions)
                 execute_counter_charge(charge_target, active, board)
@@ -1207,22 +1435,6 @@ def _episode_tactical_generator(opponent_model,
                                  flying=active.unit.flying)
 
                 if action != "rush":
-                    if active.shaken:
-                        active.shaken = False
-                    else:
-                        if current_is_a or _opp_tac_decision:
-                            target = pick_target_from_ranking(active, opp_units, _active_target_ranking)
-                        else:
-                            target = pick_target(active, opp_units, target_multipliers=my_mults)
-                        if target is not None:
-                            resolve_shooting(active, target)
-                            check_morale(target)
-                            _sync_dead_models(target, board)
-
-            elif action == "hold":
-                if active.shaken:
-                    active.shaken = False
-                else:
                     if current_is_a or _opp_tac_decision:
                         target = pick_target_from_ranking(active, opp_units, _active_target_ranking)
                     else:
@@ -1231,6 +1443,16 @@ def _episode_tactical_generator(opponent_model,
                         resolve_shooting(active, target)
                         check_morale(target)
                         _sync_dead_models(target, board)
+
+            elif action == "hold":
+                if current_is_a or _opp_tac_decision:
+                    target = pick_target_from_ranking(active, opp_units, _active_target_ranking)
+                else:
+                    target = pick_target(active, opp_units, target_multipliers=my_mults)
+                if target is not None:
+                    resolve_shooting(active, target)
+                    check_morale(target)
+                    _sync_dead_models(target, board)
 
             # Per-activation objective capture reward
             if _pre_move_friendly_on_objs_g is not None and active is not None and active.models_alive > 0:
@@ -1410,7 +1632,7 @@ def _run_games_batched_tactical(
             from ml_planning import plan_training_activation
             for gid, req in zip(main_gids, main_reqs):
                 if req.planning_units_a is not None:
-                    (uid, mt, ang, frac, dc,
+                    (uid, mt, plan_dcol, plan_drow, plan_dcidx,
                      ct, st, ranking,
                      pmr, olp, val, sm,
                      wp, pi, pvd, puv, pui,
@@ -1433,10 +1655,14 @@ def _run_games_batched_tactical(
                         planning_params=planning_params,
                         opponent_type=req.planning_opponent_type_idx,
                     )
+                    # Planning returns (dest_col, dest_row, dest_cand_idx) —
+                    # build dest pointer data for the record.
+                    # Dest candidates were not pre-computed for planning path;
+                    # store empty dest data (planning does its own candidate search).
                     all_results[gid] = _TacticalSamplingResult(
                         unit_idx=uid, move_type=mt,
-                        sampled_angle=ang, sampled_distance_frac=frac,
-                        dest_component_idx=dc,
+                        dest_candidates=[], dest_mask=[], dest_features=[],
+                        dest_selected_idx=-1,
                         charge_target_idx=ct, shoot_target_idx=st,
                         target_ranking=ranking, post_move_rel=pmr,
                         old_log_prob=olp, value=val, shoot_mask=sm,

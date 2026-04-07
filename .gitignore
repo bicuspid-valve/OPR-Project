@@ -13,5 +13,7 @@ ml_checkpoints/
 ml_checkpoints_bench_seq/
 ml_checkpoints_tactical_test/
 ml_logs/
+ml_checkpoints_profile/
+diagnostics/
 results/
 training_metrics.png
