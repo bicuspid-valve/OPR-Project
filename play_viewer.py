@@ -61,6 +61,12 @@ class _ActivationDiag:
     shadow_shoot_target: str | None = None
     shadow_value: float | None = None  # value from shadow assessment
     diverged: bool = False             # True when human chose differently from AI
+    # Sequential shadow fields (human turns only)
+    # Q2: Given human's unit + action, where would AI move (and shoot from there)?
+    shadow_dest: tuple[int, int] | None = None
+    shadow_dest_shoot_target: str | None = None
+    # Q3: Given human's unit at human's final position, what would AI shoot?
+    shadow_pos_shoot_target: str | None = None
 
 # ── Visual constants (matching viewer.py) ──────────────────────────
 CELL = 12
@@ -1393,6 +1399,9 @@ class PlayViewer:
 
     def _confirm_action(self):
         """Execute the confirmed human action."""
+        # Compute sequential shadow queries before execution mutates state
+        seq_shadow = self._compute_sequential_shadow()
+
         unit = self._active_unit
         if unit is None:
             return
@@ -1578,6 +1587,10 @@ class PlayViewer:
             human_unit = self.labels[self._selected_unit_idx]
             diag.diverged = (human_unit != shadow['unit_name']
                              or action != shadow['action'])
+        # Sequential shadow results
+        diag.shadow_dest = seq_shadow.get('shadow_dest')
+        diag.shadow_dest_shoot_target = seq_shadow.get('shadow_dest_shoot')
+        diag.shadow_pos_shoot_target = seq_shadow.get('shadow_pos_shoot')
         self._diag_log.append(diag)
         self._shadow_recommendation = None
 
@@ -1946,6 +1959,197 @@ class PlayViewer:
         finally:
             restore_game_state(snap, self.units_a, self.units_b, self.board)
 
+    def _compute_sequential_shadow(self) -> dict:
+        """Compute sequential follow-up shadow queries based on human's choices.
+
+        Called from _confirm_activation before the action executes.
+
+        Q2 — "same action": force the AI to use the human's unit with the
+             human's action type, let it pick destination (advance/rush only)
+             and shoot target from there (advance only).
+        Q3 — "same position": force the AI to use the human's unit at the
+             human's actual post-move position, let it pick shoot target
+             (hold or advance only).
+
+        Returns dict with keys shadow_dest, shadow_dest_shoot, shadow_pos_shoot.
+        """
+        import torch
+        import torch.nn.functional as F
+        import numpy as np
+        from ml_features import (
+            encode_state_tactical, MAX_UNITS_PER_SIDE,
+        )
+        from ml_integration_tactical import (
+            compute_destination_candidates, compute_destination_features,
+            compute_post_move_rel, compute_in_range_mask,
+            _get_model_space_positions, _flip_x, _flip_y,
+            MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+            NUM_MOVE_TYPES,
+        )
+
+        result = {
+            'shadow_dest': None,
+            'shadow_dest_shoot': None,
+            'shadow_pos_shoot': None,
+        }
+
+        unit_idx = self._selected_unit_idx
+        action = self._chosen_action
+        if unit_idx is None or action is None:
+            return result
+        unit = self.units_a[unit_idx]
+        player = "A"
+
+        action_to_move = {
+            "hold": MOVE_HOLD, "advance": MOVE_ADVANCE,
+            "rush": MOVE_RUSH, "charge": MOVE_CHARGE,
+        }
+        move_type = action_to_move.get(action)
+        if move_type is None or move_type == MOVE_CHARGE:
+            return result  # charge is a single combined action, no sequential queries
+
+        # Determine human's post-move centre BEFORE we undo any movement.
+        # For advance the unit is already at the advanced position (via _move_to_shooting).
+        # For rush the movement hasn't happened yet — use the goal as a proxy.
+        # For hold the unit hasn't moved.
+        if action == "advance" and self._saved_positions_before_move is not None:
+            human_post_cx, human_post_cy = unit.centre()
+        elif action == "rush" and self._move_goal is not None:
+            human_post_cx = float(self._move_goal[0])
+            human_post_cy = float(self._move_goal[1])
+        else:
+            human_post_cx, human_post_cy = unit.centre()
+
+        # Snapshot current state (for advance, unit is at advanced position)
+        snap = snapshot_game_state(self.units_a, self.units_b, self.board)
+
+        # For advance, temporarily undo the movement so queries see the pre-move state
+        if action == "advance" and self._saved_positions_before_move is not None:
+            _restore_unit_positions(unit, self._saved_positions_before_move, self.board)
+
+        try:
+            with torch.no_grad():
+                # Encode pre-move state
+                state_vec = encode_state_tactical(
+                    self.units_a, self.units_b, self.round_num + 1,
+                    self.board, player,
+                    friendly_ranged_matchups=self._fr_a,
+                    friendly_melee_matchups=self._fm_a,
+                    enemy_ranged_matchups=self._fr_b,
+                    enemy_melee_matchups=self._fm_b,
+                    total_friendly_points=self._pts_a,
+                    total_enemy_points=self._pts_b,
+                )
+
+                alive_mask = torch.tensor([
+                    (i < len(self.units_a)
+                     and self.units_a[i].models_alive > 0
+                     and not self.units_a[i].activated)
+                    for i in range(MAX_UNITS_PER_SIDE)
+                ], dtype=torch.bool)
+
+                enemy_alive_list = [
+                    (i < len(self.units_b)
+                     and self.units_b[i].models_alive > 0)
+                    for i in range(MAX_UNITS_PER_SIDE)
+                ]
+                enemy_alive_mask = torch.tensor(enemy_alive_list, dtype=torch.bool)
+                enemy_alive_np = np.array(enemy_alive_list, dtype=np.bool_)
+
+                enemy_positions_ms = _get_model_space_positions(self.units_b, player)
+
+                max_wr = max(
+                    (w.range_inches for w in unit.unit.weapons if not w.melee),
+                    default=0.0,
+                )
+
+                # ── Q2: AI picks destination given human's unit + action ──
+                if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+                    enemy_pos_set: set[tuple[int, int]] = set()
+                    for eu in self.units_b:
+                        if eu.models_alive > 0:
+                            for pos in eu.alive_positions():
+                                enemy_pos_set.add(pos)
+
+                    candidates, cand_mask = compute_destination_candidates(
+                        unit, move_type, self.board, enemy_pos_set, player)
+
+                    budget = (float(unit.unit.advance_distance)
+                              if move_type == MOVE_ADVANCE
+                              else float(unit.unit.rush_distance))
+                    dest_feats = compute_destination_features(
+                        candidates, cand_mask, unit, unit_idx, player,
+                        self.units_b, enemy_alive_np,
+                        self._fr_a, self._fr_b, self._fm_b, budget)
+
+                    dest_features_t = torch.from_numpy(dest_feats).float()
+                    dest_mask_t = torch.from_numpy(cand_mask)
+
+                    move_onehot = F.one_hot(
+                        torch.tensor(move_type), NUM_MOVE_TYPES).float()
+                    h_trunk, units_trunk, _ = self.ml_model.trunk(
+                        state_vec.unsqueeze(0))
+                    uf = self.ml_model._extract_unit_features(
+                        units_trunk, unit_idx).detach()
+                    h_uf_m = torch.cat(
+                        [h_trunk, uf, move_onehot.unsqueeze(0)], dim=-1)
+                    dest_logits = self.ml_model.compute_dest_logits(
+                        h_uf_m,
+                        dest_features_t.unsqueeze(0),
+                        dest_mask_t.unsqueeze(0),
+                    ).squeeze(0)
+
+                    if cand_mask.any():
+                        dest_idx = int(dest_logits.argmax().item())
+                        ai_dest_col = int(candidates[dest_idx, 0])
+                        ai_dest_row = int(candidates[dest_idx, 1])
+                        result['shadow_dest'] = (ai_dest_col, ai_dest_row)
+
+                        # From AI's chosen destination, get its shoot target
+                        # (advance only — rush can't shoot)
+                        if move_type == MOVE_ADVANCE:
+                            px, py = float(ai_dest_col), float(ai_dest_row)
+                            pmr = compute_post_move_rel(
+                                px, py, enemy_positions_ms)
+                            out_q2 = self.ml_model(
+                                state_vec, alive_mask, enemy_alive_mask,
+                                forced_unit_idx=unit_idx,
+                                post_move_rel=pmr)
+                            srm = compute_in_range_mask(
+                                pmr, float(max_wr), enemy_alive_mask)
+                            masked = out_q2.shoot_target_logits.masked_fill(
+                                ~srm, float('-inf'))
+                            if srm.any():
+                                si = int(masked.argmax().item())
+                                if (si < len(self.units_b)
+                                        and self.units_b[si].models_alive > 0):
+                                    result['shadow_dest_shoot'] = self.labels[
+                                        self.unit_to_idx[id(self.units_b[si])]]
+
+                # ── Q3: AI picks shoot target from human's position ──
+                if move_type in (MOVE_HOLD, MOVE_ADVANCE):
+                    hmx, hmy = human_post_cx, human_post_cy
+                    pmr_human = compute_post_move_rel(
+                        hmx, hmy, enemy_positions_ms)
+                    out_q3 = self.ml_model(
+                        state_vec, alive_mask, enemy_alive_mask,
+                        forced_unit_idx=unit_idx,
+                        post_move_rel=pmr_human)
+                    srm = compute_in_range_mask(
+                        pmr_human, float(max_wr), enemy_alive_mask)
+                    masked = out_q3.shoot_target_logits.masked_fill(
+                        ~srm, float('-inf'))
+                    if srm.any():
+                        si = int(masked.argmax().item())
+                        if (si < len(self.units_b)
+                                and self.units_b[si].models_alive > 0):
+                            result['shadow_pos_shoot'] = self.labels[
+                                self.unit_to_idx[id(self.units_b[si])]]
+        finally:
+            restore_game_state(snap, self.units_a, self.units_b, self.board)
+
+        return result
+
     # ── Shared helpers for AI suggestion callbacks ───────────────
 
     def _ai_decision_kwargs(self, player: str) -> dict:
@@ -2098,6 +2302,8 @@ class PlayViewer:
             "shadow_unit", "shadow_action", "shadow_reason",
             "shadow_charge_target", "shadow_shoot_target",
             "shadow_value", "diverged",
+            "shadow_dest", "shadow_dest_shoot_target",
+            "shadow_pos_shoot_target",
         ]
 
         import csv as csv_mod
@@ -2130,6 +2336,10 @@ class PlayViewer:
                     "shadow_value": (f"{d.shadow_value:.4f}"
                                      if d.shadow_value is not None else ""),
                     "diverged": d.diverged,
+                    "shadow_dest": (f"{d.shadow_dest[0]},{d.shadow_dest[1]}"
+                                    if d.shadow_dest else ""),
+                    "shadow_dest_shoot_target": d.shadow_dest_shoot_target or "",
+                    "shadow_pos_shoot_target": d.shadow_pos_shoot_target or "",
                 })
 
         # ── JSON: full game snapshot ──────────────────────────────
@@ -2181,6 +2391,9 @@ class PlayViewer:
                     "shadow_shoot_target": d.shadow_shoot_target,
                     "shadow_value": d.shadow_value,
                     "diverged": d.diverged,
+                    "shadow_dest": list(d.shadow_dest) if d.shadow_dest else None,
+                    "shadow_dest_shoot_target": d.shadow_dest_shoot_target,
+                    "shadow_pos_shoot_target": d.shadow_pos_shoot_target,
                 }
                 for d in self._diag_log
             ],
@@ -2556,7 +2769,7 @@ class DiagnosticReview:
         detail_frame = ttk.LabelFrame(self.win, text="Selected Activation Detail")
         detail_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
         self.detail_text = tk.Text(detail_frame, font=("Consolas", 9),
-                                   height=5, wrap=tk.WORD, state=tk.DISABLED,
+                                   height=8, wrap=tk.WORD, state=tk.DISABLED,
                                    bg="#1e1e1e", fg="white")
         self.detail_text.pack(fill=tk.X, padx=5, pady=3)
 
@@ -2627,6 +2840,20 @@ class DiagnosticReview:
                 lines.append(f"  reason: {d.shadow_reason}")
             if d.shadow_value is not None:
                 lines.append(f"  AI's pre-action value est: {d.shadow_value:+.3f}")
+
+        # Sequential shadow: what AI would do given your choices
+        if d.player == "A":
+            has_seq = (d.shadow_dest or d.shadow_dest_shoot_target
+                       or d.shadow_pos_shoot_target)
+            if has_seq:
+                lines.append("")
+                lines.append("Sequential shadow (given your choices):")
+                if d.shadow_dest:
+                    lines.append(f"  If AI {d.action}d your unit: move to ({d.shadow_dest[0]}, {d.shadow_dest[1]})")
+                    if d.shadow_dest_shoot_target:
+                        lines.append(f"    ...then shoot: {d.shadow_dest_shoot_target}")
+                if d.shadow_pos_shoot_target:
+                    lines.append(f"  From your position, AI would shoot: {d.shadow_pos_shoot_target}")
 
         self.detail_text.configure(state=tk.NORMAL)
         self.detail_text.delete("1.0", tk.END)
