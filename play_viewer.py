@@ -51,8 +51,10 @@ class _ActivationDiag:
     player: str                       # "A" (human) or "B" (AI)
     unit_name: str
     action: str                       # "hold" / "advance" / "rush" / "charge"
-    value_before: float               # model's value estimate before activation
-    value_after: float                # model's value estimate after activation
+    shoot_target_name: str | None = None   # what the human actually shot
+    charge_target_name: str | None = None  # what the human actually charged
+    value_before: float = 0.0         # model's value estimate before activation
+    value_after: float = 0.0          # model's value estimate after activation
     # Shadow AI fields (human turns only)
     shadow_unit_name: str | None = None
     shadow_action: str | None = None
@@ -1567,12 +1569,22 @@ class PlayViewer:
         value_after = self._get_value_estimate("A")
         shadow = self._shadow_recommendation
         value_before = shadow['value_before'] if shadow else 0.0
+        # Resolve human's actual shoot/charge target names
+        human_shoot_name = None
+        if self._shoot_target is not None and self._shoot_target.models_alive >= 0:
+            human_shoot_name = self.labels[self.unit_to_idx[id(self._shoot_target)]]
+        human_charge_name = None
+        if self._charge_target is not None:
+            human_charge_name = self.labels[self.unit_to_idx[id(self._charge_target)]]
+
         diag = _ActivationDiag(
             frame_idx=len(self.frames) - 1,
             round_num=self.round_num + 1,
             player="A",
             unit_name=self.labels[self._selected_unit_idx],
             action=action,
+            shoot_target_name=human_shoot_name,
+            charge_target_name=human_charge_name,
             value_before=value_before,
             value_after=value_after,
         )
@@ -2298,6 +2310,7 @@ class PlayViewer:
             "planning", "planning_params",
             "army_a", "army_b",
             "round", "player", "unit", "action",
+            "shoot_target", "charge_target",
             "value_before", "value_after", "value_delta",
             "shadow_unit", "shadow_action", "shadow_reason",
             "shadow_charge_target", "shadow_shoot_target",
@@ -2325,6 +2338,8 @@ class PlayViewer:
                     "player": d.player,
                     "unit": d.unit_name,
                     "action": d.action,
+                    "shoot_target": d.shoot_target_name or "",
+                    "charge_target": d.charge_target_name or "",
                     "value_before": f"{d.value_before:.4f}",
                     "value_after": f"{d.value_after:.4f}",
                     "value_delta": f"{d.value_after - d.value_before:.4f}",
@@ -2381,6 +2396,8 @@ class PlayViewer:
                     "player": d.player,
                     "unit": d.unit_name,
                     "action": d.action,
+                    "shoot_target": d.shoot_target_name,
+                    "charge_target": d.charge_target_name,
                     "value_before": d.value_before,
                     "value_after": d.value_after,
                     "value_delta": d.value_after - d.value_before,
@@ -2828,6 +2845,10 @@ class DiagnosticReview:
 
         lines = [f"Round {d.round_num} — {'You' if d.player == 'A' else 'AI'} — {d.unit_name}"]
         lines.append(f"Action: {d.action}  |  Value: {d.value_before:+.3f} \u2192 {d.value_after:+.3f}  (\u0394 = {d.value_after - d.value_before:+.3f})")
+        if d.shoot_target_name:
+            lines.append(f"You shot: {d.shoot_target_name}")
+        if d.charge_target_name:
+            lines.append(f"You charged: {d.charge_target_name}")
 
         if d.player == "A" and d.shadow_unit_name:
             lines.append("")
@@ -2853,7 +2874,11 @@ class DiagnosticReview:
                     if d.shadow_dest_shoot_target:
                         lines.append(f"    ...then shoot: {d.shadow_dest_shoot_target}")
                 if d.shadow_pos_shoot_target:
-                    lines.append(f"  From your position, AI would shoot: {d.shadow_pos_shoot_target}")
+                    human_shot = d.shoot_target_name or "(nothing)"
+                    if d.shadow_pos_shoot_target == human_shot:
+                        lines.append(f"  From your position, AI would also shoot: {d.shadow_pos_shoot_target}")
+                    else:
+                        lines.append(f"  From your position, AI would shoot: {d.shadow_pos_shoot_target}  (you shot: {human_shot})")
 
         self.detail_text.configure(state=tk.NORMAL)
         self.detail_text.delete("1.0", tk.END)
