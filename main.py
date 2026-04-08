@@ -741,8 +741,8 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
 
 if __name__ == "__main__":
     #ml_train(num_batches=300000, batch_size=512, time_limit=(180), model_type="tactical", use_c_ext=True, restart_training=True, memory_max="14G", memory_swap_max="40G", worker_count = 4, planning_rate = 0, minibatch_size = 128, blend_ratio = 0.25)
-    #ml_train(num_batches=300000, batch_size=512, time_limit=(300), model_type="tactical", use_c_ext=True, restart_training=False, memory_max="14G", memory_swap_max="40G", worker_count = 4, planning_rate = 0, minibatch_size = 128, blend_ratio = 0.25)
+    ml_train(num_batches=300000, batch_size=512, time_limit=(540), model_type="tactical", use_c_ext=True, restart_training=False, memory_max="14G", memory_swap_max="40G", worker_count = 4, planning_rate = 0, minibatch_size = 128, blend_ratio = 0.25)
     #ml_train(num_batches=3, batch_size=256, time_limit=2, model_type="tactical", use_c_ext=False)  # pure Python
     #run_list_evolution(graphic=True, mode="objectives", enforce_forceorg=True, use_ml=True, ml_batch_tactical=False, restart_evolution=False, use_c_ext=True)
-    from play_viewer import play_interactive
-    play_interactive()
+    #from play_viewer import play_interactive
+    #play_interactive()

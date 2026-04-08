@@ -524,16 +524,17 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                     check_morale(target)
                     _sync_dead_models(target, board)
 
-            # Check if opponent army destroyed
-            opp_alive = any(u.models_alive > 0 for u in opp_units)
-            if not opp_alive:
-                break
-
             current_is_a = not current_is_a
 
         # End of round: check objective control (objectives mode only)
         if not is_kill_points:
             board.update_objectives(units_a, units_b)
+
+        # If one side is completely destroyed, end the game after this round
+        a_alive = any(u.models_alive > 0 for u in units_a)
+        b_alive = any(u.models_alive > 0 for u in units_b)
+        if not a_alive or not b_alive:
+            break
 
     # Game end scoring
     if is_kill_points:
@@ -779,14 +780,16 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                     check_morale(target)
                     _sync_dead_models(target, board)
 
-            opp_alive = any(u.models_alive > 0 for u in opp_units)
-            if not opp_alive:
-                break
-
             current_is_a = not current_is_a
 
         if not is_kill_points:
             board.update_objectives(units_a, units_b)
+
+        # If one side is completely destroyed, end the game after this round
+        a_alive = any(u.models_alive > 0 for u in units_a)
+        b_alive = any(u.models_alive > 0 for u in units_b)
+        if not a_alive or not b_alive:
+            break
 
     if is_kill_points:
         a_kill_pts = sum(u.unit.points for u in units_b if u.models_alive <= 0)

@@ -1071,8 +1071,8 @@ class PlayViewer:
 
         self._record_frame(desc)
 
-        if self.round_num >= 3:
-            # Game over after round 4
+        if self.round_num >= 3 or self._check_game_over():
+            # Game over after round 4, or if one side is completely destroyed
             self._end_game()
         else:
             self.phase = PHASE_BETWEEN_ROUNDS
@@ -1612,11 +1612,6 @@ class PlayViewer:
         else:
             self.stats_var.set("(no combat this activation)")
 
-        # Check game over
-        if self._check_game_over():
-            self._end_game()
-            return
-
         # Now run AI turn
         self.current_is_a = False
         self._preview_positions = None
@@ -1734,10 +1729,6 @@ class PlayViewer:
 
     def _after_resolution(self):
         """After viewing resolution frames, determine what's next."""
-        if self._check_game_over():
-            self._end_game()
-            return
-
         if self._check_round_over():
             self._end_round()
             return
