@@ -57,13 +57,11 @@ def _place_unit_at(unit: UnitState, col: int, row: int, board: Board,
                     break
                 if offset > 0 and abs(dc) != offset and abs(dr_mult) != offset:
                     continue
-                nc = col + dc
-                # For backward expansion, prefer going backward
-                nr = row + dr_mult * (-row_dir if dr_mult != 0 else 0)
-                if offset == 0:
-                    nr = row
-                else:
-                    nr = row + dr_mult
+                # For mirror-symmetric spreading between sides, B's dc and
+                # dr_mult are inverted so the spiral expands in the opposite
+                # direction. row_dir is -1 for A, +1 for B.
+                nc = col + dc * -row_dir
+                nr = row + dr_mult * -row_dir
                 if board.is_free(nc, nr):
                     # Check deployment zone bounds
                     if is_player_a and not (DEPLOY_A_MIN_ROW <= nr <= max(DEPLOY_A_MAX_ROW, SCOUT_A_ROW)):

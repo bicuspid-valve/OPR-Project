@@ -37,7 +37,7 @@ from ml_features import (
 
 from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
-    NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+    NUM_MOVE_TYPES, MOVE_MOVE, MOVE_CHARGE,
     POST_MOVE_REL_FEATURES,
 )
 import fast_core as _fc
@@ -46,7 +46,7 @@ import fast_core as _fc
 # Constants
 # ---------------------------------------------------------------------------
 
-MOVE_TYPE_NAMES = ["hold", "advance", "rush", "charge"]
+MOVE_TYPE_NAMES = ["move", "charge"]
 
 _INV_BOARD_DIAG = 1.0 / BOARD_DIAG
 
@@ -148,13 +148,14 @@ class InferenceRequest:
 class InferenceResult:
     """Fully-decoded decision sent back to simulate_game by the coordinator."""
     unit_idx: int                       # selected friendly slot
-    move_type: int                      # 0=hold, 1=advance, 2=rush, 3=charge
+    move_type: int                      # 0=move, 1=charge
     dest_col: int                       # selected hex column (game-space)
     dest_row: int                       # selected hex row (game-space)
     charge_target_idx: int              # enemy slot
     shoot_target_idx: int               # enemy slot
     target_ranking: list[int]           # shoot target ranking (descending)
     value: float
+    is_advance_reachable: bool = True   # whether selected dest is advance-reachable (can shoot)
 
 
 # ---------------------------------------------------------------------------
@@ -262,41 +263,59 @@ def compute_in_range_mask_batched(
 
 def compute_destination_candidates(
     unit: UnitState,
-    move_type: int,
     board: Board,
     enemy_positions: set[tuple[int, int]],
     player: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute padded destination candidate set via Dijkstra reachable set.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute unified destination candidate set via Dijkstra (rush budget).
+
+    Each candidate is flagged as advance-reachable (within advance budget,
+    can shoot after moving) or rush-only (beyond advance budget, cannot shoot).
+    The centroid (index 0) is always advance-reachable ("hold" equivalent).
 
     Returns:
         candidates: (MAX_DEST_CANDIDATES, 2) int array of (col, row) in game-space
         mask: (MAX_DEST_CANDIDATES,) bool array
+        advance_reachable: (MAX_DEST_CANDIDATES,) bool array
     """
     cx, cy = unit.centre()
     centroid = (int(round(cx)), int(round(cy)))
 
-    if move_type == MOVE_ADVANCE:
-        budget = float(unit.unit.advance_distance)
-    elif move_type == MOVE_RUSH:
-        budget = float(unit.unit.rush_distance)
-    else:
-        # Should not be called for hold/charge
-        budget = 0.0
+    rush_budget = float(unit.unit.rush_distance)
+    advance_budget = float(unit.unit.advance_distance)
 
     from movement import build_exclusion_grid
     exclusion_grid = build_exclusion_grid(enemy_positions)
 
+    flying = bool(unit.unit.flying)
+
+    # Full candidate set: Dijkstra with rush budget
     reachable = _fc.fast_dijkstra_reachable_set(
-        centroid, budget, board.occupancy, enemy_positions,
-        is_charge=False, flying=bool(unit.unit.flying),
+        centroid, rush_budget, board.occupancy, enemy_positions,
+        is_charge=False, flying=flying,
         exclusion_grid=exclusion_grid, cols=COLS, rows=ROWS,
     )  # (N, 2) int32
+
+    # Advance-reachable subset: Dijkstra with advance budget
+    if advance_budget >= rush_budget:
+        # All rush-reachable cells are also advance-reachable
+        adv_reachable_set: set[tuple[int, int]] | None = None  # means "all"
+    elif advance_budget > 0:
+        adv_cells = _fc.fast_dijkstra_reachable_set(
+            centroid, advance_budget, board.occupancy, enemy_positions,
+            is_charge=False, flying=flying,
+            exclusion_grid=exclusion_grid, cols=COLS, rows=ROWS,
+        )
+        adv_reachable_set = set()
+        for r in range(len(adv_cells)):
+            adv_reachable_set.add((int(adv_cells[r, 0]), int(adv_cells[r, 1])))
+    else:
+        # advance_budget == 0: only centroid is advance-reachable
+        adv_reachable_set = set()
 
     # Prepend centroid as candidate 0 (always valid — "stay put" option)
     centroid_arr = np.array([[centroid[0], centroid[1]]], dtype=np.int32)
     if len(reachable) > 0:
-        # Remove centroid from Dijkstra results if already present to avoid duplicate
         not_centroid = ~((reachable[:, 0] == centroid[0]) & (reachable[:, 1] == centroid[1]))
         reachable = reachable[not_centroid]
         combined = np.concatenate([centroid_arr, reachable], axis=0)
@@ -304,12 +323,28 @@ def compute_destination_candidates(
         combined = centroid_arr
 
     n_valid = min(len(combined), MAX_DEST_CANDIDATES)
-    candidates = np.zeros((MAX_DEST_CANDIDATES, 2), dtype=np.int32)
-    mask = np.zeros(MAX_DEST_CANDIDATES, dtype=np.bool_)
-    candidates[:n_valid] = combined[:n_valid]
-    mask[:n_valid] = True
 
-    return candidates, mask
+    # Return tight arrays (no padding to MAX_DEST_CANDIDATES — callers pad to
+    # batch-max as needed, avoiding wasteful 4096-wide allocations).
+    candidates = np.zeros((n_valid, 2), dtype=np.int32)
+    mask = np.ones(n_valid, dtype=np.bool_)
+    advance_reachable = np.zeros(n_valid, dtype=np.bool_)
+
+    candidates[:] = combined[:n_valid]
+
+    # Mark advance-reachable candidates
+    if adv_reachable_set is None:
+        # All candidates are advance-reachable
+        advance_reachable[:] = True
+    else:
+        # Centroid (index 0) is always advance-reachable
+        advance_reachable[0] = True
+        for i in range(1, n_valid):
+            c, r = int(combined[i, 0]), int(combined[i, 1])
+            if (c, r) in adv_reachable_set:
+                advance_reachable[i] = True
+
+    return candidates, mask, advance_reachable
 
 
 @dataclass
@@ -381,17 +416,22 @@ def compute_destination_features(
     *,
     unit_centre: tuple[float, float] | None = None,
     unit_alive_frac: float | None = None,
+    advance_reachable: np.ndarray | None = None,  # (MAX_DEST_CANDIDATES,) bool
 ) -> np.ndarray:
     """Compute per-hex features for all candidates (vectorized).
 
     Returns: (MAX_DEST_CANDIDATES, DEST_FEATURE_DIM) float32 array.
     All spatial features use model-space (Player B flipped).
 
+    Feature [75] is the advance-reachable flag (1.0 = can shoot from here,
+    0.0 = rush-only). Offensive value features [15:25] are zeroed for
+    rush-only candidates.
+
     If *unit_centre* and *unit_alive_frac* are provided, *unit* may be None
     (used during PPO replay where UnitState objects are not available).
     """
     _ensure_obj_lookup()
-    features = np.zeros((MAX_DEST_CANDIDATES, DEST_FEATURE_DIM), dtype=np.float32)
+    features = np.zeros((len(mask), DEST_FEATURE_DIM), dtype=np.float32)
 
     n_valid = int(mask.sum())
     if n_valid == 0:
@@ -523,6 +563,19 @@ def compute_destination_features(
         # +4: has_activated
         features[:n_valid, base + 4] = enemy_act[ei]
 
+    # --- 3.5 Advance-reachable flag (1 feature) [75] ---
+    if advance_reachable is not None:
+        ar_np = np.asarray(advance_reachable, dtype=np.bool_)
+        features[:n_valid, 75] = ar_np[:n_valid].astype(np.float32)
+        # Zero out offensive value features for rush-only candidates
+        rush_only_mask = ~ar_np[:n_valid]
+        if rush_only_mask.any():
+            rush_only_indices = np.nonzero(rush_only_mask)[0]
+            features[rush_only_indices, 15:25] = 0.0
+    else:
+        # Legacy fallback: assume all advance-reachable
+        features[:n_valid, 75] = 1.0
+
     return features
 
 
@@ -584,6 +637,7 @@ def execute_decoded_decision(
     dest: tuple[float, float] | None,
     charge_target_idx: int,
     shoot_target_idx: int,
+    is_advance_reachable: bool = True,
 ) -> tuple[str, tuple[int, int] | None, UnitState | None, str]:
     """Translate decoded model decision into (action, goal_position, charge_target, reason).
 
@@ -591,10 +645,11 @@ def execute_decoded_decision(
     ----------
     unit : the activated unit
     enemies : enemy unit list
-    move_type : 0=hold, 1=advance, 2=rush, 3=charge
-    dest : (x, y) destination for advance/rush; None for hold/charge
+    move_type : 0=move, 1=charge
+    dest : (x, y) destination for move; None for charge
     charge_target_idx : enemy slot for charge
-    shoot_target_idx : enemy slot for shooting (hold/advance)
+    shoot_target_idx : enemy slot for shooting (advance-reachable dest)
+    is_advance_reachable : whether the chosen dest is advance-reachable (can shoot)
     """
     # Artillery: must hold
     if unit.unit.artillery:
@@ -603,9 +658,6 @@ def execute_decoded_decision(
     alive_enemies = [e for e in enemies if e.models_alive > 0]
     if not alive_enemies:
         return ("hold", None, None, "no enemies alive")
-
-    if move_type == MOVE_HOLD:
-        return ("hold", None, None, "model chose hold")
 
     if move_type == MOVE_CHARGE:
         if charge_target_idx < len(enemies) and enemies[charge_target_idx].models_alive > 0:
@@ -625,17 +677,20 @@ def execute_decoded_decision(
             return ("rush", tpos, None, "charge target dead, rushing nearest")
         return ("hold", None, None, "charge target dead, no enemies")
 
-    if move_type == MOVE_ADVANCE:
-        if dest is not None:
-            goal = (int(round(dest[0])), int(round(dest[1])))
+    # MOVE_MOVE: dest determines hold/advance/rush
+    if move_type == MOVE_MOVE:
+        if dest is None:
+            return ("hold", None, None, "move with no destination")
+        goal = (int(round(dest[0])), int(round(dest[1])))
+        # Check if dest is unit's current position (hold)
+        cx, cy = unit.centre()
+        centroid = (int(round(cx)), int(round(cy)))
+        if goal == centroid:
+            return ("hold", None, None, "model chose hold (dest=centroid)")
+        if is_advance_reachable:
             return ("advance", goal, None, "model chose advance")
-        return ("hold", None, None, "advance with no destination")
-
-    if move_type == MOVE_RUSH:
-        if dest is not None:
-            goal = (int(round(dest[0])), int(round(dest[1])))
+        else:
             return ("rush", goal, None, "model chose rush")
-        return ("hold", None, None, "rush with no destination")
 
     return ("hold", None, None, f"unknown move_type: {move_type}")
 
@@ -667,11 +722,12 @@ def decode_tactical_result(
     move_type = ir.move_type
 
     dest = None
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if move_type == MOVE_MOVE:
         dest = (float(ir.dest_col), float(ir.dest_row))
 
     action, goal, charge_target, reason = execute_decoded_decision(
         selected_unit, enemy_units, move_type, dest, ir.charge_target_idx, ir.shoot_target_idx,
+        is_advance_reachable=ir.is_advance_reachable,
     )
 
     return selected_unit, ir.target_ranking, action, goal, charge_target, reason
@@ -732,25 +788,30 @@ def batched_argmax_tactical(
 
     # Move type (argmax)
     h_uf = torch.cat([h, unit_features], dim=-1)
-    move_logits = model.move_type_head(h_uf)                                # (N, 4)
+    move_logits = model.move_type_head(h_uf)                                # (N, 2)
     # Mask charge when no enemy is in charge range
     no_chargeable = ~can_charge_batch.any(dim=-1)                           # (N,)
     move_logits = move_logits.clone()
     move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(no_chargeable, float('-inf'))
     move_indices = move_logits.argmax(dim=-1)                               # (N,)
-    move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()           # (N, 4)
+    move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()           # (N, 2)
 
-    h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)            # (N, H+UF+4)
+    h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)            # (N, H+UF+2)
 
-    # Destination pointer — build per-request candidates
-    # For batched eval without game state, use dest_features/dest_mask from request if available
-    dest_features_batch = torch.zeros(n, MAX_DEST_CANDIDATES, DEST_FEATURE_DIM)
-    dest_mask_batch = torch.zeros(n, MAX_DEST_CANDIDATES, dtype=torch.bool)
+    # Destination pointer — always runs for MOVE_MOVE
+    # Pad to batch-max candidate count (not global MAX_DEST_CANDIDATES)
+    _batch_max_dc = 1
+    if hasattr(requests[0], 'dest_features') and requests[0].dest_features is not None:
+        for r in requests:
+            _batch_max_dc = max(_batch_max_dc, r.dest_features.shape[0])
+    dest_features_batch = torch.zeros(n, _batch_max_dc, DEST_FEATURE_DIM)
+    dest_mask_batch = torch.zeros(n, _batch_max_dc, dtype=torch.bool)
     has_dest_data = False
     if hasattr(requests[0], 'dest_features') and requests[0].dest_features is not None:
         for i in range(n):
-            dest_features_batch[i] = requests[i].dest_features
-            dest_mask_batch[i] = requests[i].dest_mask
+            nc = requests[i].dest_features.shape[0]
+            dest_features_batch[i, :nc] = requests[i].dest_features
+            dest_mask_batch[i, :nc] = requests[i].dest_mask[:nc]
         has_dest_data = True
 
     if has_dest_data:
@@ -760,9 +821,9 @@ def batched_argmax_tactical(
         dest_indices = torch.zeros(n, dtype=torch.long)  # fallback to centroid (idx 0)
 
     # Charge target (argmax) — mask by alive AND chargeable
-    charge_logits = model.charge_target_head(h_uf_m)                        # (N, 10)
-    charge_logits = charge_logits.masked_fill(~enemy_alive_batch, float('-inf'))
-    charge_logits = charge_logits.masked_fill(~can_charge_batch, float('-inf'))
+    charge_logits = model.compute_charge_logits(
+        h, units, unit_indices, enemy_alive_batch, can_charge_batch,
+    )                                                                       # (N, 10)
     no_enemies = ~enemy_alive_batch.any(dim=-1)                             # (N,)
     charge_logits = charge_logits.masked_fill(no_enemies.unsqueeze(-1), 0.0)
     charge_indices = charge_logits.argmax(dim=-1)                           # (N,)
@@ -778,20 +839,22 @@ def batched_argmax_tactical(
     pmr_tensors: list[torch.Tensor] = []
     dest_cols: list[int] = []
     dest_rows: list[int] = []
+    adv_reachable_list: list[bool] = []
     for i in range(n):
         req = requests[i]
         uid = unit_list[i]
         mt = move_list[i]
 
         # Selected destination hex (game-space)
-        if mt in (MOVE_ADVANCE, MOVE_RUSH) and has_dest_data:
+        is_ar = True  # advance-reachable flag for selected dest
+        if mt == MOVE_MOVE and has_dest_data:
             didx = dest_idx_list[i]
-            dc = int(dest_features_batch[i, didx, 0].item()) if False else 0  # placeholder
-            dr = 0
             # Look up from request's candidate set
             if hasattr(req, 'dest_candidates') and req.dest_candidates is not None:
                 dc = int(req.dest_candidates[didx, 0])
                 dr = int(req.dest_candidates[didx, 1])
+                if hasattr(req, 'dest_advance_reachable') and req.dest_advance_reachable is not None:
+                    is_ar = bool(req.dest_advance_reachable[didx])
             else:
                 # Fallback: centroid
                 ucx, ucy = req.friendly_positions[uid]
@@ -800,7 +863,7 @@ def batched_argmax_tactical(
                     ucy = _flip_y(ucy)
                 dc, dr = int(round(ucx)), int(round(ucy))
         else:
-            # Hold/charge: use unit centroid
+            # Charge: use unit centroid
             ucx, ucy = req.friendly_positions[uid]
             if req.player == "B":
                 ucx = _flip_x(ucx)
@@ -809,27 +872,28 @@ def batched_argmax_tactical(
 
         dest_cols.append(dc)
         dest_rows.append(dr)
+        adv_reachable_list.append(is_ar)
 
         # Compute post_move_rel in model-space
         px, py = float(dc), float(dr)
         if req.player == "B":
             px = _flip_x(px)
             py = _flip_y(py)
-        if mt not in (MOVE_ADVANCE, MOVE_RUSH):
+        if mt != MOVE_MOVE:
             px, py = req.friendly_positions[uid]
 
         pmr = compute_post_move_rel(px, py, req.enemy_positions)
         pmr_tensors.append(pmr)
 
-    # Batched shoot target head with post-move features + in-range mask (pass 2)
+    # Batched shoot pointer head with post-move features + in-range mask (pass 2)
     pmr_batch = torch.stack(pmr_tensors)                                    # (N, 30)
-    shoot_input = torch.cat([h, unit_features, move_onehot, pmr_batch], dim=-1)
-    shoot_logits = model.shoot_target_head(shoot_input)                     # (N, 10)
-    # Mask by alive AND in-range
     max_wr_list = [requests[i].max_weapon_ranges[unit_list[i]] for i in range(n)]
     max_wr_t = torch.tensor(max_wr_list, dtype=torch.float32)
     shoot_mask_batch = compute_in_range_mask_batched(pmr_batch, max_wr_t, enemy_alive_batch)
-    shoot_logits = shoot_logits.masked_fill(~shoot_mask_batch, float('-inf'))
+    shoot_logits = model.compute_shoot_logits(
+        h, units, unit_indices, pmr_batch, enemy_alive_batch,
+        shoot_range_mask=shoot_mask_batch,
+    )                                                                       # (N, 10)
     no_shootable = ~shoot_mask_batch.any(dim=-1)
     shoot_logits = shoot_logits.masked_fill(no_shootable.unsqueeze(-1), 0.0)
     shoot_indices = shoot_logits.argmax(dim=-1)                             # (N,)
@@ -854,6 +918,7 @@ def batched_argmax_tactical(
             shoot_target_idx=shoot_list[i],
             target_ranking=ranking,
             value=val_list[i],
+            is_advance_reachable=adv_reachable_list[i],
         ))
 
     return results
@@ -941,21 +1006,22 @@ def apply_tactical_model(
     selected_idx = int(out.unit_logits.argmax().item())
     selected_unit = friendly_units[selected_idx]
 
-    # Decode move type — Shaken units must hold
+    # Decode move type — Shaken units must hold (force MOVE_MOVE)
     is_shaken = extract_is_shaken(state_vec, selected_idx).item()
     if is_shaken:
-        move_type = MOVE_HOLD
+        move_type = MOVE_MOVE
     else:
         move_type = int(out.move_logits.argmax().item())
 
-    # --- Destination pointer (advance/rush only) ---
+    # --- Destination pointer (always for MOVE_MOVE) ---
     unit_cx_ms, unit_cy_ms = friendly_positions[selected_idx]
     dest_col, dest_row = int(round(unit_cx_ms)), int(round(unit_cy_ms))
     dest_n_candidates = 0
     dest_top3 = []
     dest_entropy = 0.0
+    is_advance_reachable = True  # default for centroid / shaken
 
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if move_type == MOVE_MOVE and not is_shaken:
         # Build enemy position set for Dijkstra
         enemy_pos_set: set[tuple[int, int]] = set()
         for eu in enemy_units:
@@ -963,15 +1029,14 @@ def apply_tactical_model(
                 for pos in eu.alive_positions():
                     enemy_pos_set.add(pos)
 
-        candidates, cand_mask = compute_destination_candidates(
-            selected_unit, move_type, board, enemy_pos_set, player)
-        budget = (float(selected_unit.unit.advance_distance) if move_type == MOVE_ADVANCE
-                  else float(selected_unit.unit.rush_distance))
+        candidates, cand_mask, adv_reachable = compute_destination_candidates(
+            selected_unit, board, enemy_pos_set, player)
+        budget = float(selected_unit.unit.rush_distance)
         dest_feats = compute_destination_features(
             candidates, cand_mask, selected_unit, selected_idx, player,
             enemy_units, enemy_alive_np,
             friendly_ranged_matchups, enemy_ranged_matchups, enemy_melee_matchups,
-            budget)
+            budget, advance_reachable=adv_reachable)
 
         dest_features_t = torch.from_numpy(dest_feats).float()
         dest_mask_t = torch.from_numpy(cand_mask)
@@ -988,6 +1053,7 @@ def apply_tactical_model(
         dest_col = int(candidates[dest_idx, 0])
         dest_row = int(candidates[dest_idx, 1])
         dest_n_candidates = int(cand_mask.sum())
+        is_advance_reachable = bool(adv_reachable[dest_idx])
 
         # Top-3 for diagnostics
         dest_probs = torch.softmax(dest_logits, dim=-1)
@@ -998,7 +1064,7 @@ def apply_tactical_model(
         dest_entropy = -(dest_probs * torch.log(dest_probs + 1e-8)).sum().item()
 
     # Compute post_move_rel from selected hex in model-space
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if move_type == MOVE_MOVE and not is_shaken:
         px, py = float(dest_col), float(dest_row)
         if player == "B":
             px = _flip_x(px)
@@ -1029,12 +1095,13 @@ def apply_tactical_model(
 
     # Compute destination in game-space
     dest = None
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if move_type == MOVE_MOVE:
         dest = (float(dest_col), float(dest_row))
 
     # Execute decision
     action, goal, charge_target, reason = execute_decoded_decision(
         selected_unit, enemy_units, move_type, dest, charge_target_idx, shoot_target_idx,
+        is_advance_reachable=is_advance_reachable,
     )
 
     # Assessment for viewer / diagnostics
@@ -1184,8 +1251,6 @@ def apply_tactical_model_sampling(
         move_logits[MOVE_CHARGE] = float('-inf')
     if is_shaken:
         move_logits = move_logits.clone()
-        move_logits[MOVE_ADVANCE] = float('-inf')
-        move_logits[MOVE_RUSH] = float('-inf')
         move_logits[MOVE_CHARGE] = float('-inf')
     move_probs = torch.softmax(move_logits, dim=-1)
     move_type = int(torch.multinomial(move_probs, 1).item())
@@ -1193,7 +1258,7 @@ def apply_tactical_model_sampling(
     move_onehot = F.one_hot(torch.tensor(move_type), NUM_MOVE_TYPES).float().unsqueeze(0)
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
 
-    # --- Destination pointer (sample, advance/rush only) ---
+    # --- Destination pointer (sample, MOVE_MOVE only) ---
     unit_cx_ms, unit_cy_ms = friendly_positions[selected_idx]
     dest_col, dest_row = int(round(unit_cx_ms)), int(round(unit_cy_ms))
     if player == "B":
@@ -1201,23 +1266,23 @@ def apply_tactical_model_sampling(
         dest_row_gs = int(round(_flip_y(unit_cy_ms)))
     else:
         dest_col_gs, dest_row_gs = dest_col, dest_row
+    _is_ar = True
 
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if move_type == MOVE_MOVE and not is_shaken:
         enemy_pos_set: set[tuple[int, int]] = set()
         for eu in enemy_units:
             if eu.models_alive > 0:
                 for pos in eu.alive_positions():
                     enemy_pos_set.add(pos)
 
-        candidates, cand_mask = compute_destination_candidates(
-            selected_unit, move_type, board, enemy_pos_set, player)
-        budget = (float(selected_unit.unit.advance_distance) if move_type == MOVE_ADVANCE
-                  else float(selected_unit.unit.rush_distance))
+        candidates, cand_mask, adv_reachable = compute_destination_candidates(
+            selected_unit, board, enemy_pos_set, player)
+        budget = float(selected_unit.unit.rush_distance)
         dest_feats = compute_destination_features(
             candidates, cand_mask, selected_unit, selected_idx, player,
             enemy_units, enemy_alive_np,
             friendly_ranged_matchups, enemy_ranged_matchups, enemy_melee_matchups,
-            budget)
+            budget, advance_reachable=adv_reachable)
 
         dest_features_t = torch.from_numpy(dest_feats).float().unsqueeze(0)
         dest_mask_t = torch.from_numpy(cand_mask).unsqueeze(0)
@@ -1226,9 +1291,10 @@ def apply_tactical_model_sampling(
         dest_idx = int(torch.distributions.Categorical(logits=dest_logits).sample().item())
         dest_col_gs = int(candidates[dest_idx, 0])
         dest_row_gs = int(candidates[dest_idx, 1])
+        _is_ar = bool(adv_reachable[dest_idx])
 
     # Compute post_move_rel from selected hex
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if move_type == MOVE_MOVE and not is_shaken:
         px, py = float(dest_col_gs), float(dest_row_gs)
         if player == "B":
             px = _flip_x(px)
@@ -1238,9 +1304,10 @@ def apply_tactical_model_sampling(
     post_move_rel = compute_post_move_rel(px, py, enemy_positions_ms).unsqueeze(0)
 
     # --- Charge target (sample) ---
-    charge_logits = model.charge_target_head(h_uf_m).squeeze(0)
-    charge_logits = charge_logits.masked_fill(~enemy_alive_mask, float('-inf'))
-    charge_logits = charge_logits.masked_fill(~can_charge_mask, float('-inf'))
+    charge_logits = model.compute_charge_logits(
+        h.squeeze(0), units.squeeze(0), selected_idx,
+        enemy_alive_mask, can_charge_mask,
+    )
     no_enemies = not enemy_alive_mask.any()
     no_chargeable = not (enemy_alive_mask & can_charge_mask).any()
     if no_enemies or no_chargeable:
@@ -1250,8 +1317,6 @@ def apply_tactical_model_sampling(
         charge_target_idx = int(torch.multinomial(charge_probs, 1).item())
 
     # --- Shoot target (sample) ---
-    shoot_input = torch.cat([h, unit_features, move_onehot, post_move_rel], dim=-1)
-    shoot_logits = model.shoot_target_head(shoot_input).squeeze(0)
     max_wr = max(
         (w.range_inches for w in selected_unit.unit.weapons if not w.melee),
         default=0.0,
@@ -1260,7 +1325,11 @@ def apply_tactical_model_sampling(
         post_move_rel.squeeze(0), float(max_wr), enemy_alive_mask)
     if is_shaken:
         shoot_range_mask = torch.zeros_like(shoot_range_mask)
-    shoot_logits = shoot_logits.masked_fill(~shoot_range_mask, float('-inf'))
+    shoot_logits = model.compute_shoot_logits(
+        h.squeeze(0), units.squeeze(0), selected_idx,
+        post_move_rel.squeeze(0), enemy_alive_mask,
+        shoot_range_mask=shoot_range_mask,
+    )
     no_shootable = not shoot_range_mask.any()
     if no_enemies or no_shootable:
         shoot_target_idx = 0
@@ -1271,11 +1340,12 @@ def apply_tactical_model_sampling(
     target_ranking = torch.argsort(shoot_logits, descending=True).tolist()
 
     dest = None
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if move_type == MOVE_MOVE:
         dest = (float(dest_col_gs), float(dest_row_gs))
 
     action, goal, charge_target, reason = execute_decoded_decision(
         selected_unit, enemy_units, move_type, dest, charge_target_idx, shoot_target_idx,
+        is_advance_reachable=_is_ar,
     )
 
     return selected_unit, target_ranking, action, goal, charge_target, reason, {}

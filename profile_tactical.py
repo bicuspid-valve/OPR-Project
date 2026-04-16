@@ -121,8 +121,7 @@ def profile_components():
 
     # --- 4. Full episode simulation (single game, no multiprocessing) ---
     print("\n--- 4. Single episode simulation ---")
-    from ml_training import _run_single_episode_tactical
-    from board import OBJECTIVES as BOARD_OBJECTIVES
+    from ml_training import _run_games_batched_tactical
 
     episode_times = []
     episode_step_counts = []
@@ -130,12 +129,12 @@ def profile_components():
         res_a2, res_b2, states_a2, states_b2, *_ = _generate_army_pair()
         sa_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_a2]
         sb_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_b2]
+        game_specs = [(res_a2, res_b2, sa_data, sb_data, "heuristic", -1, "random")]
 
         t0 = time.perf_counter()
-        traj, result, opp_type, _traj_b = _run_single_episode_tactical(
-            model, None, res_a2, res_b2, sa_data, sb_data, "heuristic", BOARD_OBJECTIVES,
-        )
+        results = _run_games_batched_tactical(model, game_specs, {})
         episode_times.append(time.perf_counter() - t0)
+        traj = results[0][0]
         episode_step_counts.append(len(traj))
 
     print(f"  Mean episode time: {statistics.mean(episode_times)*1000:.1f}ms")
@@ -153,15 +152,14 @@ def profile_components():
     model.train()
     # Collect some trajectories for replay test
     all_trajs = []
+    model.eval()
     for _ in range(5):
         res_a2, res_b2, states_a2, states_b2, *_ = _generate_army_pair()
         sa_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_a2]
         sb_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_b2]
-        model.eval()
-        traj, _, _, _ = _run_single_episode_tactical(
-            model, None, res_a2, res_b2, sa_data, sb_data, "heuristic", BOARD_OBJECTIVES,
-        )
-        all_trajs.append(traj)
+        game_specs = [(res_a2, res_b2, sa_data, sb_data, "heuristic", -1, "random")]
+        results = _run_games_batched_tactical(model, game_specs, {})
+        all_trajs.append(results[0][0])
     model.train()
 
     total_steps = sum(len(t) for t in all_trajs)

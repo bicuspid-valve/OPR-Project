@@ -17,7 +17,7 @@ from ml_features import (
     _flip_x, _flip_y,
 )
 from ml_model_tactical import (
-    TacticalModel, NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+    TacticalModel, NUM_MOVE_TYPES, MOVE_MOVE, MOVE_CHARGE,
 )
 from ml_integration_tactical import (
     MOVE_TYPE_NAMES, execute_decoded_decision, pick_target_from_ranking,
@@ -118,733 +118,6 @@ def _collect_episodes_shared_worker(args) -> list[tuple[list[TacticalActivationR
                                        planning_params=planning_params)
 
 
-def _collect_episodes_chunked_worker(args) -> list:
-    """Run multiple training episodes in one worker, rebuilding models only once.
-
-    Accepts (model_state_dict, opponent_state_dicts, game_specs, model_type) where
-    game_specs is a list of (res_a, res_b, states_a_data, states_b_data, opponent_type, opp_sd_index, army_type).
-    opp_sd_index is an index into opponent_state_dicts (or -1 for no opponent model).
-
-    Returns a list of (trajectory_steps, game_result, opponent_type, army_type) per game.
-    """
-    model_state_dict, opponent_state_dicts, game_specs, model_type = args
-
-    # Prevent torch thread oversubscription across workers
-    torch.set_num_threads(1)
-
-    from game import deploy_armies, _collect_enemy_positions, _sync_dead_models
-    from ai import (
-        pick_target, choose_action_and_goal, activation_order,
-        assign_objectives, reassign_roles,
-    )
-    from combat import resolve_shooting, check_morale, resolve_melee, resolve_impact, check_melee_morale
-    from movement import (
-        execute_movement, execute_charge_movement, execute_counter_charge,
-        post_melee_separation, consolidation_move,
-    )
-    from board import OBJECTIVES as BOARD_OBJECTIVES
-
-    # Build the training model once for the whole chunk
-    model = _make_model(model_type)
-    model.load_state_dict(model_state_dict, strict=False)
-    model.eval()
-
-    # Build opponent models once (deduplicated by index)
-    opp_models: dict[int, nn.Module] = {}
-    for spec in game_specs:
-        opp_sd_idx = spec[5]
-        if opp_sd_idx >= 0 and opp_sd_idx not in opp_models:
-            opp_model = _make_model(model_type)
-            opp_model.load_state_dict(opponent_state_dicts[opp_sd_idx], strict=False)
-            opp_model.eval()
-            opp_models[opp_sd_idx] = opp_model
-
-    results = []
-    for res_a, res_b, states_a_data, states_b_data, opponent_type, opp_sd_idx, army_type in game_specs:
-        opponent_model = opp_models.get(opp_sd_idx)
-        traj_a, result, opp_t, traj_b = _run_single_episode_tactical(
-            model, opponent_model, res_a, res_b, states_a_data, states_b_data,
-            opponent_type, BOARD_OBJECTIVES, army_type=army_type,
-        )
-        results.append((traj_a, result, opp_t, army_type))
-        if traj_b is not None:
-            results.append((traj_b, result, "mirror_b", army_type))
-    return results
-
-def _run_single_episode_tactical(model, opponent_model, res_a, res_b,
-                                  states_a_data, states_b_data, opponent_type,
-                                  BOARD_OBJECTIVES, shaping_scale=1.0,
-                                  army_type="random",
-                                  planning_rate=0.0, planning_params=None):
-    """Run one training episode with the tactical (per-activation) model.
-
-    Player A uses the new sequential-conditioned sampling path (§4.1) with
-    execute_decoded_decision + pick_target_from_ranking for action resolution.
-    """
-    from game import deploy_armies, _collect_enemy_positions, _sync_dead_models
-    from ai import (
-        pick_target, choose_action_and_goal, activation_order,
-        assign_objectives, reassign_roles,
-    )
-    from combat import resolve_shooting, check_morale, resolve_melee, resolve_impact, check_melee_morale
-    from movement import (
-        execute_movement, execute_charge_movement, execute_counter_charge,
-        post_melee_separation, consolidation_move,
-    )
-    from ml_integration_tactical import apply_tactical_model_sampling
-    is_mirror = (opponent_type == "selfplay_mirror")
-    opponent_type_idx = _get_opponent_type_idx(opponent_type, army_type)
-
-    # Rebuild UnitState objects
-    units_a = [UnitState(ru) for ru in res_a]
-    for u in units_a:
-        u.owner = "A"
-    units_b = [UnitState(ru) for ru in res_b]
-    for u in units_b:
-        u.owner = "B"
-
-    for u, (ai_role, combat_pref, assigned_obj) in zip(units_a, states_a_data):
-        u.ai_role = ai_role
-        u.combat_preference = combat_pref
-        u.assigned_objective = assigned_obj
-    for u, (ai_role, combat_pref, assigned_obj) in zip(units_b, states_b_data):
-        u.ai_role = ai_role
-        u.combat_preference = combat_pref
-        u.assigned_objective = assigned_obj
-
-    board = Board()
-    deploy_armies(units_a, units_b, board)
-
-    fr_a, fm_a = precompute_damage([u.unit for u in units_a], [u.unit for u in units_b])
-    fr_b, fm_b = precompute_damage([u.unit for u in units_b], [u.unit for u in units_a])
-    pts_a = sum(u.unit.points for u in units_a)
-    pts_b = sum(u.unit.points for u in units_b)
-
-    if opponent_type == "heuristic":
-        assign_objectives(units_b)
-
-    a_first = random.random() < 0.5
-    a_finished_first = a_first
-
-    trajectory: list[TacticalActivationRecord] = []
-    trajectory_b: list[TacticalActivationRecord] | None = [] if is_mirror else None
-    prev_a_kill_pts = 0.0
-    prev_b_kill_pts = 0.0
-    prev_b_fkp = 0.0
-    prev_b_ekp = 0.0
-
-    # Activation counters for countdown targets
-    _a_act_total = 0
-    _b_act_total = 0
-    _traj_a_counts: list[tuple[int, int]] = []   # (a_so_far, b_so_far) per A trajectory step
-    _traj_b_counts: list[tuple[int, int]] = []   # (b_so_far, a_so_far) per B trajectory step (mirror)
-
-    for round_num in range(1, 5):
-        for u in units_a + units_b:
-            u.activated = False
-            u.fatigued = False
-
-        current_is_a = a_first if round_num == 1 else a_finished_first
-
-        # Player B decisions at round start (heuristic only; tactical opponents
-        # and mirror decide per-activation, not per-round).
-        target_mults_b = None
-        if opponent_type == "heuristic":
-            reassign_roles(units_b)
-
-        # Track steps in this round for reward assignment
-        round_step_indices: list[int] = []
-        round_step_indices_b: list[int] = []
-
-        # --- Alternating activations ---
-        a_done = False
-        b_done = False
-        a_finished_first = True
-
-        # Per-activation state for ML-driven sides (set in decision block,
-        # consumed in execution block)
-        _a_tac_action: str = "hold"
-        _a_tac_goal: tuple[int, int] | None = None
-        _a_tac_charge_target: UnitState | None = None
-        _a_tac_target_ranking: list[int] = []
-
-        while True:
-            if current_is_a:
-                my_units, opp_units = units_a, units_b
-                my_mults = None  # tactical model provides per-activation
-            else:
-                my_units, opp_units = units_b, units_a
-                my_mults = target_mults_b
-
-            _opp_tac_decision = False
-
-            if current_is_a:
-                # --- Player A: tactical model decides (new conditioned path) ---
-                # Build alive+unactivated mask
-                alive_mask_list = []
-                for i in range(MAX_UNITS_PER_SIDE):
-                    if i < len(units_a):
-                        us = units_a[i]
-                        alive_mask_list.append(us.models_alive > 0 and not us.activated)
-                    else:
-                        alive_mask_list.append(False)
-
-                if not any(alive_mask_list):
-                    a_done = True
-                    if not b_done:
-                        a_finished_first = True
-                    if a_done and b_done:
-                        break
-                    current_is_a = not current_is_a
-                    continue
-
-                alive_mask = torch.tensor(alive_mask_list, dtype=torch.bool)
-
-                # Build enemy_alive_mask (§1.11)
-                enemy_alive_mask_list = [
-                    (i < len(units_b) and units_b[i].models_alive > 0)
-                    for i in range(MAX_UNITS_PER_SIDE)
-                ]
-                enemy_alive_mask = torch.tensor(enemy_alive_mask_list, dtype=torch.bool)
-
-                # Encode state
-                state_vec = encode_state_tactical(
-                    units_a, units_b, round_num, board, "A",
-                    friendly_ranged_matchups=fr_a, friendly_melee_matchups=fm_a,
-                    enemy_ranged_matchups=fr_b, enemy_melee_matchups=fm_b,
-                    total_friendly_points=pts_a, total_enemy_points=pts_b,
-                )
-                state_vec_np = state_vec.numpy()
-
-                # Compute model-space positions for sampling
-                a_friendly_pos = _get_model_space_positions(units_a, "A")
-                a_enemy_pos = _get_model_space_positions(units_b, "A")
-                a_adv_dists, a_rush_dists = _get_movement_budgets(units_a)
-                a_max_wr = _get_max_weapon_ranges(units_a)
-
-                # Decide: planning or policy sampling
-                _was_planned = False
-                _planning_improved = False
-                _planning_value_delta = 0.0
-                _planning_unit_values = None
-                _planning_unit_indices = None
-                _planning_move_values = None
-                _planning_move_indices = None
-                _planning_charge_values = None
-                _planning_charge_indices = None
-                _planning_shoot_values = None
-                _planning_shoot_indices = None
-
-                use_planning = (
-                    planning_rate > 0
-                    and random.random() < planning_rate
-                )
-
-                # Pre-compute destination candidates (rush budget = superset)
-                # for all alive units so we can pass the right one after unit selection.
-                a_enemy_occ = _collect_enemy_positions(units_b)
-                _a_enemy_alive_np = np.array(enemy_alive_mask_list, dtype=np.bool_)
-                _a_per_unit_cands = {}
-                _a_per_unit_mask = {}
-                _a_per_unit_feats = {}
-                for _ui in range(min(len(units_a), MAX_UNITS_PER_SIDE)):
-                    if alive_mask_list[_ui]:
-                        _uc, _um = compute_destination_candidates(
-                            units_a[_ui], MOVE_RUSH, board, a_enemy_occ, "A",
-                        )
-                        _uf = compute_destination_features(
-                            _uc, _um, units_a[_ui], _ui, "A",
-                            units_b, _a_enemy_alive_np,
-                            fr_a, fr_b, fm_b, a_rush_dists[_ui],
-                        )
-                        _a_per_unit_cands[_ui] = _uc
-                        _a_per_unit_mask[_ui] = _um
-                        _a_per_unit_feats[_ui] = _uf
-
-                if use_planning:
-                    from ml_planning import plan_training_activation
-                    (sel_idx, move_type_a, _plan_dest_col, _plan_dest_row,
-                     _plan_dest_cand_idx,
-                     charge_tgt_a, shoot_tgt_a, _a_tac_target_ranking,
-                     pmr_a, old_lp, value_est, shoot_mask_a,
-                     _was_planned, _planning_improved, _planning_value_delta,
-                     _planning_unit_values, _planning_unit_indices,
-                     _planning_move_values, _planning_move_indices,
-                     _planning_charge_values, _planning_charge_indices,
-                     _planning_shoot_values, _planning_shoot_indices,
-                    ) = plan_training_activation(
-                        model, state_vec, alive_mask, enemy_alive_mask,
-                        units_a, units_b, round_num, board, "A",
-                        current_is_a=current_is_a,
-                        mode="objectives",
-                        friendly_positions=a_friendly_pos,
-                        enemy_positions=a_enemy_pos,
-                        advance_distances=a_adv_dists,
-                        rush_distances=a_rush_dists,
-                        max_weapon_ranges=a_max_wr,
-                        fr_a=fr_a, fm_a=fm_a, fr_b=fr_b, fm_b=fm_b,
-                        pts_a=pts_a, pts_b=pts_b,
-                        planning_params=planning_params,
-                        opponent_type=opponent_type_idx,
-                    )
-                    # Build dest data from planning result
-                    if sel_idx in _a_per_unit_cands:
-                        _p_cands = _a_per_unit_cands[sel_idx]
-                        _p_mask = _a_per_unit_mask[sel_idx]
-                        _p_feats = _a_per_unit_feats[sel_idx]
-                        _n_valid = int(_p_mask.sum())
-                        dest_cands_a = _p_cands[:_n_valid].tolist()
-                        dest_mask_a = [True] * _n_valid
-                        dest_feats_a = _p_feats[:_n_valid].tolist()
-                        dest_sel_a = 0
-                        for _ci in range(_n_valid):
-                            if int(_p_cands[_ci, 0]) == _plan_dest_col and int(_p_cands[_ci, 1]) == _plan_dest_row:
-                                dest_sel_a = _ci
-                                break
-                    else:
-                        dest_cands_a, dest_mask_a, dest_feats_a, dest_sel_a = [], [], [], -1
-                else:
-                    # Sample without candidates first (pointer skipped, dest_lp=0),
-                    # then run the pointer post-hoc for the selected unit.
-                    (sel_idx, move_type_a,
-                     _, _, _, _,
-                     charge_tgt_a, shoot_tgt_a, _a_tac_target_ranking,
-                     pmr_a, old_lp, value_est, shoot_mask_a) = sample_tactical_actions_no_grad(
-                        model, state_vec, alive_mask, enemy_alive_mask,
-                        a_friendly_pos, a_enemy_pos, a_adv_dists, a_rush_dists,
-                        a_max_wr, opponent_type_idx=opponent_type_idx,
-                    )
-                    # Run pointer post-hoc if advance/rush
-                    dest_cands_a, dest_mask_a, dest_feats_a, dest_sel_a = [], [], [], -1
-                    if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) and sel_idx in _a_per_unit_cands:
-                        _sel_cands = _a_per_unit_cands[sel_idx]
-                        _sel_mask = _a_per_unit_mask[sel_idx]
-                        _sel_feats = _a_per_unit_feats[sel_idx]
-                        _n_valid = int(_sel_mask.sum())
-                        # Run pointer via model
-                        with torch.no_grad():
-                            _x = state_vec.unsqueeze(0)
-                            _h, _units, _ = model.trunk(_x)
-                            _uf = model._extract_unit_features(_units, sel_idx).detach()
-                            _mo = F.one_hot(torch.tensor(move_type_a), NUM_MOVE_TYPES).float().unsqueeze(0)
-                            _h_uf_m = torch.cat([_h, _uf, _mo], dim=-1)
-                            _df_t = torch.from_numpy(_sel_feats).float().unsqueeze(0)
-                            _dm_t = torch.from_numpy(_sel_mask).unsqueeze(0)
-                            _dlogits = model.compute_dest_logits(_h_uf_m, _df_t, _dm_t).squeeze(0)
-                            _ddist = torch.distributions.Categorical(logits=_dlogits)
-                            dest_sel_a = int(_ddist.sample().item())
-                            _dest_lp = _ddist.log_prob(torch.tensor(dest_sel_a)).item()
-                            old_lp += _dest_lp
-                        dest_cands_a = _sel_cands[:_n_valid].tolist()
-                        dest_mask_a = [True] * _n_valid
-                        dest_feats_a = _sel_feats[:_n_valid].tolist()
-                        # Recompute post_move_rel from selected hex
-                        _dcol = int(_sel_cands[dest_sel_a, 0])
-                        _drow = int(_sel_cands[dest_sel_a, 1])
-                        pmr_a = compute_post_move_rel(
-                            float(_dcol), float(_drow), a_enemy_pos,
-                        ).numpy()
-
-                # Record for PPO replay
-                step = TacticalActivationRecord(
-                    state_vec=state_vec_np,
-                    alive_mask=alive_mask_list,
-                    enemy_alive_mask=enemy_alive_mask_list,
-                    unit_idx=sel_idx,
-                    move_type=move_type_a,
-                    dest_candidates=dest_cands_a,
-                    dest_mask=dest_mask_a,
-                    dest_features=dest_feats_a,
-                    dest_selected_idx=dest_sel_a,
-                    charge_target_idx=charge_tgt_a,
-                    shoot_target_idx=shoot_tgt_a,
-                    shoot_mask=shoot_mask_a,
-                    post_move_rel=pmr_a,
-                    old_log_prob=old_lp,
-                    old_value=value_est,
-                    opponent_type_idx=opponent_type_idx,
-                    was_planned=_was_planned,
-                    planning_improved=_planning_improved,
-                    planning_value_delta=_planning_value_delta,
-                    planning_unit_values=_planning_unit_values,
-                    planning_unit_indices=_planning_unit_indices,
-                    planning_move_values=_planning_move_values,
-                    planning_move_indices=_planning_move_indices,
-                    planning_charge_values=_planning_charge_values,
-                    planning_charge_indices=_planning_charge_indices,
-                    planning_shoot_values=_planning_shoot_values,
-                    planning_shoot_indices=_planning_shoot_indices,
-                )
-                round_step_indices.append(len(trajectory))
-                trajectory.append(step)
-                _a_act_total += 1
-                _traj_a_counts.append((_a_act_total, _b_act_total))
-
-                active = units_a[sel_idx]
-                active.activated = True
-
-                # Compute destination in game-space from selected candidate hex
-                _a_dest = None
-                if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) and dest_sel_a >= 0 and len(dest_cands_a) > 0:
-                    _dest_hex = dest_cands_a[dest_sel_a]
-                    _a_dest = (float(_dest_hex[0]), float(_dest_hex[1]))  # game-space (Player A: model==game)
-
-                _a_tac_action, _a_tac_goal, _a_tac_charge_target, _a_reason = execute_decoded_decision(
-                    active, units_b, move_type_a, _a_dest, charge_tgt_a, shoot_tgt_a,
-                )
-            else:
-                # --- Player B: mirror, heuristic, strategic, or tactical model ---
-                _b_target_ranking: list[int] = []
-                _b_action = "hold"
-                _b_goal = None
-                _b_charge_target = None
-                if is_mirror:
-                    # Mirror self-play: B uses same tactical model as A
-                    b_alive_list = []
-                    for i in range(MAX_UNITS_PER_SIDE):
-                        if i < len(units_b):
-                            us = units_b[i]
-                            b_alive_list.append(us.models_alive > 0 and not us.activated)
-                        else:
-                            b_alive_list.append(False)
-
-                    if not any(b_alive_list):
-                        active = None
-                    else:
-                        b_alive_mask = torch.tensor(b_alive_list, dtype=torch.bool)
-                        b_enemy_alive_list = [
-                            (i < len(units_a) and units_a[i].models_alive > 0)
-                            for i in range(MAX_UNITS_PER_SIDE)
-                        ]
-                        b_enemy_alive_mask = torch.tensor(b_enemy_alive_list, dtype=torch.bool)
-
-                        b_state_vec = encode_state_tactical(
-                            units_b, units_a, round_num, board, "B",
-                            friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
-                            enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
-                            total_friendly_points=pts_b, total_enemy_points=pts_a,
-                        )
-                        b_state_vec_np = b_state_vec.numpy()
-
-                        b_friendly_pos = _get_model_space_positions(units_b, "B")
-                        b_enemy_pos = _get_model_space_positions(units_a, "B")
-                        b_adv_dists, b_rush_dists = _get_movement_budgets(units_b)
-                        b_max_wr = _get_max_weapon_ranges(units_b)
-
-                        # Pre-compute dest candidates for all alive B units
-                        b_enemy_occ = _collect_enemy_positions(units_a)
-                        _b_enemy_alive_np = np.array(b_enemy_alive_list, dtype=np.bool_)
-                        _b_per_unit_cands = {}
-                        _b_per_unit_mask = {}
-                        _b_per_unit_feats = {}
-                        for _bui in range(min(len(units_b), MAX_UNITS_PER_SIDE)):
-                            if b_alive_list[_bui]:
-                                _bc, _bm = compute_destination_candidates(
-                                    units_b[_bui], MOVE_RUSH, board, b_enemy_occ, "B",
-                                )
-                                _bf = compute_destination_features(
-                                    _bc, _bm, units_b[_bui], _bui, "B",
-                                    units_a, _b_enemy_alive_np,
-                                    fr_b, fr_a, fm_a, b_rush_dists[_bui],
-                                )
-                                _b_per_unit_cands[_bui] = _bc
-                                _b_per_unit_mask[_bui] = _bm
-                                _b_per_unit_feats[_bui] = _bf
-
-                        # Sample without candidates, then run pointer post-hoc
-                        (sel_b, mt_b,
-                         _, _, _, _,
-                         ct_b, st_b, _b_target_ranking,
-                         pmr_b, olp_b, val_b, sm_b) = sample_tactical_actions_no_grad(
-                            model, b_state_vec, b_alive_mask, b_enemy_alive_mask,
-                            b_friendly_pos, b_enemy_pos, b_adv_dists, b_rush_dists,
-                            b_max_wr, opponent_type_idx=opponent_type_idx,
-                        )
-                        # Run pointer post-hoc for B
-                        dest_cands_b, dest_mask_b, dest_feats_b, dest_sel_b = [], [], [], -1
-                        if mt_b in (MOVE_ADVANCE, MOVE_RUSH) and sel_b in _b_per_unit_cands:
-                            _bsc = _b_per_unit_cands[sel_b]
-                            _bsm = _b_per_unit_mask[sel_b]
-                            _bsf = _b_per_unit_feats[sel_b]
-                            _bn_valid = int(_bsm.sum())
-                            with torch.no_grad():
-                                _bx = b_state_vec.unsqueeze(0)
-                                _bh, _bunits, _ = model.trunk(_bx)
-                                _buf = model._extract_unit_features(_bunits, sel_b).detach()
-                                _bmo = F.one_hot(torch.tensor(mt_b), NUM_MOVE_TYPES).float().unsqueeze(0)
-                                _bh_uf_m = torch.cat([_bh, _buf, _bmo], dim=-1)
-                                _bdf_t = torch.from_numpy(_bsf).float().unsqueeze(0)
-                                _bdm_t = torch.from_numpy(_bsm).unsqueeze(0)
-                                _bdlogits = model.compute_dest_logits(_bh_uf_m, _bdf_t, _bdm_t).squeeze(0)
-                                _bddist = torch.distributions.Categorical(logits=_bdlogits)
-                                dest_sel_b = int(_bddist.sample().item())
-                                _bdest_lp = _bddist.log_prob(torch.tensor(dest_sel_b)).item()
-                                olp_b += _bdest_lp
-                            dest_cands_b = _bsc[:_bn_valid].tolist()
-                            dest_mask_b = [True] * _bn_valid
-                            dest_feats_b = _bsf[:_bn_valid].tolist()
-                            # Recompute post_move_rel from selected hex (model-space for B)
-                            _bdcol = int(_bsc[dest_sel_b, 0])
-                            _bdrow = int(_bsc[dest_sel_b, 1])
-                            pmr_b = compute_post_move_rel(
-                                _flip_x(float(_bdcol)), _flip_y(float(_bdrow)), b_enemy_pos,
-                            ).numpy()
-
-                        step_b = TacticalActivationRecord(
-                            state_vec=b_state_vec_np,
-                            alive_mask=b_alive_list,
-                            enemy_alive_mask=b_enemy_alive_list,
-                            unit_idx=sel_b,
-                            move_type=mt_b,
-                            dest_candidates=dest_cands_b,
-                            dest_mask=dest_mask_b,
-                            dest_features=dest_feats_b,
-                            dest_selected_idx=dest_sel_b,
-                            charge_target_idx=ct_b,
-                            shoot_target_idx=st_b,
-                            shoot_mask=sm_b,
-                            post_move_rel=pmr_b,
-                            old_log_prob=olp_b,
-                            old_value=val_b,
-                            opponent_type_idx=opponent_type_idx,
-                        )
-                        round_step_indices_b.append(len(trajectory_b))
-                        trajectory_b.append(step_b)
-                        _b_act_total += 1
-                        _traj_b_counts.append((_b_act_total, _a_act_total))
-
-                        active = units_b[sel_b]
-                        active.activated = True
-
-                        # Compute B destination in game-space from selected hex
-                        _b_dest = None
-                        if mt_b in (MOVE_ADVANCE, MOVE_RUSH) and dest_sel_b >= 0 and dest_cands_b:
-                            _bdhex = dest_cands_b[dest_sel_b]
-                            # Candidates are in game-space already
-                            _b_dest = (float(_bdhex[0]), float(_bdhex[1]))
-
-                        _b_action, _b_goal, _b_charge_target, _ = execute_decoded_decision(
-                            active, units_a, mt_b, _b_dest, ct_b, st_b,
-                        )
-
-                    _opp_tac_decision = active is not None
-                elif opponent_model is not None:
-                    (selected, _b_target_ranking, _b_action, _b_goal,
-                     _b_charge_target, _b_reason, _) = apply_tactical_model_sampling(
-                        opponent_model, my_units, opp_units, round_num, board, "B",
-                        friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
-                        enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
-                        total_friendly_points=pts_b, total_enemy_points=pts_a,
-                    )
-                    active = selected
-                    _opp_tac_decision = active is not None
-                else:
-                    ordered = activation_order(my_units, enemies=opp_units, mode="objectives")
-                    active = ordered[0] if ordered else None
-
-                if active is None:
-                    b_done = True
-                    if not a_done:
-                        a_finished_first = False
-                    if a_done and b_done:
-                        break
-                    current_is_a = not current_is_a
-                    continue
-
-                if not is_mirror or not _opp_tac_decision:
-                    active.activated = True
-                # Count B activations (non-mirror; mirror already counted above)
-                if not is_mirror:
-                    _b_act_total += 1
-
-            # --- Execute the activation ---
-            # Determine action / goal / charge_target and target ranking for shooting
-            if current_is_a:
-                # Player A: already resolved via execute_decoded_decision above
-                action = _a_tac_action
-                goal = _a_tac_goal
-                charge_target = _a_tac_charge_target
-                _active_target_ranking = _a_tac_target_ranking
-            elif _opp_tac_decision:
-                action, goal, charge_target = _b_action, _b_goal, _b_charge_target
-                _active_target_ranking = _b_target_ranking
-            else:
-                action, goal, charge_target, _reason = choose_action_and_goal(
-                    active, opp_units, board, mode="objectives",
-                    target_multipliers=my_mults,
-                )
-                _active_target_ranking = []  # not used — falls through to pick_target
-
-            # Pre-move snapshot: which objectives already have a friendly unit on them?
-            _pre_move_friendly_on_objs: list[bool] | None = None
-            if current_is_a or (is_mirror and _opp_tac_decision):
-                _obj_friendly = units_a if current_is_a else units_b
-                _pre_move_friendly_on_objs = [
-                    _any_friendly_on_objective(obj_pos, _obj_friendly)
-                    for obj_pos in _OBJECTIVES_FOR_REWARD
-                ]
-
-            # Shaken units must hold and recover — no shooting, no charging
-            if active.shaken:
-                active.shaken = False
-            elif action == "charge" and charge_target is not None:
-                enemy_positions = _collect_enemy_positions(opp_units)
-                execute_charge_movement(active, charge_target, board, enemy_positions)
-                execute_counter_charge(charge_target, active, board)
-
-                if active.unit.impact > 0:
-                    resolve_impact(active, charge_target)
-                    _sync_dead_models(charge_target, board)
-
-                charger_wounds = 0
-                if charge_target.models_alive > 0:
-                    charger_wounds = resolve_melee(active, charge_target, is_charge=True) or 0
-                    _sync_dead_models(charge_target, board)
-
-                defender_wounds = 0
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    defender_wounds = resolve_melee(charge_target, active, is_strike_back=True) or 0
-                    _sync_dead_models(active, board)
-
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    check_melee_morale(active, charger_wounds, defender_wounds)
-                    check_melee_morale(charge_target, defender_wounds, charger_wounds)
-                    _sync_dead_models(active, board)
-                    _sync_dead_models(charge_target, board)
-
-                active.fatigued = True
-                if charge_target.models_alive > 0:
-                    charge_target.fatigued = True
-
-                if active.models_alive > 0 and charge_target.models_alive > 0:
-                    enemy_positions = _collect_enemy_positions(opp_units)
-                    post_melee_separation(active, charge_target, board, enemy_positions)
-                elif active.models_alive > 0:
-                    consolidation_move(active, board, opp_units, BOARD_OBJECTIVES, "objectives")
-                elif charge_target.models_alive > 0:
-                    consolidation_move(charge_target, board, my_units, BOARD_OBJECTIVES, "objectives")
-
-            elif action in ("advance", "rush") and goal is not None:
-                budget = active.unit.advance_distance if action == "advance" else active.unit.rush_distance
-                enemy_positions = _collect_enemy_positions(opp_units)
-                execute_movement(active, goal, budget, board, enemy_positions,
-                                 flying=active.unit.flying)
-
-                if action != "rush":
-                    if current_is_a or _opp_tac_decision:
-                        target = pick_target_from_ranking(active, opp_units, _active_target_ranking)
-                    else:
-                        target = pick_target(active, opp_units, target_multipliers=my_mults)
-                    if target is not None:
-                        resolve_shooting(active, target)
-                        check_morale(target)
-                        _sync_dead_models(target, board)
-
-            elif action == "hold":
-                if current_is_a or _opp_tac_decision:
-                    target = pick_target_from_ranking(active, opp_units, _active_target_ranking)
-                else:
-                    target = pick_target(active, opp_units, target_multipliers=my_mults)
-                if target is not None:
-                    resolve_shooting(active, target)
-                    check_morale(target)
-                    _sync_dead_models(target, board)
-
-            # Per-activation objective capture reward
-            if _pre_move_friendly_on_objs is not None and active is not None and active.models_alive > 0:
-                if current_is_a:
-                    _cap_reward = compute_objective_capture_reward(
-                        active, units_a, board, "A", round_num, shaping_scale,
-                        _pre_move_friendly_on_objs,
-                    )
-                    if _cap_reward != 0.0 and round_step_indices:
-                        trajectory[round_step_indices[-1]].reward += _cap_reward
-                elif is_mirror and round_step_indices_b:
-                    _cap_reward = compute_objective_capture_reward(
-                        active, units_b, board, "B", round_num, shaping_scale,
-                        _pre_move_friendly_on_objs,
-                    )
-                    if _cap_reward != 0.0:
-                        trajectory_b[round_step_indices_b[-1]].reward += _cap_reward
-
-            current_is_a = not current_is_a
-
-        # End of round: update objectives
-        board.update_objectives(units_a, units_b)
-
-        # Assign round kill reward to the last activation step of this round
-        reward, prev_a_kill_pts, prev_b_kill_pts = compute_round_reward(
-            units_a, units_b, board, "A", pts_a,
-            prev_a_kill_pts, prev_b_kill_pts,
-            shaping_scale=shaping_scale,
-            round_num=round_num,
-        )
-        if round_step_indices:
-            trajectory[round_step_indices[-1]].reward += reward
-
-        if is_mirror and round_step_indices_b:
-            reward_b, prev_b_fkp, prev_b_ekp = compute_round_reward(
-                units_b, units_a, board, "B", pts_b,
-                prev_b_fkp, prev_b_ekp,
-                shaping_scale=shaping_scale,
-                round_num=round_num,
-            )
-            trajectory_b[round_step_indices_b[-1]].reward = reward_b
-
-        # Aux targets: short-horizon (end-of-current-round) survival + obj control
-        snap_a = _make_round_snapshot(units_a, units_b, board, "A")
-        for si in round_step_indices:
-            trajectory[si].friendly_survival_target_short = snap_a.friendly_survival
-            trajectory[si].enemy_survival_target_short = snap_a.enemy_survival
-            trajectory[si].obj_control_target_short = snap_a.obj_control
-        if is_mirror:
-            snap_b = _make_round_snapshot(units_b, units_a, board, "B")
-            for si in round_step_indices_b:
-                trajectory_b[si].friendly_survival_target_short = snap_b.friendly_survival
-                trajectory_b[si].enemy_survival_target_short = snap_b.enemy_survival
-                trajectory_b[si].obj_control_target_short = snap_b.obj_control
-
-    # Determine winner
-    a_objs = board.count_objectives("A")
-    b_objs = board.count_objectives("B")
-    if a_objs > b_objs:
-        result = "A"
-    elif b_objs > a_objs:
-        result = "B"
-    else:
-        result = "draw"
-
-    if trajectory:
-        trajectory[-1].reward += terminal_reward(result, "A", a_objs, b_objs)
-
-    if is_mirror and trajectory_b:
-        trajectory_b[-1].reward += terminal_reward(result, "B", a_objs, b_objs)
-
-    # Aux targets: long-horizon (end-of-game) survival + obj control (backfill to all steps)
-    final_snap_a = _make_round_snapshot(units_a, units_b, board, "A")
-    for step in trajectory:
-        step.friendly_survival_target = final_snap_a.friendly_survival
-        step.enemy_survival_target = final_snap_a.enemy_survival
-        step.obj_control_target = final_snap_a.obj_control
-    if is_mirror and trajectory_b:
-        final_snap_b = _make_round_snapshot(units_b, units_a, board, "B")
-        for step in trajectory_b:
-            step.friendly_survival_target = final_snap_b.friendly_survival
-            step.enemy_survival_target = final_snap_b.enemy_survival
-            step.obj_control_target = final_snap_b.obj_control
-
-    # Activation countdown targets (backfill to all steps)
-    for i, step in enumerate(trajectory):
-        a_so_far, b_so_far = _traj_a_counts[i]
-        step.friendly_activations_remaining = float(_a_act_total - a_so_far)
-        step.enemy_activations_remaining = float(_b_act_total - b_so_far)
-    if is_mirror and trajectory_b:
-        for i, step in enumerate(trajectory_b):
-            b_so_far, a_so_far = _traj_b_counts[i]
-            step.friendly_activations_remaining = float(_b_act_total - b_so_far)
-            step.enemy_activations_remaining = float(_a_act_total - a_so_far)
-
-    return trajectory, result, opponent_type, trajectory_b
 
 
 # ---------------------------------------------------------------------------
@@ -857,16 +130,24 @@ def _episode_tactical_generator(opponent_model,
                                 BOARD_OBJECTIVES, shaping_scale=1.0,
                                 army_type="random",
                                 planning_enabled=False,
-                                has_tactical_opponent=False):
-    """Generator version of _run_single_episode_tactical for batched inference.
+                                has_tactical_opponent=False,
+                                model_side: str = "A"):
+    """Run one training episode with the tactical per-activation model.
 
     Yields _TacticalInferenceRequest at each ML decision point.
     Receives _TacticalSamplingResult via generator.send().
     Returns (trajectory, game_result, opponent_type, trajectory_b) via StopIteration.value.
 
-    Player A inference is always yielded (model_key="main").
-    Player B inference is yielded for tactical opponents (model_key="opponent")
-    or with model_key="main" for mirror self-play.
+    The main trajectory holds the learning model's activations. Its physical
+    side is chosen by ``model_side`` ("A" or "B"); for mirror self-play the
+    main trajectory always holds side A and trajectory_b holds side B, so
+    ``model_side`` is effectively ignored.
+
+    Caller convention: ``res_a``/``states_a_data`` describe the army deployed
+    on physical side A (rows 0-11); ``res_b`` describes the army on side B.
+    ``model_side`` tells this generator which physical side the main learning
+    model occupies. The caller is responsible for swapping the positional
+    args when randomizing sides.
     """
     from game import deploy_armies, _collect_enemy_positions, _sync_dead_models
     from ai import (
@@ -881,13 +162,28 @@ def _episode_tactical_generator(opponent_model,
     is_mirror = (opponent_type == "selfplay_mirror")
     opponent_type_idx = _get_opponent_type_idx(opponent_type, army_type)
 
-    # Rebuild UnitState objects
+    # For mirror self-play, both sides are the main model — we fix
+    # model_side to "A" so the A branch / mirror-B split in the activation
+    # loop keeps working unchanged. For non-mirror games the caller can
+    # randomise which physical side the main model plays.
+    if is_mirror:
+        model_side = "A"
+    _opp_side = "B" if model_side == "A" else "A"
+
+    # Internal convention: ``units_a`` is ALWAYS the main model's army and
+    # ``units_b`` is ALWAYS the opponent's, regardless of which physical
+    # side they occupy. Owner tags match the physical side so that the game
+    # engine (which counts objectives by owner) still works.
+
+    # Rebuild UnitState objects — units_a is ALWAYS the main model's army.
+    # Owner tags match physical deployment: main on physical model_side,
+    # opponent on physical _opp_side.
     units_a = [UnitState(ru) for ru in res_a]
     for u in units_a:
-        u.owner = "A"
+        u.owner = model_side
     units_b = [UnitState(ru) for ru in res_b]
     for u in units_b:
-        u.owner = "B"
+        u.owner = _opp_side
 
     for u, (ai_role, combat_pref, assigned_obj) in zip(units_a, states_a_data):
         u.ai_role = ai_role
@@ -899,7 +195,13 @@ def _episode_tactical_generator(opponent_model,
         u.assigned_objective = assigned_obj
 
     board = Board()
-    deploy_armies(units_a, units_b, board)
+    # deploy_armies puts its first positional arg on physical side A and
+    # second on physical side B — so if the main model is on side B we
+    # pass (units_b, units_a) to land the opponent on A and main on B.
+    if model_side == "A":
+        deploy_armies(units_a, units_b, board)
+    else:
+        deploy_armies(units_b, units_a, board)
 
     fr_a, fm_a = precompute_damage([u.unit for u in units_a], [u.unit for u in units_b])
     fr_b, fm_b = precompute_damage([u.unit for u in units_b], [u.unit for u in units_a])
@@ -933,7 +235,8 @@ def _episode_tactical_generator(opponent_model,
         current_is_a = a_first if round_num == 1 else a_finished_first
 
         # Player B round-start decisions (heuristic only; tactical opponents
-        # and mirror decide per-activation, not per-round).
+        # and mirror decide per-activation, not per-round). units_b is the
+        # opponent by convention, so roles are always reassigned on it.
         target_mults_b = None
         if opponent_type == "heuristic":
             reassign_roles(units_b)
@@ -988,7 +291,7 @@ def _episode_tactical_generator(opponent_model,
                 enemy_alive_mask = torch.tensor(enemy_alive_mask_list, dtype=torch.bool)
 
                 state_vec = encode_state_tactical(
-                    units_a, units_b, round_num, board, "A",
+                    units_a, units_b, round_num, board, model_side,
                     friendly_ranged_matchups=fr_a, friendly_melee_matchups=fm_a,
                     enemy_ranged_matchups=fr_b, enemy_melee_matchups=fm_b,
                     total_friendly_points=pts_a, total_enemy_points=pts_b,
@@ -996,8 +299,8 @@ def _episode_tactical_generator(opponent_model,
                 state_vec_np = state_vec.numpy()
 
                 # Compute model-space positions for inference
-                a_friendly_pos = _get_model_space_positions(units_a, "A")
-                a_enemy_pos = _get_model_space_positions(units_b, "A")
+                a_friendly_pos = _get_model_space_positions(units_a, model_side)
+                a_enemy_pos = _get_model_space_positions(units_b, model_side)
                 a_adv_dists, a_rush_dists = _get_movement_budgets(units_a)
                 a_max_wr = _get_max_weapon_ranges(units_a)
 
@@ -1007,23 +310,27 @@ def _episode_tactical_generator(opponent_model,
                 _ga_enemy_alive_np = np.array(enemy_alive_mask_list, dtype=np.bool_)
                 _ga_cands_dict = {}
                 _ga_mask_dict = {}
+                _ga_ar_dict = {}
                 for _gui in range(min(len(units_a), MAX_UNITS_PER_SIDE)):
                     if alive_mask_list[_gui]:
-                        _gc, _gm = compute_destination_candidates(
-                            units_a[_gui], MOVE_RUSH, board, _ga_enemy_occ, "A",
+                        _gc, _gm, _gar = compute_destination_candidates(
+                            units_a[_gui], board, _ga_enemy_occ, model_side,
                         )
                         _ga_cands_dict[_gui] = _gc
                         _ga_mask_dict[_gui] = _gm
-                _ga_enemy_cache = build_dest_enemy_cache(units_b, _ga_enemy_alive_np, "A")
+                        _ga_ar_dict[_gui] = _gar
+                _ga_enemy_cache = build_dest_enemy_cache(units_b, _ga_enemy_alive_np, model_side)
 
                 # >>> YIELD for batched inference (or planning, decided by coordinator) <<<
                 _req = _TacticalInferenceRequest(
                     state_vec, alive_mask, enemy_alive_mask, "main",
                     a_friendly_pos, a_enemy_pos, a_adv_dists, a_rush_dists,
                     a_max_wr, opponent_type_idx=opponent_type_idx,
+                    player=model_side,
                 )
                 _req.dest_candidates_per_unit = _ga_cands_dict
                 _req.dest_mask_per_unit = _ga_mask_dict
+                _req.dest_advance_reachable_per_unit = _ga_ar_dict
                 _req.dest_features_per_unit = None  # computed lazily
                 _req.dest_lazy_units = units_a
                 _req.dest_lazy_enemy_units = units_b
@@ -1031,7 +338,7 @@ def _episode_tactical_generator(opponent_model,
                 _req.dest_lazy_fr_matchups = fr_a
                 _req.dest_lazy_er_matchups = fr_b
                 _req.dest_lazy_melee_matchups = fm_b
-                _req.dest_lazy_player = "A"
+                _req.dest_lazy_player = model_side
                 _req.dest_lazy_enemy_cache = _ga_enemy_cache
                 if planning_enabled:
                     _req.planning_units_a = units_a
@@ -1060,15 +367,18 @@ def _episode_tactical_generator(opponent_model,
                 shoot_mask_a = _inf_result.shoot_mask
                 dest_cands_a = _inf_result.dest_candidates
                 dest_sel_a = _inf_result.dest_selected_idx
+                dest_ar_a = _inf_result.dest_advance_reachable
 
                 # Build recomputation data for PPO replay (avoids storing ~60KB features)
                 _sel_unit = units_a[sel_idx]
                 _sel_cx, _sel_cy = _sel_unit.centre()
-                # Store model-space centre for replay
-                if True:  # player == "A" — model-space == game-space
+                # Store model-space centre for replay — flip for side B.
+                if model_side == "A":
                     _sel_mcx, _sel_mcy = _sel_cx, _sel_cy
+                else:
+                    _sel_mcx, _sel_mcy = _flip_x(_sel_cx), _flip_y(_sel_cy)
                 _a_recomp = {
-                    'player': 'A',
+                    'player': model_side,
                     'unit_cx': _sel_mcx, 'unit_cy': _sel_mcy,
                     'unit_alive_frac': _sel_unit.models_alive / max(_sel_unit.unit.models, 1),
                     'move_budget': a_rush_dists[sel_idx],
@@ -1085,6 +395,7 @@ def _episode_tactical_generator(opponent_model,
                     unit_idx=sel_idx,
                     move_type=move_type_a,
                     dest_candidates=dest_cands_a,
+                    dest_advance_reachable=dest_ar_a,
                     dest_selected_idx=dest_sel_a,
                     dest_recomp=_a_recomp,
                     charge_target_idx=charge_tgt_a,
@@ -1116,12 +427,16 @@ def _episode_tactical_generator(opponent_model,
 
                 # Compute destination in game-space from selected candidate hex
                 _a_dest = None
-                if move_type_a in (MOVE_ADVANCE, MOVE_RUSH) and dest_sel_a >= 0 and len(dest_cands_a) > 0:
+                _a_is_ar = True
+                if move_type_a == MOVE_MOVE and dest_sel_a >= 0 and len(dest_cands_a) > 0:
                     _dest_hex = dest_cands_a[dest_sel_a]
-                    _a_dest = (float(_dest_hex[0]), float(_dest_hex[1]))  # game-space (Player A: model==game)
+                    _a_dest = (float(_dest_hex[0]), float(_dest_hex[1]))  # game-space
+                    if dest_ar_a is not None and dest_sel_a < len(dest_ar_a):
+                        _a_is_ar = dest_ar_a[dest_sel_a]
 
                 _a_tac_action, _a_tac_goal, _a_tac_charge_target, _a_reason = execute_decoded_decision(
                     active, units_b, move_type_a, _a_dest, charge_tgt_a, shoot_tgt_a,
+                    is_advance_reachable=_a_is_ar,
                 )
             else:
                 # --- Player B ---
@@ -1150,15 +465,15 @@ def _episode_tactical_generator(opponent_model,
                         ]
                         b_enemy_alive_mask = torch.tensor(b_enemy_alive_list, dtype=torch.bool)
                         b_state_vec = encode_state_tactical(
-                            units_b, units_a, round_num, board, "B",
+                            units_b, units_a, round_num, board, _opp_side,
                             friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
                             enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
                             total_friendly_points=pts_b, total_enemy_points=pts_a,
                         )
                         b_state_vec_np = b_state_vec.numpy()
 
-                        b_friendly_pos = _get_model_space_positions(units_b, "B")
-                        b_enemy_pos = _get_model_space_positions(units_a, "B")
+                        b_friendly_pos = _get_model_space_positions(units_b, _opp_side)
+                        b_enemy_pos = _get_model_space_positions(units_a, _opp_side)
                         b_adv_dists, b_rush_dists = _get_movement_budgets(units_b)
                         b_max_wr = _get_max_weapon_ranges(units_b)
 
@@ -1167,23 +482,27 @@ def _episode_tactical_generator(opponent_model,
                         _gb_enemy_alive_np = np.array(b_enemy_alive_list, dtype=np.bool_)
                         _gb_cands_dict = {}
                         _gb_mask_dict = {}
+                        _gb_ar_dict = {}
                         for _gbui in range(min(len(units_b), MAX_UNITS_PER_SIDE)):
                             if b_alive_list[_gbui]:
-                                _gbc, _gbm = compute_destination_candidates(
-                                    units_b[_gbui], MOVE_RUSH, board, _gb_enemy_occ, "B",
+                                _gbc, _gbm, _gbar = compute_destination_candidates(
+                                    units_b[_gbui], board, _gb_enemy_occ, _opp_side,
                                 )
                                 _gb_cands_dict[_gbui] = _gbc
                                 _gb_mask_dict[_gbui] = _gbm
-                        _gb_enemy_cache = build_dest_enemy_cache(units_a, _gb_enemy_alive_np, "B")
+                                _gb_ar_dict[_gbui] = _gbar
+                        _gb_enemy_cache = build_dest_enemy_cache(units_a, _gb_enemy_alive_np, _opp_side)
 
                         # >>> YIELD for batched main-model inference (mirror B) <<<
                         _gb_req = _TacticalInferenceRequest(
                             b_state_vec, b_alive_mask, b_enemy_alive_mask, "main",
                             b_friendly_pos, b_enemy_pos, b_adv_dists, b_rush_dists,
                             b_max_wr, opponent_type_idx=opponent_type_idx,
+                            player=_opp_side,
                         )
                         _gb_req.dest_candidates_per_unit = _gb_cands_dict
                         _gb_req.dest_mask_per_unit = _gb_mask_dict
+                        _gb_req.dest_advance_reachable_per_unit = _gb_ar_dict
                         _gb_req.dest_features_per_unit = None
                         _gb_req.dest_lazy_units = units_b
                         _gb_req.dest_lazy_enemy_units = units_a
@@ -1191,7 +510,7 @@ def _episode_tactical_generator(opponent_model,
                         _gb_req.dest_lazy_fr_matchups = fr_b
                         _gb_req.dest_lazy_er_matchups = fr_a
                         _gb_req.dest_lazy_melee_matchups = fm_a
-                        _gb_req.dest_lazy_player = "B"
+                        _gb_req.dest_lazy_player = _opp_side
                         _gb_req.dest_lazy_enemy_cache = _gb_enemy_cache
                         _b_inf = yield _gb_req
 
@@ -1206,7 +525,7 @@ def _episode_tactical_generator(opponent_model,
                             _selb_cx, _selb_cy = _selb.centre()
                             _selb_mcx, _selb_mcy = _flip_x(_selb_cx), _flip_y(_selb_cy)
                             _b_recomp_m = {
-                                'player': 'B',
+                                'player': _opp_side,
                                 'unit_cx': _selb_mcx, 'unit_cy': _selb_mcy,
                                 'unit_alive_frac': _selb.models_alive / max(_selb.unit.models, 1),
                                 'move_budget': b_rush_dists[sel_b],
@@ -1222,6 +541,7 @@ def _episode_tactical_generator(opponent_model,
                                 unit_idx=sel_b,
                                 move_type=_b_inf.move_type,
                                 dest_candidates=_b_inf.dest_candidates,
+                                dest_advance_reachable=_b_inf.dest_advance_reachable,
                                 dest_selected_idx=_b_inf.dest_selected_idx,
                                 dest_recomp=_b_recomp_m,
                                 charge_target_idx=_b_inf.charge_target_idx,
@@ -1238,16 +558,21 @@ def _episode_tactical_generator(opponent_model,
                             _traj_b_counts.append((_b_act_total, _a_act_total))
 
                             _b_dest = None
-                            if (_b_inf.move_type in (MOVE_ADVANCE, MOVE_RUSH)
+                            _b_is_ar = True
+                            if (_b_inf.move_type == MOVE_MOVE
                                     and _b_inf.dest_selected_idx >= 0
                                     and len(_b_inf.dest_candidates) > 0):
                                 _bdhex = _b_inf.dest_candidates[_b_inf.dest_selected_idx]
                                 # Candidates are in game-space
                                 _b_dest = (float(_bdhex[0]), float(_bdhex[1]))
+                                if (_b_inf.dest_advance_reachable is not None
+                                        and _b_inf.dest_selected_idx < len(_b_inf.dest_advance_reachable)):
+                                    _b_is_ar = _b_inf.dest_advance_reachable[_b_inf.dest_selected_idx]
 
                             _b_action, _b_goal, _b_charge_target, _ = execute_decoded_decision(
                                 active, units_a, _b_inf.move_type, _b_dest,
                                 _b_inf.charge_target_idx, _b_inf.shoot_target_idx,
+                                is_advance_reachable=_b_is_ar,
                             )
                             active.activated = True
                         else:
@@ -1275,14 +600,14 @@ def _episode_tactical_generator(opponent_model,
                             dtype=torch.bool,
                         )
                         b_state_vec = encode_state_tactical(
-                            units_b, units_a, round_num, board, "B",
+                            units_b, units_a, round_num, board, _opp_side,
                             friendly_ranged_matchups=fr_b, friendly_melee_matchups=fm_b,
                             enemy_ranged_matchups=fr_a, enemy_melee_matchups=fm_a,
                             total_friendly_points=pts_b, total_enemy_points=pts_a,
                         )
 
-                        b_friendly_pos_opp = _get_model_space_positions(units_b, "B")
-                        b_enemy_pos_opp = _get_model_space_positions(units_a, "B")
+                        b_friendly_pos_opp = _get_model_space_positions(units_b, _opp_side)
+                        b_enemy_pos_opp = _get_model_space_positions(units_a, _opp_side)
                         b_adv_dists_opp, b_rush_dists_opp = _get_movement_budgets(units_b)
                         b_max_wr_opp = _get_max_weapon_ranges(units_b)
 
@@ -1295,23 +620,27 @@ def _episode_tactical_generator(opponent_model,
                         )
                         _gopp_cands_dict = {}
                         _gopp_mask_dict = {}
+                        _gopp_ar_dict = {}
                         for _goppi in range(min(len(units_b), MAX_UNITS_PER_SIDE)):
                             if b_alive_list[_goppi]:
-                                _goppc, _goppm = compute_destination_candidates(
-                                    units_b[_goppi], MOVE_RUSH, board, _gopp_enemy_occ, "B",
+                                _goppc, _goppm, _goppar = compute_destination_candidates(
+                                    units_b[_goppi], board, _gopp_enemy_occ, _opp_side,
                                 )
                                 _gopp_cands_dict[_goppi] = _goppc
                                 _gopp_mask_dict[_goppi] = _goppm
-                        _gopp_enemy_cache = build_dest_enemy_cache(units_a, _gopp_enemy_alive_np, "B")
+                                _gopp_ar_dict[_goppi] = _goppar
+                        _gopp_enemy_cache = build_dest_enemy_cache(units_a, _gopp_enemy_alive_np, _opp_side)
 
                         # >>> YIELD for batched opponent-model inference <<<
                         _gopp_req = _TacticalInferenceRequest(
                             b_state_vec, b_alive_mask, b_enemy_alive_mask, "opponent",
                             b_friendly_pos_opp, b_enemy_pos_opp, b_adv_dists_opp, b_rush_dists_opp,
                             b_max_wr_opp,
+                            player=_opp_side,
                         )
                         _gopp_req.dest_candidates_per_unit = _gopp_cands_dict
                         _gopp_req.dest_mask_per_unit = _gopp_mask_dict
+                        _gopp_req.dest_advance_reachable_per_unit = _gopp_ar_dict
                         _gopp_req.dest_features_per_unit = None
                         _gopp_req.dest_lazy_units = units_b
                         _gopp_req.dest_lazy_enemy_units = units_a
@@ -1319,7 +648,7 @@ def _episode_tactical_generator(opponent_model,
                         _gopp_req.dest_lazy_fr_matchups = fr_b
                         _gopp_req.dest_lazy_er_matchups = fr_a
                         _gopp_req.dest_lazy_melee_matchups = fm_a
-                        _gopp_req.dest_lazy_player = "B"
+                        _gopp_req.dest_lazy_player = _opp_side
                         _gopp_req.dest_lazy_enemy_cache = _gopp_enemy_cache
                         _b_inf = yield _gopp_req
 
@@ -1330,15 +659,20 @@ def _episode_tactical_generator(opponent_model,
                             active = units_b[sel_b]
                             _b_target_ranking = _b_inf.target_ranking
                             _b_dest_opp = None
-                            if (_b_inf.move_type in (MOVE_ADVANCE, MOVE_RUSH)
+                            _b_is_ar_opp = True
+                            if (_b_inf.move_type == MOVE_MOVE
                                     and _b_inf.dest_selected_idx >= 0
                                     and len(_b_inf.dest_candidates) > 0):
                                 _bdhex_opp = _b_inf.dest_candidates[_b_inf.dest_selected_idx]
                                 # Candidates are in game-space
                                 _b_dest_opp = (float(_bdhex_opp[0]), float(_bdhex_opp[1]))
+                                if (_b_inf.dest_advance_reachable is not None
+                                        and _b_inf.dest_selected_idx < len(_b_inf.dest_advance_reachable)):
+                                    _b_is_ar_opp = _b_inf.dest_advance_reachable[_b_inf.dest_selected_idx]
                             _b_action, _b_goal, _b_charge_target, _ = execute_decoded_decision(
                                 active, units_a, _b_inf.move_type, _b_dest_opp,
                                 _b_inf.charge_target_idx, _b_inf.shoot_target_idx,
+                                is_advance_reachable=_b_is_ar_opp,
                             )
                         else:
                             active = None
@@ -1363,7 +697,7 @@ def _episode_tactical_generator(opponent_model,
                 if not is_mirror:
                     _b_act_total += 1
 
-            # --- Execute the activation (identical to _run_single_episode_tactical) ---
+            # --- Execute the activation ---
             if current_is_a:
                 action = _a_tac_action
                 goal = _a_tac_goal
@@ -1458,14 +792,14 @@ def _episode_tactical_generator(opponent_model,
             if _pre_move_friendly_on_objs_g is not None and active is not None and active.models_alive > 0:
                 if current_is_a:
                     _cap_reward = compute_objective_capture_reward(
-                        active, units_a, board, "A", round_num, shaping_scale,
+                        active, units_a, board, model_side, round_num, shaping_scale,
                         _pre_move_friendly_on_objs_g,
                     )
                     if _cap_reward != 0.0 and round_step_indices:
                         trajectory[round_step_indices[-1]].reward += _cap_reward
                 elif is_mirror and round_step_indices_b:
                     _cap_reward = compute_objective_capture_reward(
-                        active, units_b, board, "B", round_num, shaping_scale,
+                        active, units_b, board, _opp_side, round_num, shaping_scale,
                         _pre_move_friendly_on_objs_g,
                     )
                     if _cap_reward != 0.0:
@@ -1477,7 +811,7 @@ def _episode_tactical_generator(opponent_model,
         board.update_objectives(units_a, units_b)
 
         reward, prev_a_kill_pts, prev_b_kill_pts = compute_round_reward(
-            units_a, units_b, board, "A", pts_a,
+            units_a, units_b, board, model_side, pts_a,
             prev_a_kill_pts, prev_b_kill_pts,
             shaping_scale=shaping_scale,
             round_num=round_num,
@@ -1487,7 +821,7 @@ def _episode_tactical_generator(opponent_model,
 
         if is_mirror and round_step_indices_b:
             reward_b, prev_b_fkp, prev_b_ekp = compute_round_reward(
-                units_b, units_a, board, "B", pts_b,
+                units_b, units_a, board, _opp_side, pts_b,
                 prev_b_fkp, prev_b_ekp,
                 shaping_scale=shaping_scale,
                 round_num=round_num,
@@ -1495,13 +829,13 @@ def _episode_tactical_generator(opponent_model,
             trajectory_b[round_step_indices_b[-1]].reward += reward_b
 
         # Aux targets: short-horizon (end-of-current-round) survival + obj control
-        snap_a = _make_round_snapshot(units_a, units_b, board, "A")
+        snap_a = _make_round_snapshot(units_a, units_b, board, model_side)
         for si in round_step_indices:
             trajectory[si].friendly_survival_target_short = snap_a.friendly_survival
             trajectory[si].enemy_survival_target_short = snap_a.enemy_survival
             trajectory[si].obj_control_target_short = snap_a.obj_control
         if is_mirror:
-            snap_b = _make_round_snapshot(units_b, units_a, board, "B")
+            snap_b = _make_round_snapshot(units_b, units_a, board, _opp_side)
             for si in round_step_indices_b:
                 trajectory_b[si].friendly_survival_target_short = snap_b.friendly_survival
                 trajectory_b[si].enemy_survival_target_short = snap_b.enemy_survival
@@ -1518,19 +852,19 @@ def _episode_tactical_generator(opponent_model,
         result = "draw"
 
     if trajectory:
-        trajectory[-1].reward += terminal_reward(result, "A", a_objs, b_objs)
+        trajectory[-1].reward += terminal_reward(result, model_side, a_objs, b_objs)
 
     if is_mirror and trajectory_b:
-        trajectory_b[-1].reward += terminal_reward(result, "B", a_objs, b_objs)
+        trajectory_b[-1].reward += terminal_reward(result, _opp_side, a_objs, b_objs)
 
     # Aux targets: long-horizon (end-of-game) survival + obj control (backfill to all steps)
-    final_snap_a = _make_round_snapshot(units_a, units_b, board, "A")
+    final_snap_a = _make_round_snapshot(units_a, units_b, board, model_side)
     for step in trajectory:
         step.friendly_survival_target = final_snap_a.friendly_survival
         step.enemy_survival_target = final_snap_a.enemy_survival
         step.obj_control_target = final_snap_a.obj_control
     if is_mirror and trajectory_b:
-        final_snap_b = _make_round_snapshot(units_b, units_a, board, "B")
+        final_snap_b = _make_round_snapshot(units_b, units_a, board, _opp_side)
         for step in trajectory_b:
             step.friendly_survival_target = final_snap_b.friendly_survival
             step.enemy_survival_target = final_snap_b.enemy_survival
@@ -1557,11 +891,20 @@ def _run_games_batched_tactical(
     shaping_scale: float = 1.0,
     planning_rate: float = 0.0,
     planning_params: dict | None = None,
+    randomize_sides: bool = True,
 ) -> list[tuple]:
     """Run multiple tactical training games with batched inference.
 
     Creates generator coroutines for each game and advances them in lockstep,
     batching main-model and opponent-model forward passes separately.
+
+    If ``randomize_sides`` is True, each non-mirror game coin-flips whether
+    the main learning model plays physical side A or side B. Mirror
+    self-play games are not randomized (both sides are the main model
+    already). Credit assignment is handled inside the generator via the
+    ``model_side`` argument: the main trajectory always carries the main
+    model's activations and its terminal reward is computed from the main
+    model's perspective regardless of physical side.
 
     Returns list of (trajectory, result, opponent_type, army_type) per game.
     """
@@ -1570,6 +913,7 @@ def _run_games_batched_tactical(
     # Create generators and track opponent models for tactical opponents
     generators: list = []
     game_army_types: list[str] = []
+    game_model_sides: list[str] = []
     game_opp_tactical_models: dict[int, nn.Module] = {}
 
     for i, (res_a, res_b, sa_data, sb_data, opp_type, opp_sd_idx, army_type) in enumerate(game_specs):
@@ -1578,6 +922,12 @@ def _run_games_batched_tactical(
         if opp_model is not None:
             game_opp_tactical_models[i] = opp_model
 
+        is_mirror_game = (opp_type == "selfplay_mirror")
+        if randomize_sides and not is_mirror_game and random.random() < 0.5:
+            _model_side = "B"
+        else:
+            _model_side = "A"
+
         gen = _episode_tactical_generator(
             None,
             res_a, res_b, sa_data, sb_data, opp_type, BOARD_OBJECTIVES,
@@ -1585,9 +935,11 @@ def _run_games_batched_tactical(
             army_type=army_type,
             planning_enabled=(planning_rate > 0),
             has_tactical_opponent=(opp_model is not None),
+            model_side=_model_side,
         )
         generators.append(gen)
         game_army_types.append(army_type)
+        game_model_sides.append(_model_side)
 
     # Initialize all generators (advance to first yield or completion)
     active: dict[int, tuple] = {}
@@ -1717,11 +1069,21 @@ def _run_games_batched_tactical(
 
         active = new_active
 
-    # Return results in original order, adding army_type
+    # Return results in original order, adding army_type.
+    # Transform physical winner ("A"/"B") to main-perspective ("main"/"opp")
+    # so record_game sees the same semantic regardless of which physical
+    # side the main model was assigned to this game.
+    def _to_main(result: str, main_side: str) -> str:
+        if result == "draw":
+            return "draw"
+        return "main" if result == main_side else "opp"
+
     results = []
     for i in range(len(generators)):
         traj, result, opp_type, traj_b = finished[i]
-        results.append((traj, result, opp_type, game_army_types[i]))
+        m_side = game_model_sides[i]
+        results.append((traj, _to_main(result, m_side), opp_type, game_army_types[i], m_side))
         if traj_b is not None:
-            results.append((traj_b, result, "mirror_b", game_army_types[i]))
+            opp_m_side = "B" if m_side == "A" else "A"
+            results.append((traj_b, _to_main(result, opp_m_side), "mirror_b", game_army_types[i], opp_m_side))
     return results

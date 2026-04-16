@@ -27,8 +27,8 @@ SCOUT_A_ROW = 23
 SCOUT_B_ROW = 24
 
 # Objective positions (col, row)
-OBJECTIVES: list[tuple[int, int]] = [
-    (36, 24),  # Centre
+OBJECTIVES: list[tuple[float, float]] = [
+    (35.5, 23.5),  # Centre — half-integer for 180° self-symmetry on even grid
     (18, 16),  # A-side
     (53, 31),  # B-side  (180° symmetric: 71-18=53, 47-16=31)
     (36, 6),   # Home-A (centre of A's deployment zone)
@@ -98,31 +98,31 @@ class Board:
         self.occupancy[new_row * COLS + new_col] = 1
 
     def update_objectives(self, units_a: list, units_b: list):
-        """Update objective control at end of round per §2.1."""
+        """Update objective control at end of round per §2.1.
+
+        Tags are based on each unit's ``owner`` attribute so that "A" always
+        means physical side A regardless of which positional argument each
+        side was passed in. The training generator swaps positional args
+        when the learning model is placed on side B, so relying on
+        positional order would mis-tag captures in that case.
+        """
         threshold_sq = OBJ_SEIZE_RANGE * OBJ_SEIZE_RANGE
 
         for oi, (oc, orow) in enumerate(OBJECTIVES):
             a_present = False
             b_present = False
 
-            for u in units_a:
+            for u in list(units_a) + list(units_b):
                 if u.destroyed or u.shaken:
                     continue
                 for pos in u.alive_positions():
                     if dist_sq(pos, (oc, orow)) <= threshold_sq:
-                        a_present = True
+                        if u.owner == "A":
+                            a_present = True
+                        elif u.owner == "B":
+                            b_present = True
                         break
-                if a_present:
-                    break
-
-            for u in units_b:
-                if u.destroyed or u.shaken:
-                    continue
-                for pos in u.alive_positions():
-                    if dist_sq(pos, (oc, orow)) <= threshold_sq:
-                        b_present = True
-                        break
-                if b_present:
+                if a_present and b_present:
                     break
 
             if a_present and not b_present:

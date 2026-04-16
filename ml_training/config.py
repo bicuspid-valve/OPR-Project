@@ -88,7 +88,6 @@ class TrainingConfig:
     batch_size: int = 64
     entropy_coeff_start: float = 0.01
     entropy_coeff_end: float = 0.01
-    baseline_alpha: float = 0.01
     checkpoint_interval: int = 50      # save checkpoint every N batches
     max_checkpoints: int = 20          # checkpoint pool size
     heuristic_window: int = 200        # rolling window for heuristic win rate
@@ -112,7 +111,7 @@ class TrainingConfig:
     # Per-head entropy targets (adaptive entropy tuning)
     use_entropy_targets: bool = True   # if True, use per-head adaptive entropy; else use entropy_coeff
     entropy_target_fraction: float = 0.25  # fraction of max entropy for masked categoricals
-    entropy_target_move: float = 0.25 * math.log(4)      # ~0.347
+    entropy_target_move: float = 0.25 * math.log(2)      # ~0.173 (2-way: move/charge)
     entropy_target_dest_fraction: float = 0.25               # target 25% of max entropy for destination pointer (normalised by ln(N_valid))
     entropy_alpha_lr: float = 1e-4                         # learning rate for entropy alpha params
     # Planning-augmented training (Expert Iteration)
@@ -142,7 +141,7 @@ class TacticalActivationRecord:
     alive_mask: list[bool]                # which friendly slots were alive+unactivated
     enemy_alive_mask: list[bool]          # which enemy slots were alive
     unit_idx: int                         # which unit was selected
-    move_type: int                        # 0=hold, 1=advance, 2=rush, 3=charge
+    move_type: int                        # 0=move, 1=charge
     # Destination pointer (replaces sampled_angle, sampled_distance_frac)
     dest_candidates: np.ndarray | list    # (N, 2) int32 — actual candidates (unpadded)
     dest_mask: list[bool] | None = None   # (N,) — all True (unpadded); legacy, can be derived
@@ -151,9 +150,10 @@ class TacticalActivationRecord:
     # ~60 KB of features per activation).  Matchup arrays are references to
     # per-game data so they don't duplicate memory across activations.
     dest_recomp: dict | None = None
+    dest_advance_reachable: list[bool] | None = None  # per-candidate (unpadded)
     dest_selected_idx: int = -1            # index into candidates
     charge_target_idx: int = -1            # enemy slot for charge
-    shoot_target_idx: int = -1             # enemy slot for shooting (hold/advance)
+    shoot_target_idx: int = -1             # enemy slot for shooting (advance-reachable dest)
     shoot_mask: list[bool] | None = None   # enemy alive AND in weapon range (10 bools)
     post_move_rel: np.ndarray | None = None  # (30,) post-move relative features
     reward: float = 0.0
@@ -200,11 +200,13 @@ class _TacticalInferenceRequest:
     rush_distances: list[float]                    # per friendly slot
     max_weapon_ranges: list[float]                 # max ranged weapon range per friendly slot
     opponent_type_idx: int = 0                     # index into NUM_OPPONENT_TYPES (for value head conditioning)
+    player: str = "A"                              # "A" or "B" — physical side the acting model is on (needed to flip dest for post_move_rel)
     # Destination pointer inputs: per-unit candidate sets (precomputed by caller).
     # Keyed by unit slot index. The batched sampling code looks up the selected
     # unit's candidates after unit selection.
     dest_candidates_per_unit: dict | None = None   # {slot: (MAX_DEST_CANDIDATES, 2) int ndarray}
     dest_mask_per_unit: dict | None = None         # {slot: (MAX_DEST_CANDIDATES,) bool ndarray}
+    dest_advance_reachable_per_unit: dict | None = None  # {slot: (MAX_DEST_CANDIDATES,) bool ndarray}
     dest_features_per_unit: dict | None = None     # {slot: (MAX_DEST_CANDIDATES, DEST_FEATURE_DIM) float ndarray}
     # Lazy dest feature computation: raw ingredients passed so sampling code
     # can compute features only for the selected unit (instead of all alive units).
@@ -236,7 +238,7 @@ class _TacticalInferenceRequest:
 class _TacticalSamplingResult:
     """Sent back to episode generator with batched sampling outputs."""
     unit_idx: int
-    move_type: int              # 0-3
+    move_type: int              # 0=move, 1=charge
     dest_candidates: np.ndarray | list  # (N, 2) int32 unpadded candidates
     dest_mask: list[bool]              # (N,) all True
     dest_features: np.ndarray | list   # (N, DEST_FEATURE_DIM) float32 unpadded
@@ -248,6 +250,7 @@ class _TacticalSamplingResult:
     old_log_prob: float
     value: float
     shoot_mask: list[bool]      # enemy alive AND in weapon range (10 bools)
+    dest_advance_reachable: list[bool] | None = None  # per-candidate (unpadded)
     # Planning metadata (populated by coordinator when planning was used)
     was_planned: bool = False
     planning_improved: bool = False

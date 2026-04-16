@@ -54,8 +54,8 @@ class EntropyTargetTuner(nn.Module):
         dest_ent: torch.Tensor,      # (N,)
         charge_ent: torch.Tensor,    # (N,)
         shoot_ent: torch.Tensor,     # (N,)
-        is_adv_rush: torch.Tensor,   # (N,) bool — destination active
-        is_hold_adv: torch.Tensor,   # (N,) bool — shoot active
+        is_move: torch.Tensor,       # (N,) bool — destination active (non-charge, non-shaken)
+        is_can_shoot: torch.Tensor,  # (N,) bool — shoot active (advance-reachable dest)
         is_charge: torch.Tensor,     # (N,) bool — charge active
     ) -> torch.Tensor:
         """Compute the weighted entropy bonus for the policy loss.
@@ -67,17 +67,17 @@ class EntropyTargetTuner(nn.Module):
         bonus = self.get_alpha("unit").detach() * unit_ent.mean()
         bonus = bonus + self.get_alpha("move").detach() * move_ent.mean()
 
-        # Destination: only active for advance/rush
-        n_adv_rush = is_adv_rush.sum().clamp(min=1)
-        bonus = bonus + self.get_alpha("dest").detach() * (dest_ent * is_adv_rush).sum() / n_adv_rush
+        # Destination: active for move (non-charge, non-shaken)
+        n_move = is_move.sum().clamp(min=1)
+        bonus = bonus + self.get_alpha("dest").detach() * (dest_ent * is_move).sum() / n_move
 
         # Charge: only active for charge moves
         n_charge = is_charge.sum().clamp(min=1)
         bonus = bonus + self.get_alpha("charge").detach() * (charge_ent * is_charge).sum() / n_charge
 
-        # Shoot: only active for hold/advance
-        n_hold_adv = is_hold_adv.sum().clamp(min=1)
-        bonus = bonus + self.get_alpha("shoot").detach() * (shoot_ent * is_hold_adv).sum() / n_hold_adv
+        # Shoot: only active for advance-reachable destinations
+        n_can_shoot = is_can_shoot.sum().clamp(min=1)
+        bonus = bonus + self.get_alpha("shoot").detach() * (shoot_ent * is_can_shoot).sum() / n_can_shoot
 
         return bonus
 
@@ -88,8 +88,8 @@ class EntropyTargetTuner(nn.Module):
         dest_ent: torch.Tensor,       # (N,)
         charge_ent: torch.Tensor,     # (N,)
         shoot_ent: torch.Tensor,      # (N,)
-        is_adv_rush: torch.Tensor,    # (N,) bool
-        is_hold_adv: torch.Tensor,    # (N,) bool
+        is_move: torch.Tensor,        # (N,) bool — dest active (non-charge, non-shaken)
+        is_can_shoot: torch.Tensor,   # (N,) bool — shoot active (advance-reachable dest)
         is_charge: torch.Tensor,      # (N,) bool
         alive_mask: torch.Tensor,     # (N, 10) — for unit target
         enemy_alive_mask: torch.Tensor,  # (N, 10) — for charge target
@@ -107,16 +107,16 @@ class EntropyTargetTuner(nn.Module):
         unit_target = self.target_fraction * torch.log(n_alive)
         loss = loss + self.get_alpha("unit") * (unit_ent.detach() - unit_target).mean()
 
-        # Move type: fixed target
+        # Move type: fixed target (2-way: move/charge)
         loss = loss + self.get_alpha("move") * (move_ent.detach() - self.target_move).mean()
 
         # Destination pointer: normalised entropy = dest_ent / ln(N_valid)
         # Target is target_dest_fraction (e.g. 0.25 = 25% of max entropy)
-        if is_adv_rush.any() and dest_n_valid is not None:
-            n_ar = is_adv_rush.sum().clamp(min=1)
+        if is_move.any() and dest_n_valid is not None:
+            n_mv = is_move.sum().clamp(min=1)
             ln_n_valid = torch.log(dest_n_valid.float().clamp(min=1.0))  # (N,)
             normalised_ent = dest_ent.detach() / ln_n_valid.clamp(min=1.0)  # (N,)
-            mean_norm_ent = (normalised_ent * is_adv_rush).sum() / n_ar
+            mean_norm_ent = (normalised_ent * is_move).sum() / n_mv
             loss = loss + self.get_alpha("dest") * (mean_norm_ent - self.target_dest_fraction)
 
         # Charge target: target = fraction * ln(num_enemy_alive), only for charge steps
@@ -128,13 +128,13 @@ class EntropyTargetTuner(nn.Module):
             mean_charge_target = (charge_target * is_charge).sum() / n_ch
             loss = loss + self.get_alpha("charge") * (mean_charge_ent - mean_charge_target)
 
-        # Shoot target: target = fraction * ln(num_in_range), only for hold/advance steps
-        if is_hold_adv.any():
+        # Shoot target: target = fraction * ln(num_in_range), only for advance-reachable dest
+        if is_can_shoot.any():
             n_shootable = shoot_mask.sum(dim=-1).clamp(min=1).float()
             shoot_target = self.target_fraction * torch.log(n_shootable)
-            n_ha = is_hold_adv.sum().clamp(min=1)
-            mean_shoot_ent = (shoot_ent.detach() * is_hold_adv).sum() / n_ha
-            mean_shoot_target = (shoot_target * is_hold_adv).sum() / n_ha
+            n_cs = is_can_shoot.sum().clamp(min=1)
+            mean_shoot_ent = (shoot_ent.detach() * is_can_shoot).sum() / n_cs
+            mean_shoot_target = (shoot_target * is_can_shoot).sum() / n_cs
             loss = loss + self.get_alpha("shoot") * (mean_shoot_ent - mean_shoot_target)
 
         return loss

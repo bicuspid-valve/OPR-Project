@@ -4,6 +4,11 @@ from __future__ import annotations
 import math
 
 from board import Board, OBJECTIVES, OBJ_SEIZE_RANGE, HOME_OBJ_A, HOME_OBJ_B, dist, dist_sq
+
+
+def _obj_goal(obj: tuple) -> tuple[int, int]:
+    """Convert an objective position (possibly float) to an integer movement goal."""
+    return (int(round(obj[0])), int(round(obj[1])))
 from combat import (
     expected_damage_score, expected_melee_damage_score,
     models_in_range, can_shoot_any,
@@ -321,9 +326,9 @@ def _choose_holder_action(unit: UnitState,
     advance_dist = unit.unit.advance_distance
 
     if d <= advance_dist + OBJ_SEIZE_RANGE:
-        return "advance", obj, f"{obj_name} objective in advance range ({d:.0f}\" away)"
+        return "advance", _obj_goal(obj), f"{obj_name} objective in advance range ({d:.0f}\" away)"
 
-    return "rush", obj, f"{obj_name} objective not in advance range ({d:.0f}\" away)"
+    return "rush", _obj_goal(obj), f"{obj_name} objective not in advance range ({d:.0f}\" away)"
 
 
 def _nearest_enemy(unit: UnitState, enemies: list[UnitState]) -> UnitState | None:
@@ -491,8 +496,8 @@ def _choose_melee_holder_action(
         # No charge — rush/advance toward objective
         d = _dist_to_objective(unit, obj_idx)
         if d <= unit.unit.advance_distance + OBJ_SEIZE_RANGE:
-            return "advance", obj, None, f"{obj_name} objective in advance range ({d:.0f}\" away)"
-        return "rush", obj, None, f"{obj_name} objective not in advance range ({d:.0f}\" away)"
+            return "advance", _obj_goal(obj), None, f"{obj_name} objective in advance range ({d:.0f}\" away)"
+        return "rush", _obj_goal(obj), None, f"{obj_name} objective not in advance range ({d:.0f}\" away)"
 
     # On objective — charge only if target is within 4\" of objective
     charge_target = _pick_holder_charge_target(unit, enemies, obj)

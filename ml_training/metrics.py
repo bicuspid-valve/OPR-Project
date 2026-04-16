@@ -33,9 +33,16 @@ class TrainingMetrics:
     selfplay_hof_ml_results: deque = field(default_factory=lambda: deque(maxlen=200))
     selfplay_random_results: deque = field(default_factory=lambda: deque(maxlen=200))
     batch_logs: list[dict] = field(default_factory=list)
+    # Per-physical-side win rate tracking (A/B symmetry monitoring)
+    a_side_results: deque = field(default_factory=lambda: deque(maxlen=200))
+    b_side_results: deque = field(default_factory=lambda: deque(maxlen=200))
 
-    def record_game(self, result: str, opponent_type: str, army_type: str = "random") -> None:
-        win = 1.0 if result == "A" else (0.5 if result == "draw" else 0.0)
+    def record_game(self, result: str, opponent_type: str,
+                    army_type: str = "random",
+                    physical_side: str | None = None) -> None:
+        # result is main-perspective: "main" = main model won, "opp" = lost, "draw" = draw.
+        # Physical "A"/"B" is transformed in _run_games_batched_tactical before dispatch.
+        win = 1.0 if result == "main" else (0.5 if result == "draw" else 0.0)
         if opponent_type == "heuristic":
             self.heuristic_results.append(win)
             if army_type == "hof":
@@ -52,6 +59,13 @@ class TrainingMetrics:
                 self.selfplay_hof_ml_results.append(win)
             else:
                 self.selfplay_random_results.append(win)
+        # Track per-physical-side win rate (mirror self-play only —
+        # cleanest signal for game-engine symmetry)
+        if physical_side and opponent_type in ("selfplay_mirror", "mirror_b"):
+            if physical_side == "A":
+                self.a_side_results.append(win)
+            elif physical_side == "B":
+                self.b_side_results.append(win)
 
     @property
     def heuristic_win_rate(self) -> float:
@@ -93,6 +107,14 @@ class TrainingMetrics:
     @property
     def selfplay_random_win_rate(self) -> float:
         return self._wr(self.selfplay_random_results)
+
+    @property
+    def a_side_win_rate(self) -> float:
+        return self._wr(self.a_side_results)
+
+    @property
+    def b_side_win_rate(self) -> float:
+        return self._wr(self.b_side_results)
 
     def log_batch(self, batch_num: int, loss_metrics: dict,
                   heuristic_fraction: float) -> dict:

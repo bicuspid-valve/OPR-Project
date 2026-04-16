@@ -67,9 +67,9 @@ _MAX_MODELS = 10
 _MAX_SPEED = 24.0
 
 # Destination pointer constants
-DEST_FEATURE_DIM = 75       # per-hex feature vector size
+DEST_FEATURE_DIM = 76       # per-hex feature vector size (75 base + 1 advance-reachable flag)
 DEST_EMBED_DIM = 64         # embedding dimension for pointer cross-attention
-MAX_DEST_CANDIDATES = 512   # padded candidate set size
+MAX_DEST_CANDIDATES = 4096  # upper bound for candidate arrays; actual padding uses min(this, batch_max)
 
 # Pre-allocated zero arrays for missing unit slots (never mutated)
 _ZERO_RANGED_ROW = np.zeros((MAX_UNITS_PER_SIDE, NUM_RANGE_THRESHOLDS), dtype=np.float32)
@@ -178,10 +178,12 @@ def _expected_ranged_damage_at_range(
                         else max((7 - eff_def_normal) / 6.0, 1 / 6))
         wounds_normal = normal_hits * (1 - block_normal)
 
-        # Deadly multiplier
+        # Deadly multiplier (cap at model HP — overkill is wasted)
         if w.deadly:
-            wounds_nat6 *= w.deadly
-            wounds_normal *= w.deadly
+            model_hp = defender.tough if defender.tough > 0 else 1
+            effective_deadly = min(w.deadly, model_hp)
+            wounds_nat6 *= effective_deadly
+            wounds_normal *= effective_deadly
 
         weapon_wounds = wounds_nat6 + wounds_normal
 
@@ -270,10 +272,12 @@ def _expected_melee_damage_raw(
                         else max((7 - eff_def_normal) / 6.0, 1 / 6))
         wounds_normal = normal_hits * (1 - block_normal)
 
-        # Deadly multiplier
+        # Deadly multiplier (cap at model HP — overkill is wasted)
         if w.deadly:
-            wounds_nat6 *= w.deadly
-            wounds_normal *= w.deadly
+            model_hp = defender.tough if defender.tough > 0 else 1
+            effective_deadly = min(w.deadly, model_hp)
+            wounds_nat6 *= effective_deadly
+            wounds_normal *= effective_deadly
 
         weapon_wounds = wounds_nat6 + wounds_normal
 

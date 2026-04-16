@@ -14,8 +14,12 @@ import csv
 import sys
 import pathlib
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+import tkinter as tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 def load_csv(path: str) -> dict[str, np.ndarray]:
@@ -71,13 +75,13 @@ def main():
     n = len(data["batch"])
     print(f"Loaded {n} batches from {path.name}")
 
-    fig = plt.figure(figsize=(16, 26))
+    fig = plt.figure(figsize=(16, 30))
     fig.suptitle(
         f"Tactical Training Dashboard  (block avg = {block_size} batches)",
         fontsize=14,
         fontweight="bold",
     )
-    gs = GridSpec(6, 2, figure=fig, hspace=0.35, wspace=0.28)
+    gs = GridSpec(7, 2, figure=fig, hspace=0.45, wspace=0.28)
 
     # --- Panel 1: Win rates vs heuristic ---
     ax1 = fig.add_subplot(gs[0, 0])
@@ -149,11 +153,24 @@ def main():
     ax6.plot(bx, by, marker="o", markersize=3, linewidth=2.0, color="#8E44AD", label="Total")
     ent_cols = [c for c in data if c.startswith("ent_")]
     if ent_cols:
-        ent_colors = plt.cm.Set2(np.linspace(0, 1, len(ent_cols)))
-        for col, color in zip(ent_cols, ent_colors):
+        bold_palette = [
+            "#E6194B",  # red
+            "#3CB44B",  # green
+            "#0082C8",  # blue
+            "#F58231",  # orange
+            "#911EB4",  # purple
+            "#00CED1",  # dark turquoise
+            "#F032E6",  # magenta
+            "#BFEF45",  # lime
+            "#000075",  # navy
+            "#9A6324",  # brown
+        ]
+        for i, col in enumerate(ent_cols):
             head_name = col.replace("ent_", "")
             bx, by = block_average(data, col, block_size)
-            ax6.plot(bx, by, linewidth=1.2, color=color, alpha=0.7, label=head_name)
+            ax6.plot(bx, by, linewidth=1.6,
+                     color=bold_palette[i % len(bold_palette)],
+                     label=head_name)
         ax6.legend(fontsize=7, ncol=3)
     ax6.set_ylabel("Entropy")
     ax6.set_title("Policy Entropy (per head)")
@@ -218,22 +235,69 @@ def main():
     ax8.set_title("Planning Metrics")
     ax8.grid(alpha=0.3)
 
-    # --- Panel 9: Dest 4th component objective proximity loss ---
-    ax9 = fig.add_subplot(gs[4, :])
+    # --- Panel 9: A/B Side Symmetry ---
+    ax9a = fig.add_subplot(gs[4, 0])
+    _has_side_wr = "wr_side_a" in data and "wr_side_b" in data
+    if _has_side_wr:
+        bx, by = block_average(data, "wr_side_a", block_size)
+        ax9a.plot(bx, by, marker="o", markersize=2, linewidth=1.5,
+                  color="#2E86C1", label="A-side WR")
+        bx, by = block_average(data, "wr_side_b", block_size)
+        ax9a.plot(bx, by, marker="o", markersize=2, linewidth=1.5,
+                  color="#E74C3C", label="B-side WR")
+        ax9a.axhline(0.5, color="black", linestyle="--", linewidth=0.8, alpha=0.4)
+        ax9a.legend(fontsize=8)
+    else:
+        ax9a.text(0.5, 0.5, "wr_side_* not in CSV\n(older log format)",
+                  transform=ax9a.transAxes, ha="center", va="center",
+                  fontsize=10, color="gray")
+    ax9a.set_ylabel("Win Rate")
+    ax9a.set_title("Win Rate by Physical Side (mirror self-play)")
+    ax9a.set_ylim(0.2, 0.8)
+    ax9a.grid(alpha=0.3)
+
+    ax9b = fig.add_subplot(gs[4, 1])
+    _has_side_val = "val_side_a" in data and "val_side_b" in data
+    if _has_side_val:
+        bx_a, by_a = block_average(data, "val_side_a", block_size)
+        bx_b, by_b = block_average(data, "val_side_b", block_size)
+        ax9b.plot(bx_a, by_a, marker="o", markersize=2, linewidth=1.5,
+                  color="#2E86C1", label="V (A-side)")
+        ax9b.plot(bx_b, by_b, marker="o", markersize=2, linewidth=1.5,
+                  color="#E74C3C", label="V (B-side)")
+        # Plot the gap (V_A + V_B, should be ~0)
+        min_len = min(len(by_a), len(by_b))
+        if min_len > 0:
+            gap_x = bx_a[:min_len]
+            gap_y = by_a[:min_len] + by_b[:min_len]
+            ax9b.plot(gap_x, gap_y, linewidth=1.5, linestyle="--",
+                      color="#27AE60", label="V_A + V_B (gap)")
+        ax9b.axhline(0, color="black", linestyle="--", linewidth=0.8, alpha=0.4)
+        ax9b.legend(fontsize=7)
+    else:
+        ax9b.text(0.5, 0.5, "val_side_* not in CSV\n(older log format)",
+                  transform=ax9b.transAxes, ha="center", va="center",
+                  fontsize=10, color="gray")
+    ax9b.set_ylabel("Mean Value")
+    ax9b.set_title("Value by Physical Side (mirror self-play)")
+    ax9b.grid(alpha=0.3)
+
+    # --- Panel 10: Dest 4th component objective proximity loss ---
+    ax10_dest = fig.add_subplot(gs[5, :])
     if "dest_obj_prox" in data:
         bx, by = block_average(data, "dest_obj_prox", block_size)
-        ax9.plot(bx, by, marker="o", markersize=2, linewidth=1.5, color="#27AE60")
+        ax10_dest.plot(bx, by, marker="o", markersize=2, linewidth=1.5, color="#27AE60")
     else:
-        ax9.text(0.5, 0.5, "dest_obj_prox not in CSV\n(older log format)",
-                 transform=ax9.transAxes, ha="center", va="center",
-                 fontsize=10, color="gray")
-    ax9.set_ylabel("Mean Distance to Nearest Obj")
-    ax9.set_title("4th Dest Component: Objective Proximity (advance/rush only)")
-    ax9.set_ylim(bottom=0)
-    ax9.grid(alpha=0.3)
+        ax10_dest.text(0.5, 0.5, "dest_obj_prox not in CSV\n(older log format)",
+                       transform=ax10_dest.transAxes, ha="center", va="center",
+                       fontsize=10, color="gray")
+    ax10_dest.set_ylabel("Mean Distance to Nearest Obj")
+    ax10_dest.set_title("4th Dest Component: Objective Proximity (advance/rush only)")
+    ax10_dest.set_ylim(bottom=0)
+    ax10_dest.grid(alpha=0.3)
 
-    # --- Panel 10: Per-head alpha coefficients (full width) ---
-    ax10 = fig.add_subplot(gs[5, :])
+    # --- Panel 11: Per-head alpha coefficients (full width) ---
+    ax10 = fig.add_subplot(gs[6, :])
     alpha_cols = [c for c in data if c.startswith("alpha_")]
     colors10 = plt.cm.Set2(np.linspace(0, 1, len(alpha_cols)))
     for col, color in zip(alpha_cols, colors10):
@@ -246,10 +310,48 @@ def main():
     ax10.legend(fontsize=7, ncol=2)
     ax10.grid(alpha=0.3)
 
+    # Enable minor gridlines on all panels for readability
+    for ax in fig.get_axes():
+        ax.minorticks_on()
+        ax.grid(which='minor', alpha=0.12, linewidth=0.5)
+
     out_path = path.parent.parent / "training_metrics.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved to {out_path}")
-    plt.show()
+    # -- Scrollable display window --
+    root = tk.Tk()
+    root.title("Tactical Training Dashboard")
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry(f"{min(sw, 1700)}x{sh - 100}")
+
+    outer = tk.Frame(root)
+    outer.pack(fill=tk.BOTH, expand=True)
+
+    tk_canvas = tk.Canvas(outer)
+    vbar = tk.Scrollbar(outer, orient=tk.VERTICAL, command=tk_canvas.yview)
+    tk_canvas.configure(yscrollcommand=vbar.set)
+    vbar.pack(side=tk.RIGHT, fill=tk.Y)
+    tk_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    inner = tk.Frame(tk_canvas)
+    tk_canvas.create_window((0, 0), window=inner, anchor=tk.NW)
+
+    fig_canvas = FigureCanvasTkAgg(fig, master=inner)
+    fig_canvas.draw()
+    fig_canvas.get_tk_widget().pack()
+
+    inner.update_idletasks()
+    tk_canvas.configure(scrollregion=tk_canvas.bbox("all"))
+
+    def _scroll(event):
+        if event.num == 4:
+            tk_canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            tk_canvas.yview_scroll(3, "units")
+    tk_canvas.bind_all("<Button-4>", _scroll)
+    tk_canvas.bind_all("<Button-5>", _scroll)
+
+    root.mainloop()
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ fast_core.USE_C_EXT = fast_core.is_available()
 
 from ml_model_tactical import (
     TacticalModel, NUM_MOVE_TYPES,
-    MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+    MOVE_MOVE, MOVE_CHARGE,
 )
 from ml_training import load_model_state_dict, sample_tactical_actions_no_grad
 from ml_features import encode_state_tactical, precompute_damage, MAX_UNITS_PER_SIDE, extract_can_charge_mask
@@ -220,14 +220,12 @@ def test_components(model, hof_data, n_trials=10):
                     if mt == 1: px,py = compute_post_move_position(cx,cy,sa,sf*ad[uid])
                     elif mt == 2: px,py = compute_post_move_position(cx,cy,sa,sf*rd[uid])
                     else: px,py = cx,cy
-                    cl = model.charge_target_head(h_uf_m).squeeze(0).masked_fill(~eam, float('-inf')).masked_fill(~ccm, float('-inf'))
+                    cl = model.compute_charge_logits(h_b.squeeze(0), u_att.squeeze(0), uid, eam, ccm)
                     ct = int(cl.argmax().item()) if is_am else (int(torch.multinomial(torch.softmax(cl,-1),1).item()) if eam.any() else 0)
                     pmr = compute_post_move_rel(px, py, ep)
-                    si_in = torch.cat([h_b, uf_b, moh, pmr.unsqueeze(0)], -1)
-                    sl = model.shoot_target_head(si_in).squeeze(0)
                     wr = max((w.range_inches for w in unit.unit.weapons if not w.melee), default=0.0)
                     sm = compute_in_range_mask(pmr, float(wr), eam)
-                    sl = sl.masked_fill(~sm, float('-inf'))
+                    sl = model.compute_shoot_logits(h_b.squeeze(0), u_att.squeeze(0), uid, pmr, eam, shoot_range_mask=sm)
                     st = int(sl.argmax().item()) if is_am else (int(torch.multinomial(torch.softmax(sl,-1),1).item()) if sm.any() else 0)
                     rank = torch.argsort(sl, descending=True).tolist()
                     dest = (px,py) if mt in (1,2) else None
@@ -273,10 +271,9 @@ def test_components(model, hof_data, n_trials=10):
             moh2 = F.one_hot(torch.tensor(ch[1]), NUM_MOVE_TYPES).float().unsqueeze(0)
             h_uf_m2 = torch.cat([h_b, uf2_b, moh2], dim=-1)
             model.destination_head(h_uf_m2)
-            model.charge_target_head(h_uf_m2)
+            model.compute_charge_logits(h_b.squeeze(0), u_att.squeeze(0), ch[0], eam, extract_can_charge_mask(state_vec, ch[0]))
             pmr2 = compute_post_move_rel(fp[ch[0]][0], fp[ch[0]][1], ep)
-            si2 = torch.cat([h_b, uf2_b, moh2, pmr2.unsqueeze(0)], -1)
-            model.shoot_target_head(si2)
+            model.compute_shoot_logits(h_b.squeeze(0), u_att.squeeze(0), ch[0], pmr2, eam)
             model.value_head(h, round_oh, model._get_opp_embed(h, 0))
         results["logprob"].append(time.perf_counter() - t0)
 

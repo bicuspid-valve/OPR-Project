@@ -52,7 +52,7 @@ from ml_integration_tactical import (
 )
 from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
-    NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+    NUM_MOVE_TYPES, MOVE_MOVE, MOVE_CHARGE,
 )
 from simulation import start_round, end_round, score_game
 
@@ -432,16 +432,14 @@ def simulate_forward(
         unit_cx, unit_cy = friendly_positions[selected_idx]
 
         dest = None
-        if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+        if move_type == MOVE_MOVE:
             enemy_pos_set = _collect_enemy_positions(opp_units)
-            candidates, cand_mask = compute_destination_candidates(
-                selected_unit, move_type, board, enemy_pos_set, player)
+            candidates, cand_mask, adv_reachable = compute_destination_candidates(
+                selected_unit, board, enemy_pos_set, player)
             eam_np = np.array(
                 [(i < len(opp_units) and opp_units[i].models_alive > 0)
                  for i in range(MAX_UNITS_PER_SIDE)], dtype=np.bool_)
-            budget = (float(selected_unit.unit.advance_distance)
-                      if move_type == MOVE_ADVANCE
-                      else float(selected_unit.unit.rush_distance))
+            budget = float(selected_unit.unit.rush_distance)
             _n_f = len(my_units)
             _n_e = len(opp_units)
             _fr_matchup = np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32)
@@ -449,7 +447,8 @@ def simulate_forward(
             _mm_matchup = np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32)
             dest_feats_np = compute_destination_features(
                 candidates, cand_mask, selected_unit, selected_idx, player,
-                opp_units, eam_np, _fr_matchup, _er_matchup, _mm_matchup, budget)
+                opp_units, eam_np, _fr_matchup, _er_matchup, _mm_matchup, budget,
+                advance_reachable=adv_reachable)
             dest_features_t = torch.from_numpy(dest_feats_np).unsqueeze(0)
             dest_mask_t = torch.from_numpy(cand_mask.astype(np.bool_)).unsqueeze(0)
 
@@ -667,9 +666,9 @@ def _batched_argmax_forward(
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)       # (B, 272)
 
     # Charge target — argmax, mask by alive AND chargeable
-    charge_logits = model.charge_target_head(h_uf_m)                   # (B, 10)
-    charge_logits = charge_logits.masked_fill(~enemy_batch, float('-inf'))
-    charge_logits = charge_logits.masked_fill(~can_charge_batch, float('-inf'))
+    charge_logits = model.compute_charge_logits(
+        h, units, unit_indices, enemy_batch, can_charge_batch,
+    )                                                                  # (B, 10)
     no_enemies = ~enemy_batch.any(dim=-1)                              # (B,)
     charge_indices = charge_logits.argmax(dim=-1)                      # (B,)
 
@@ -692,15 +691,15 @@ def _batched_argmax_forward(
         dest_cols.append(int(round(px)))
         dest_rows.append(int(round(py)))
 
-    # Batched shoot target head
+    # Batched shoot pointer head
     pmr_batch = torch.stack(pmr_tensors)                               # (B, 30)
-    shoot_input = torch.cat([h, unit_features, move_onehot, pmr_batch], dim=-1)
-    shoot_logits = model.shoot_target_head(shoot_input)                # (B, 10)
-    # Mask by alive AND in-range (matching training masking)
     max_wr_list = [requests[i].max_weapon_ranges[unit_list[i]] for i in range(n)]
     max_wr_t = torch.tensor(max_wr_list, dtype=torch.float32)
     shoot_mask_batch = compute_in_range_mask_batched(pmr_batch, max_wr_t, enemy_batch)
-    shoot_logits = shoot_logits.masked_fill(~shoot_mask_batch, float('-inf'))
+    shoot_logits = model.compute_shoot_logits(
+        h, units, unit_indices, pmr_batch, enemy_batch,
+        shoot_range_mask=shoot_mask_batch,
+    )                                                                  # (B, 10)
     no_shootable = ~shoot_mask_batch.any(dim=-1)                       # (B,)
     shoot_logits = shoot_logits.masked_fill(no_shootable.unsqueeze(-1), 0.0)
     shoot_indices = shoot_logits.argmax(dim=-1)                        # (B,)
@@ -841,7 +840,7 @@ def _rollout_generator(
         # In batched rollouts (centroid fallback), dest_col/dest_row are
         # model-space centroid coords; flip to game-space for player B.
         dest = None
-        if mt in (MOVE_ADVANCE, MOVE_RUSH):
+        if mt == MOVE_MOVE:
             gx, gy = float(result.dest_col), float(result.dest_row)
             if la_player == "B":
                 gx = _flip_x(gx)
@@ -851,6 +850,7 @@ def _rollout_generator(
         la_action, la_goal, la_charge, la_reason = execute_decoded_decision(
             selected_unit, opp_units, mt, dest,
             result.charge_target_idx, result.shoot_target_idx,
+            is_advance_reachable=getattr(result, 'is_advance_reachable', True),
         )
 
         opp_wiped = _execute_activation(
@@ -1129,66 +1129,63 @@ def plan_activation(
             move_logits[MOVE_CHARGE] = float('-inf')
         move_probs = torch.softmax(move_logits, dim=-1)
 
-        # Precompute destination candidates for advance/rush (shared across samples)
-        _dest_cache: dict[int, tuple] = {}  # move_type → (candidates, mask, features, logits)
-        for mt_candidate in (MOVE_ADVANCE, MOVE_RUSH):
-            if move_probs[mt_candidate].item() > 0:
-                cands, cmask = compute_destination_candidates(
-                    unit, mt_candidate, board, enemy_pos_set, player)
-                budget = (float(unit.unit.advance_distance)
-                          if mt_candidate == MOVE_ADVANCE
-                          else float(unit.unit.rush_distance))
-                _n_f = len(friendly_units)
-                _n_e = len(enemy_units)
-                _fr_m = (np.array(friendly_ranged_matchups, dtype=np.float32)
-                         if friendly_ranged_matchups is not None
-                         else np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
-                _er_m = (np.array(enemy_ranged_matchups, dtype=np.float32)
-                         if enemy_ranged_matchups is not None
-                         else np.zeros((_n_e, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
-                _mm_m = (np.array(friendly_melee_matchups, dtype=np.float32).reshape(_n_f, -1)[:, :MAX_UNITS_PER_SIDE]
-                         if friendly_melee_matchups is not None
-                         else np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32))
-                dest_feats_np = compute_destination_features(
-                    cands, cmask, unit, uid, player,
-                    enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget)
-                dest_features_t = torch.from_numpy(dest_feats_np).unsqueeze(0)
-                dest_mask_t = torch.from_numpy(cmask.astype(np.bool_)).unsqueeze(0)
+        # Precompute destination candidates (unified rush budget)
+        _dest_cache_move: tuple | None = None
+        if move_probs[MOVE_MOVE].item() > 0:
+            cands, cmask, adv_reach = compute_destination_candidates(
+                unit, board, enemy_pos_set, player)
+            budget = float(unit.unit.rush_distance)
+            _n_f = len(friendly_units)
+            _n_e = len(enemy_units)
+            _fr_m = (np.array(friendly_ranged_matchups, dtype=np.float32)
+                     if friendly_ranged_matchups is not None
+                     else np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+            _er_m = (np.array(enemy_ranged_matchups, dtype=np.float32)
+                     if enemy_ranged_matchups is not None
+                     else np.zeros((_n_e, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+            _mm_m = (np.array(friendly_melee_matchups, dtype=np.float32).reshape(_n_f, -1)[:, :MAX_UNITS_PER_SIDE]
+                     if friendly_melee_matchups is not None
+                     else np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32))
+            dest_feats_np = compute_destination_features(
+                cands, cmask, unit, uid, player,
+                enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget,
+                advance_reachable=adv_reach)
+            dest_features_t = torch.from_numpy(dest_feats_np).unsqueeze(0)
+            dest_mask_t = torch.from_numpy(cmask.astype(np.bool_)).unsqueeze(0)
 
-                # Compute logits using move-type-specific h_uf_m
-                mt_onehot = F.one_hot(
-                    torch.tensor(mt_candidate), NUM_MOVE_TYPES
-                ).float().unsqueeze(0)
-                h_uf_m_cand = torch.cat([h_b, uf_b, mt_onehot], dim=-1)
-                dest_logits = model.compute_dest_logits(
-                    h_uf_m_cand, dest_features_t, dest_mask_t).squeeze(0)
-                _dest_cache[mt_candidate] = (cands, cmask, dest_feats_np, dest_logits)
+            mt_onehot = F.one_hot(
+                torch.tensor(MOVE_MOVE), NUM_MOVE_TYPES
+            ).float().unsqueeze(0)
+            h_uf_m_cand = torch.cat([h_b, uf_b, mt_onehot], dim=-1)
+            dest_logits = model.compute_dest_logits(
+                h_uf_m_cand, dest_features_t, dest_mask_t).squeeze(0)
+            _dest_cache_move = (cands, cmask, adv_reach, dest_feats_np, dest_logits)
 
         for sample_i in range(C):
             # 1. Sample move type
             move_type = int(torch.multinomial(move_probs, 1).item())
             move_onehot = F.one_hot(
                 torch.tensor(move_type), NUM_MOVE_TYPES
-            ).float().unsqueeze(0)  # (1, 4)
+            ).float().unsqueeze(0)
 
-            h_uf_m = torch.cat([h_b, uf_b, move_onehot], dim=-1)  # (1, 272)
+            h_uf_m = torch.cat([h_b, uf_b, move_onehot], dim=-1)
 
             # 2. Destination pointer: sample or cycle through top-K candidates
             unit_cx, unit_cy = friendly_positions[uid]
             dest_col, dest_row = int(round(unit_cx)), int(round(unit_cy))  # default: centroid
+            _pick_ar = True  # advance-reachable for selected dest
 
-            if move_type in (MOVE_ADVANCE, MOVE_RUSH) and move_type in _dest_cache:
-                cands, cmask, _, dest_logits = _dest_cache[move_type]
+            if move_type == MOVE_MOVE and _dest_cache_move is not None:
+                cands, cmask, adv_reach, _, dest_logits = _dest_cache_move
                 n_valid = int(cmask.sum())
                 if n_valid > 0:
-                    # Cycle through top candidates across samples for diversity
                     dest_probs = torch.softmax(dest_logits, dim=-1)
                     _, top_dest = torch.topk(dest_probs, min(C, n_valid))
                     pick_idx = top_dest[sample_i % len(top_dest)].item()
                     dest_col = int(cands[pick_idx, 0])
                     dest_row = int(cands[pick_idx, 1])
+                    _pick_ar = bool(adv_reach[pick_idx])
 
-                # Compute post-move position in model-space
                 post_x, post_y = float(dest_col), float(dest_row)
                 if player == "B":
                     post_x = _flip_x(post_x)
@@ -1196,10 +1193,11 @@ def plan_activation(
             else:
                 post_x, post_y = unit_cx, unit_cy
 
-            # 3. Sample charge target (conditioned on h + unit_feat + move)
-            charge_logits = model.charge_target_head(h_uf_m).squeeze(0)
-            charge_logits = charge_logits.masked_fill(~enemy_alive_mask, float('-inf'))
-            charge_logits = charge_logits.masked_fill(~can_charge_mask, float('-inf'))
+            # 3. Sample charge target (pointer head)
+            charge_logits = model.compute_charge_logits(
+                h_b.squeeze(0), units.squeeze(0), uid,
+                enemy_alive_mask, can_charge_mask,
+            )
             no_chargeable = no_enemies or not (enemy_alive_mask & can_charge_mask).any()
             if no_chargeable:
                 charge_target_idx = 0
@@ -1209,11 +1207,13 @@ def plan_activation(
 
             # 4. Compute post_move_rel and sample shoot target
             post_move_rel = compute_post_move_rel(post_x, post_y, enemy_positions)
-            shoot_input = torch.cat([h_b, uf_b, move_onehot, post_move_rel.unsqueeze(0)], dim=-1)
-            shoot_logits = model.shoot_target_head(shoot_input).squeeze(0)
             shoot_range_mask = compute_in_range_mask(
                 post_move_rel, float(max_wr), enemy_alive_mask)
-            shoot_logits = shoot_logits.masked_fill(~shoot_range_mask, float('-inf'))
+            shoot_logits = model.compute_shoot_logits(
+                h_b.squeeze(0), units.squeeze(0), uid,
+                post_move_rel, enemy_alive_mask,
+                shoot_range_mask=shoot_range_mask,
+            )
             no_shootable = no_enemies or not shoot_range_mask.any()
             if no_shootable:
                 shoot_target_idx = 0
@@ -1225,13 +1225,14 @@ def plan_activation(
 
             # Convert to game-space destination
             dest = None
-            if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+            if move_type == MOVE_MOVE:
                 dest = (dest_col, dest_row)
 
             # Resolve the candidate action
             action, goal, charge_target_unit, reason = execute_decoded_decision(
                 unit, enemy_units, move_type, dest,
                 charge_target_idx, shoot_target_idx,
+                is_advance_reachable=_pick_ar,
             )
 
             # Convert charge_target reference to index for serialization
@@ -1250,7 +1251,7 @@ def plan_activation(
 
             will_not_shoot = (
                 no_shootable
-                or move_type == MOVE_RUSH
+                or (move_type == MOVE_MOVE and not _pick_ar)
                 or move_type == MOVE_CHARGE
             )
             candidate_actions.append((
@@ -1485,39 +1486,37 @@ def plan_training_activation(
             move_logits[MOVE_CHARGE] = float('-inf')
         move_probs = torch.softmax(move_logits, dim=-1)
 
-        # Precompute destination candidates for advance/rush
-        _dest_cache: dict[int, tuple] = {}
-        for mt_candidate in (MOVE_ADVANCE, MOVE_RUSH):
-            if move_probs[mt_candidate].item() > 0:
-                cands, cmask = compute_destination_candidates(
-                    unit, mt_candidate, board, enemy_pos_set, player)
-                budget = (advance_distances[uid]
-                          if mt_candidate == MOVE_ADVANCE
-                          else rush_distances[uid])
-                _n_f = len(friendly_units)
-                _n_e = len(enemy_units)
-                _fr_m = (np.array(friendly_ranged_matchups, dtype=np.float32)
-                         if friendly_ranged_matchups is not None
-                         else np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
-                _er_m = (np.array(enemy_ranged_matchups, dtype=np.float32)
-                         if enemy_ranged_matchups is not None
-                         else np.zeros((_n_e, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
-                _mm_m = (np.array(friendly_melee_matchups, dtype=np.float32).reshape(_n_f, -1)[:, :MAX_UNITS_PER_SIDE]
-                         if friendly_melee_matchups is not None
-                         else np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32))
-                dest_feats_np = compute_destination_features(
-                    cands, cmask, unit, uid, player,
-                    enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget)
-                dest_features_t = torch.from_numpy(dest_feats_np).unsqueeze(0)
-                dest_mask_t = torch.from_numpy(cmask.astype(np.bool_)).unsqueeze(0)
+        # Precompute destination candidates (unified rush budget)
+        _dest_cache_move: tuple | None = None
+        if move_probs[MOVE_MOVE].item() > 0:
+            cands, cmask, adv_reach = compute_destination_candidates(
+                unit, board, enemy_pos_set, player)
+            budget = float(unit.unit.rush_distance)
+            _n_f = len(friendly_units)
+            _n_e = len(enemy_units)
+            _fr_m = (np.array(friendly_ranged_matchups, dtype=np.float32)
+                     if friendly_ranged_matchups is not None
+                     else np.zeros((_n_f, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+            _er_m = (np.array(enemy_ranged_matchups, dtype=np.float32)
+                     if enemy_ranged_matchups is not None
+                     else np.zeros((_n_e, MAX_UNITS_PER_SIDE, 7), dtype=np.float32))
+            _mm_m = (np.array(friendly_melee_matchups, dtype=np.float32).reshape(_n_f, -1)[:, :MAX_UNITS_PER_SIDE]
+                     if friendly_melee_matchups is not None
+                     else np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32))
+            dest_feats_np = compute_destination_features(
+                cands, cmask, unit, uid, player,
+                enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget,
+                advance_reachable=adv_reach)
+            dest_features_t = torch.from_numpy(dest_feats_np).unsqueeze(0)
+            dest_mask_t = torch.from_numpy(cmask.astype(np.bool_)).unsqueeze(0)
 
-                mt_onehot = F.one_hot(
-                    torch.tensor(mt_candidate), NUM_MOVE_TYPES
-                ).float().unsqueeze(0)
-                h_uf_m_cand = torch.cat([h_b, uf_b, mt_onehot], dim=-1)
-                dest_logits = model.compute_dest_logits(
-                    h_uf_m_cand, dest_features_t, dest_mask_t).squeeze(0)
-                _dest_cache[mt_candidate] = (cands, cmask, dest_logits)
+            mt_onehot = F.one_hot(
+                torch.tensor(MOVE_MOVE), NUM_MOVE_TYPES
+            ).float().unsqueeze(0)
+            h_uf_m_cand = torch.cat([h_b, uf_b, mt_onehot], dim=-1)
+            dest_logits = model.compute_dest_logits(
+                h_uf_m_cand, dest_features_t, dest_mask_t).squeeze(0)
+            _dest_cache_move = (cands, cmask, adv_reach, dest_logits)
 
         # Argmax unit: 1 argmax action + C-1 sampled actions; others: C sampled
         n_samples = C
@@ -1538,9 +1537,10 @@ def plan_training_activation(
             # Destination pointer
             unit_cx, unit_cy = friendly_positions[uid]
             dest_col, dest_row = int(round(unit_cx)), int(round(unit_cy))
+            _pick_ar = True  # advance-reachable for selected dest
 
-            if move_type in (MOVE_ADVANCE, MOVE_RUSH) and move_type in _dest_cache:
-                cands, cmask, dest_logits = _dest_cache[move_type]
+            if move_type == MOVE_MOVE and _dest_cache_move is not None:
+                cands, cmask, adv_reach, dest_logits = _dest_cache_move
                 n_valid = int(cmask.sum())
                 if n_valid > 0:
                     if is_argmax_action:
@@ -1551,6 +1551,7 @@ def plan_training_activation(
                         pick_idx = top_dest[si % len(top_dest)].item()
                     dest_col = int(cands[pick_idx, 0])
                     dest_row = int(cands[pick_idx, 1])
+                    _pick_ar = bool(adv_reach[pick_idx])
 
                 post_x, post_y = float(dest_col), float(dest_row)
                 if player == "B":
@@ -1559,12 +1560,11 @@ def plan_training_activation(
             else:
                 post_x, post_y = unit_cx, unit_cy
 
-            # Charge target — mask by alive AND chargeable
-            charge_logits = model.charge_target_head(h_uf_m).squeeze(0)
-            charge_logits = charge_logits.masked_fill(
-                ~enemy_alive_mask, float('-inf'))
-            charge_logits = charge_logits.masked_fill(
-                ~can_charge_mask, float('-inf'))
+            # Charge target (pointer head)
+            charge_logits = model.compute_charge_logits(
+                h_b.squeeze(0), units.squeeze(0), uid,
+                enemy_alive_mask, can_charge_mask,
+            )
             no_chargeable = no_enemies or not (enemy_alive_mask & can_charge_mask).any()
             if no_chargeable:
                 charge_target_idx = 0
@@ -1575,16 +1575,16 @@ def plan_training_activation(
                 charge_target_idx = int(
                     torch.multinomial(charge_probs, 1).item())
 
-            # Shoot target
+            # Shoot target (pointer head)
             post_move_rel = compute_post_move_rel(
                 post_x, post_y, enemy_positions)
-            shoot_input = torch.cat(
-                [h_b, uf_b, move_onehot, post_move_rel.unsqueeze(0)], dim=-1)
-            shoot_logits = model.shoot_target_head(shoot_input).squeeze(0)
             shoot_range_mask = compute_in_range_mask(
                 post_move_rel, float(max_wr), enemy_alive_mask)
-            shoot_logits = shoot_logits.masked_fill(
-                ~shoot_range_mask, float('-inf'))
+            shoot_logits = model.compute_shoot_logits(
+                h_b.squeeze(0), units.squeeze(0), uid,
+                post_move_rel, enemy_alive_mask,
+                shoot_range_mask=shoot_range_mask,
+            )
             no_shootable = no_enemies or not shoot_range_mask.any()
             if no_shootable:
                 shoot_target_idx = 0
@@ -1600,13 +1600,14 @@ def plan_training_activation(
 
             # Resolve to game-space action
             dest = None
-            if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+            if move_type == MOVE_MOVE:
                 dest = (dest_col, dest_row)
 
             action_str, goal, charge_target_unit, reason = \
                 execute_decoded_decision(
                     unit, enemy_units, move_type, dest,
                     charge_target_idx, shoot_target_idx,
+                    is_advance_reachable=_pick_ar,
                 )
 
             ct_idx = -1
@@ -1623,7 +1624,7 @@ def plan_training_activation(
 
             will_not_shoot = (
                 no_shootable
-                or move_type == MOVE_RUSH
+                or (move_type == MOVE_MOVE and not _pick_ar)
                 or move_type == MOVE_CHARGE
             )
             candidate_actions.append((
@@ -1704,7 +1705,7 @@ def plan_training_activation(
                 key_ct = (uid_ci, ct)
                 charge_value_sums[key_ct] = charge_value_sums.get(key_ct, 0.0) + val_ci
                 charge_value_counts[key_ct] = charge_value_counts.get(key_ct, 0) + 1
-        if mt in (MOVE_HOLD, MOVE_ADVANCE):
+        if mt == MOVE_MOVE and not ca[11]:  # will_not_shoot == False means can shoot
             st = ca[6]  # shoot_target_idx
             if st >= 0:
                 key_st = (uid_ci, st)
@@ -1759,12 +1760,12 @@ def plan_training_activation(
     # distilling toward targets that aren't reachable from some positions.
     planning_shoot_indices = []
     planning_shoot_values = []
-    # Collect shoot masks for all hold/advance candidates of the chosen unit
+    # Collect shoot masks for all MOVE_MOVE candidates that can shoot
     _chosen_shoot_masks = []
     for ci, uid_ci in enumerate(candidate_to_unit):
         if uid_ci == chosen_uid:
             ca = candidate_actions[ci]
-            if ca[1] in (MOVE_HOLD, MOVE_ADVANCE):
+            if ca[1] == MOVE_MOVE and not ca[11]:  # can shoot (will_not_shoot == False)
                 _chosen_shoot_masks.append(candidate_shoot_masks[ci])
     if _chosen_shoot_masks:
         # Intersection: target must be in range from every candidate position
@@ -1807,14 +1808,13 @@ def plan_training_activation(
 
     # Destination pointer log-prob (categorical over candidate hexes)
     dest_lp = 0.0
-    if chosen_move_type in (MOVE_ADVANCE, MOVE_RUSH):
-        # Recompute candidates for the chosen unit + move type
+    _chosen_ar = True  # advance-reachable for chosen dest
+    if chosen_move_type == MOVE_MOVE:
+        # Recompute candidates for the chosen unit
         chosen_unit = friendly_units[chosen_uid]
-        cands_ch, cmask_ch = compute_destination_candidates(
-            chosen_unit, chosen_move_type, board, enemy_pos_set, player)
-        budget_ch = (advance_distances[chosen_uid]
-                     if chosen_move_type == MOVE_ADVANCE
-                     else rush_distances[chosen_uid])
+        cands_ch, cmask_ch, adv_reach_ch = compute_destination_candidates(
+            chosen_unit, board, enemy_pos_set, player)
+        budget_ch = float(chosen_unit.unit.rush_distance)
         _n_f = len(friendly_units)
         _n_e = len(enemy_units)
         _fr_m = (np.array(friendly_ranged_matchups, dtype=np.float32)
@@ -1828,7 +1828,8 @@ def plan_training_activation(
                  else np.zeros((_n_e, MAX_UNITS_PER_SIDE), dtype=np.float32))
         dest_feats_ch = compute_destination_features(
             cands_ch, cmask_ch, chosen_unit, chosen_uid, player,
-            enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget_ch)
+            enemy_units, eam_np, _fr_m, _er_m, _mm_m, budget_ch,
+            advance_reachable=adv_reach_ch)
         dest_features_ch_t = torch.from_numpy(dest_feats_ch).unsqueeze(0)
         dest_mask_ch_t = torch.from_numpy(cmask_ch.astype(np.bool_)).unsqueeze(0)
         dest_logits_ch = model.compute_dest_logits(
@@ -1841,15 +1842,15 @@ def plan_training_activation(
                     and int(cands_ch[ci_ch, 1]) == chosen_dest_row):
                 chosen_cand_idx = ci_ch
                 break
+        _chosen_ar = bool(adv_reach_ch[chosen_cand_idx])
         dest_lp = float(dest_log_probs[chosen_cand_idx].item())
         dest_lp = max(-20.0, min(20.0, dest_lp))
 
-    # Charge log-prob — mask by alive AND chargeable
-    charge_logits_ch = model.charge_target_head(h_uf_m_ch).squeeze(0)
-    charge_logits_ch = charge_logits_ch.masked_fill(
-        ~enemy_alive_mask, float('-inf'))
-    charge_logits_ch = charge_logits_ch.masked_fill(
-        ~can_charge_mask, float('-inf'))
+    # Charge log-prob (pointer head)
+    charge_logits_ch = model.compute_charge_logits(
+        h_b.squeeze(0), units.squeeze(0), chosen_uid,
+        enemy_alive_mask, can_charge_mask,
+    )
     no_chargeable = no_enemies or not (enemy_alive_mask & can_charge_mask).any()
     if no_chargeable:
         charge_lp = 0.0
@@ -1860,7 +1861,7 @@ def plan_training_activation(
 
     # Shoot log-prob (need post-move position for chosen action)
     unit_cx, unit_cy = friendly_positions[chosen_uid]
-    if chosen_move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if chosen_move_type == MOVE_MOVE:
         ch_px, ch_py = float(chosen_dest_col), float(chosen_dest_row)
         if player == "B":
             ch_px = _flip_x(ch_px)
@@ -1869,16 +1870,15 @@ def plan_training_activation(
         ch_px, ch_py = unit_cx, unit_cy
 
     ch_pmr = compute_post_move_rel(ch_px, ch_py, enemy_positions)
-    ch_shoot_input = torch.cat(
-        [h_b, uf_b, move_onehot_ch, ch_pmr.unsqueeze(0)], dim=-1)
-    ch_shoot_logits = model.shoot_target_head(ch_shoot_input).squeeze(0)
     ch_max_wr = max(
         (w.range_inches for w in friendly_units[chosen_uid].unit.weapons
          if not w.melee), default=0.0)
     ch_shoot_mask = compute_in_range_mask(
         ch_pmr, float(ch_max_wr), enemy_alive_mask)
-    ch_shoot_logits = ch_shoot_logits.masked_fill(
-        ~ch_shoot_mask, float('-inf'))
+    ch_shoot_logits = model.compute_shoot_logits(
+        h_b.squeeze(0), units.squeeze(0), chosen_uid,
+        ch_pmr, enemy_alive_mask, shoot_range_mask=ch_shoot_mask,
+    )
     ch_no_shootable = no_enemies or not ch_shoot_mask.any()
     if ch_no_shootable:
         shoot_lp = 0.0
@@ -1889,9 +1889,9 @@ def plan_training_activation(
 
     # Combine log-probs (same rules as sample_tactical_actions_no_grad)
     old_log_prob = chosen_unit_lp + move_lp
-    if chosen_move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if chosen_move_type == MOVE_MOVE:
         old_log_prob += dest_lp
-    if chosen_move_type in (MOVE_HOLD, MOVE_ADVANCE):
+    if chosen_move_type == MOVE_MOVE and _chosen_ar:
         old_log_prob += shoot_lp
     if chosen_move_type == MOVE_CHARGE:
         old_log_prob += charge_lp

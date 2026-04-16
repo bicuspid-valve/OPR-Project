@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import ttk
 from pathlib import Path
 
-from board import Board, COLS, ROWS, OBJECTIVES
+from board import Board, COLS, ROWS, OBJECTIVES, OBJ_SEIZE_RANGE
 from models import ResolvedUnit, UnitState
 from combat import (
     resolve_shooting, check_morale, can_shoot_any, models_in_range,
@@ -560,15 +560,29 @@ class PlayViewer:
 
         # Objectives
         if self.mode != "kill_points":
+            threshold_sq = OBJ_SEIZE_RANGE * OBJ_SEIZE_RANGE
             for oi, (oc, orow) in enumerate(OBJECTIVES):
-                x = oc * CELL + CELL // 2
-                y = (ROWS - orow) * CELL - CELL // 2
-                r = CELL * 2
                 color = OBJ_COLORS.get(self.board.objective_control[oi], "#888888")
-                self.canvas.create_oval(x - r, y - r, x + r, y + r,
-                                        outline=color, width=2, dash=(3, 3))
+                # Draw each cell whose centre is within seize range
+                r = int(OBJ_SEIZE_RANGE) + 1
+                for dc in range(-r, r + 1):
+                    for dr in range(-r, r + 1):
+                        if dc * dc + dr * dr <= threshold_sq:
+                            c, rw = oc + dc, orow + dr
+                            if 0 <= c < COLS and 0 <= rw < ROWS:
+                                px = c * CELL
+                                py = (ROWS - 1 - rw) * CELL
+                                self.canvas.create_rectangle(
+                                    px, py, px + CELL, py + CELL,
+                                    outline=color, width=1, dash=(2, 2))
+                # Circle at seize range
+                cx = oc * CELL + CELL // 2
+                cy = (ROWS - orow) * CELL - CELL // 2
+                pr = OBJ_SEIZE_RANGE * CELL
+                self.canvas.create_oval(cx - pr, cy - pr, cx + pr, cy + pr,
+                                        outline=color, width=1, dash=(3, 3))
                 obj_label = OBJ_NAMES[oi][0] if oi < 3 else OBJ_NAMES[oi][-1]
-                self.canvas.create_text(x, y, text=obj_label,
+                self.canvas.create_text(cx, cy, text=obj_label,
                                         fill=color, font=("Consolas", 8, "bold"))
 
         # Draw models
@@ -753,10 +767,14 @@ class PlayViewer:
         lines.append(("", _INFO_TEXT))
         lines.append(("Weapons:", _INFO_HEADER))
         seen: dict[str, int] = {}
-        for w in ru.weapons:
-            seen[w.name] = seen.get(w.name, 0) + 1
+        weapon_obj: dict[str, object] = {}
+        for mw in unit.weapons_per_model:
+            for w in mw:
+                seen[w.name] = seen.get(w.name, 0) + 1
+                if w.name not in weapon_obj:
+                    weapon_obj[w.name] = w
         for wname, count in seen.items():
-            w = next(w for w in ru.weapons if w.name == wname)
+            w = weapon_obj[wname]
             prefix = f"{count}x " if count > 1 else ""
             range_str = f'{w.range_inches}"' if w.range_inches > 0 else "melee"
             abilities = []
@@ -1986,7 +2004,7 @@ class PlayViewer:
             compute_destination_candidates, compute_destination_features,
             compute_post_move_rel, compute_in_range_mask,
             _get_model_space_positions, _flip_x, _flip_y,
-            MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+            MOVE_MOVE, MOVE_CHARGE,
             NUM_MOVE_TYPES,
         )
 
@@ -2004,8 +2022,8 @@ class PlayViewer:
         player = "A"
 
         action_to_move = {
-            "hold": MOVE_HOLD, "advance": MOVE_ADVANCE,
-            "rush": MOVE_RUSH, "charge": MOVE_CHARGE,
+            "hold": MOVE_MOVE, "advance": MOVE_MOVE,
+            "rush": MOVE_MOVE, "charge": MOVE_CHARGE,
         }
         move_type = action_to_move.get(action)
         if move_type is None or move_type == MOVE_CHARGE:
@@ -2067,23 +2085,22 @@ class PlayViewer:
                 )
 
                 # ── Q2: AI picks destination given human's unit + action ──
-                if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+                if move_type == MOVE_MOVE:
                     enemy_pos_set: set[tuple[int, int]] = set()
                     for eu in self.units_b:
                         if eu.models_alive > 0:
                             for pos in eu.alive_positions():
                                 enemy_pos_set.add(pos)
 
-                    candidates, cand_mask = compute_destination_candidates(
-                        unit, move_type, self.board, enemy_pos_set, player)
+                    candidates, cand_mask, adv_reachable = compute_destination_candidates(
+                        unit, self.board, enemy_pos_set, player)
 
-                    budget = (float(unit.unit.advance_distance)
-                              if move_type == MOVE_ADVANCE
-                              else float(unit.unit.rush_distance))
+                    budget = float(unit.unit.rush_distance)
                     dest_feats = compute_destination_features(
                         candidates, cand_mask, unit, unit_idx, player,
                         self.units_b, enemy_alive_np,
-                        self._fr_a, self._fr_b, self._fm_b, budget)
+                        self._fr_a, self._fr_b, self._fm_b, budget,
+                        advance_reachable=adv_reachable)
 
                     dest_features_t = torch.from_numpy(dest_feats).float()
                     dest_mask_t = torch.from_numpy(cand_mask)
@@ -2109,8 +2126,8 @@ class PlayViewer:
                         result['shadow_dest'] = (ai_dest_col, ai_dest_row)
 
                         # From AI's chosen destination, get its shoot target
-                        # (advance only — rush can't shoot)
-                        if move_type == MOVE_ADVANCE:
+                        # (only if advance-reachable — rush-only can't shoot)
+                        if bool(adv_reachable[dest_idx]):
                             px, py = float(ai_dest_col), float(ai_dest_row)
                             pmr = compute_post_move_rel(
                                 px, py, enemy_positions_ms)
@@ -2130,7 +2147,7 @@ class PlayViewer:
                                         self.unit_to_idx[id(self.units_b[si])]]
 
                 # ── Q3: AI picks shoot target from human's position ──
-                if move_type in (MOVE_HOLD, MOVE_ADVANCE):
+                if action in ("hold", "advance"):  # advance-reachable actions can shoot
                     hmx, hmy = human_post_cx, human_post_cy
                     pmr_human = compute_post_move_rel(
                         hmx, hmy, enemy_positions_ms)

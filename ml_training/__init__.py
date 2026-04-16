@@ -63,8 +63,6 @@ from ml_training.collection import (
     _MAX_SHARED_OPPONENTS,
     _init_shared_worker,
     _collect_episodes_shared_worker,
-    _collect_episodes_chunked_worker,
-    _run_single_episode_tactical,
     _episode_tactical_generator,
     _run_games_batched_tactical,
 )
@@ -72,6 +70,9 @@ from ml_training.collection import (
 # --- loss ---
 from ml_training.loss import (
     FlatReplayResult,
+    PreparedReplayData,
+    prepare_replay_data,
+    replay_from_prepared,
     replay_tactical_log_probs_flat,
     compute_loss_flat,
 )

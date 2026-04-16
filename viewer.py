@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import colorsys
-import math
 import tkinter as tk
 from tkinter import ttk
 
@@ -849,31 +848,38 @@ class GameViewer:
                     lines.extend(prob_parts)
 
             lines.append("")
-            # Move type with full distribution
+            # Move type with full distribution (binary: move / charge)
             move_probs = assessment.get('move_type_probs')
-            move_names = ['hold', 'advance', 'rush', 'charge']
+            move_names = ['move', 'charge']
             if move_probs:
                 lines.append("Move Type:")
                 for mi, mn in enumerate(move_names):
+                    if mi >= len(move_probs):
+                        break
                     marker = " *" if mn == move_type else ""
                     lines.append(f"  {mn}: {move_probs[mi]:.0%}{marker}")
             else:
                 lines.append(f"Move: {move_type}  ({move_conf:.0%} confidence)")
 
-            # Direction and distance for advance/rush
-            if move_type in ('advance', 'rush'):
-                angle = assessment.get('direction_angle', 0)
-                dist_frac = assessment.get('distance_frac', 0)
-                angle_deg = math.degrees(angle)
-                conc = assessment.get('direction_concentration')
-                conc_str = f"  conc:{conc:.1f}" if conc is not None else ""
-                lines.append(f"  direction: {angle_deg:.1f}\u00b0{conc_str}")
-                alpha = assessment.get('distance_alpha')
-                beta = assessment.get('distance_beta')
-                dist_detail = f"  distance: {dist_frac:.0%} of budget"
-                if alpha is not None and beta is not None:
-                    dist_detail += f"  (Beta \u03b1={alpha:.2f} \u03b2={beta:.2f})"
-                lines.append(dist_detail)
+            # Destination pointer selection (unified hold/advance/rush)
+            if move_type == 'move':
+                dest_sel = assessment.get('dest_selected')
+                n_cand = assessment.get('dest_n_candidates')
+                dest_entropy = assessment.get('dest_entropy')
+                if dest_sel is not None:
+                    dc, dr = dest_sel
+                    detail = f"  destination: ({dc}, {dr})"
+                    if n_cand is not None:
+                        detail += f"  [{n_cand} candidates]"
+                    if dest_entropy is not None:
+                        detail += f"  entropy:{dest_entropy:.2f}"
+                    lines.append(detail)
+                top3 = assessment.get('dest_top3')
+                if top3:
+                    lines.append("  top hexes:")
+                    for tc, tr, tp in top3:
+                        marker = " *" if dest_sel is not None and (tc, tr) == tuple(dest_sel) else ""
+                        lines.append(f"    ({tc}, {tr}): {tp:.0%}{marker}")
 
             # Charge target with logits
             if move_type == 'charge':

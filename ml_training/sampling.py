@@ -17,7 +17,7 @@ from ml_features import (
     MAX_DEST_CANDIDATES, DEST_FEATURE_DIM,
 )
 from ml_model_tactical import (
-    TacticalModel, NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+    TacticalModel, NUM_MOVE_TYPES, MOVE_MOVE, MOVE_CHARGE,
 )
 from ml_integration_tactical import (
     compute_post_move_rel,
@@ -42,8 +42,9 @@ def sample_tactical_actions_no_grad(
     rush_distances: list[float],                    # per friendly slot
     max_weapon_ranges: list[float] | None = None,   # max ranged weapon range per friendly slot
     opponent_type_idx: int | None = None,
+    player: str = "A",                              # "A" or "B" — needed to flip dest for post_move_rel
     # Destination pointer inputs (precomputed by caller)
-    dest_candidates: np.ndarray | None = None,      # (MAX_DEST_CANDIDATES, 2) int
+    dest_candidates: np.ndarray | None = None,      # (MAX_DEST_CANDIDATES, 2) int (game-space)
     dest_mask: np.ndarray | None = None,            # (MAX_DEST_CANDIDATES,) bool
     dest_features: np.ndarray | None = None,        # (MAX_DEST_CANDIDATES, DEST_FEATURE_DIM) float
 ) -> tuple[int, int, list[list[int]], list[bool], list[list[float]], int,
@@ -83,8 +84,6 @@ def sample_tactical_actions_no_grad(
         move_logits[MOVE_CHARGE] = float('-inf')
     if is_shaken:
         move_logits = move_logits.clone()
-        move_logits[MOVE_ADVANCE] = float('-inf')
-        move_logits[MOVE_RUSH] = float('-inf')
         move_logits[MOVE_CHARGE] = float('-inf')
     move_probs = torch.softmax(move_logits, dim=-1)
     move_type = int(torch.multinomial(move_probs, 1).item())
@@ -95,7 +94,7 @@ def sample_tactical_actions_no_grad(
     ).float().unsqueeze(0)
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
 
-    # --- Destination pointer (advance/rush only) ---
+    # --- Destination pointer (always for MOVE_MOVE, unless shaken) ---
     dest_lp = 0.0
     dest_selected_idx = -1
     # Store unpadded for serialization
@@ -103,7 +102,7 @@ def sample_tactical_actions_no_grad(
     dest_mask_unpadded: list[bool] = []
     dest_feats_unpadded: list[list[float]] = []
 
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH) and dest_candidates is not None:
+    if move_type == MOVE_MOVE and not is_shaken and dest_candidates is not None:
         n_valid = int(dest_mask.sum())
 
         dest_features_t = torch.from_numpy(dest_features).float().unsqueeze(0)
@@ -119,37 +118,29 @@ def sample_tactical_actions_no_grad(
         dest_mask_unpadded = [True] * n_valid
         dest_feats_unpadded = dest_features[:n_valid].tolist()
 
-    # Compute post-move position from selected hex
+    # Compute post-move position from selected hex in MODEL-SPACE
+    # (dest_candidates are in game-space; enemy_positions are in model-space,
+    # so we must flip the game-space dest for player B to keep the coordinate
+    # frames consistent before computing relative features.)
     unit_cx, unit_cy = friendly_positions[unit_idx]
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH) and dest_selected_idx >= 0:
+    if move_type == MOVE_MOVE and dest_selected_idx >= 0:
         dcol = int(dest_candidates[dest_selected_idx, 0])
         drow = int(dest_candidates[dest_selected_idx, 1])
-        # Convert game-space hex to model-space for post_move_rel
-        px, py = float(dcol), float(drow)
-        if friendly_positions[unit_idx][0] != _flip_x(float(dcol)):
-            # Check if player B flip is needed
-            pass
-        # The candidates are in game-space. We need model-space for post_move_rel.
-        # friendly_positions are already in model-space.
-        # To get model-space from game-space: if player B, flip.
-        # But we don't have player here... We can infer from friendly_positions.
-        # Actually, the caller provides model-space positions but candidates are game-space.
-        # The simplest approach: use the candidate directly and let caller handle flip.
-        # For now, compute model-space from game-space using unit position comparison.
-        # If unit_cx matches the unit's game-space centroid, player is A; else B.
-        # Simpler: just pass through. The caller who builds dest_candidates knows the player.
-        # We'll assume game-space candidates and flip based on whether model-space != game-space.
-        post_x, post_y = px, py
+        post_x, post_y = float(dcol), float(drow)
+        if player == "B":
+            post_x = _flip_x(post_x)
+            post_y = _flip_y(post_y)
     else:
         post_x, post_y = unit_cx, unit_cy
 
     post_move_rel = compute_post_move_rel(post_x, post_y, enemy_positions)
     post_move_rel_unsq = post_move_rel.unsqueeze(0)
 
-    # --- Charge target (sample) ---
-    charge_logits = model.charge_target_head(h_uf_m).squeeze(0)
-    charge_logits = charge_logits.masked_fill(~enemy_alive_mask, float('-inf'))
-    charge_logits = charge_logits.masked_fill(~can_charge_mask, float('-inf'))
+    # --- Charge target (pointer head, sample) ---
+    charge_logits = model.compute_charge_logits(
+        h.squeeze(0), units.squeeze(0), unit_idx,
+        enemy_alive_mask, can_charge_mask,
+    )
     no_enemies = not enemy_alive_mask.any()
     if no_enemies:
         charge_target_idx = 0
@@ -159,9 +150,7 @@ def sample_tactical_actions_no_grad(
         charge_target_idx = int(torch.multinomial(charge_probs, 1).item())
         charge_lp = torch.log(charge_probs[charge_target_idx] + eps).item()
 
-    # --- Shoot target (sample) ---
-    shoot_input = torch.cat([h, unit_features, move_onehot, post_move_rel_unsq], dim=-1)
-    shoot_logits = model.shoot_target_head(shoot_input).squeeze(0)
+    # --- Shoot target (pointer head, sample) ---
     if max_weapon_ranges is not None:
         shoot_mask_t = compute_in_range_mask(
             post_move_rel, max_weapon_ranges[unit_idx], enemy_alive_mask)
@@ -169,7 +158,10 @@ def sample_tactical_actions_no_grad(
         shoot_mask_t = enemy_alive_mask
     if is_shaken:
         shoot_mask_t = torch.zeros_like(shoot_mask_t)
-    shoot_logits = shoot_logits.masked_fill(~shoot_mask_t, float('-inf'))
+    shoot_logits = model.compute_shoot_logits(
+        h.squeeze(0), units.squeeze(0), unit_idx,
+        post_move_rel, enemy_alive_mask, shoot_range_mask=shoot_mask_t,
+    )
     shoot_mask_list = shoot_mask_t.tolist()
     no_shootable = not shoot_mask_t.any()
     if no_enemies or no_shootable:
@@ -184,13 +176,15 @@ def sample_tactical_actions_no_grad(
 
     # --- Value ---
     opp_embed = model._get_opp_embed(h, opponent_type_idx)
-    value = model.value_head(h, round_onehot, opp_embed).squeeze(0).item()
+    side_embed = model._get_side_embed(h, player)
+    value = model.value_head(h, round_onehot, opp_embed, side_embed).squeeze(0).item()
 
     # Log-prob: sum across active heads based on move_type
     old_log_prob = unit_lp + move_lp
-    if move_type in (MOVE_ADVANCE, MOVE_RUSH):
+    if move_type == MOVE_MOVE and not is_shaken:
         old_log_prob += dest_lp
-    if move_type in (MOVE_HOLD, MOVE_ADVANCE):
+        # Shoot log-prob only if dest is advance-reachable
+        # (determined by caller via dest_advance_reachable)
         old_log_prob += shoot_lp
     if move_type == MOVE_CHARGE:
         old_log_prob += charge_lp
@@ -252,14 +246,12 @@ def _batched_sample_tactical_no_grad(
     can_charge_batch = extract_can_charge_mask(state_batch, unit_indices)
     is_shaken_batch = extract_is_shaken(state_batch, unit_indices)
 
-    # Move type
+    # Move type (2-way: move/charge)
     h_uf = torch.cat([h, unit_features], dim=-1)
     move_logits = model.move_type_head(h_uf)
     no_chargeable = ~can_charge_batch.any(dim=-1)
     move_logits = move_logits.clone()
     move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(no_chargeable, float('-inf'))
-    move_logits[:, MOVE_ADVANCE] = move_logits[:, MOVE_ADVANCE].masked_fill(is_shaken_batch, float('-inf'))
-    move_logits[:, MOVE_RUSH] = move_logits[:, MOVE_RUSH].masked_fill(is_shaken_batch, float('-inf'))
     move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(is_shaken_batch, float('-inf'))
     move_logits = torch.nan_to_num(move_logits, nan=0.0, posinf=50.0, neginf=-50.0)
     move_probs = torch.softmax(move_logits, dim=-1)
@@ -270,10 +262,10 @@ def _batched_sample_tactical_no_grad(
 
     h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
 
-    # Charge target
-    charge_logits = model.charge_target_head(h_uf_m)
-    charge_logits = charge_logits.masked_fill(~enemy_alive_batch, float('-inf'))
-    charge_logits = charge_logits.masked_fill(~can_charge_batch, float('-inf'))
+    # Charge target (pointer head)
+    charge_logits = model.compute_charge_logits(
+        h, units, unit_indices, enemy_alive_batch, can_charge_batch,
+    )
     no_enemies = ~enemy_alive_batch.any(dim=-1)
     charge_logits = charge_logits.masked_fill(no_enemies.unsqueeze(-1), 0.0)
     charge_logits = torch.nan_to_num(charge_logits, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -292,13 +284,18 @@ def _batched_sample_tactical_no_grad(
     opp_type_indices = torch.tensor(
         [r.opponent_type_idx for r in requests], dtype=torch.long)
     opp_embed_batch = model.opponent_embedding(opp_type_indices)
-    values = model.value_head(h, round_onehot, opp_embed_batch)
+    _side_map = {"A": 0, "B": 1}
+    side_indices = torch.tensor(
+        [_side_map.get(r.player, 0) for r in requests], dtype=torch.long)
+    side_embed_batch = model.side_embedding(side_indices)
+    values = model.value_head(h, round_onehot, opp_embed_batch, side_embed_batch)
 
     # --- Per-sample destination pointer + post-move ---
-    dest_cands_list: list[list[list[int]]] = []
+    dest_cands_list: list = []
     dest_masks_list: list[list[bool]] = []
-    dest_feats_list: list[list[list[float]]] = []
+    dest_feats_list: list = []
     dest_selected_list: list[int] = []
+    dest_ar_list: list[list[bool] | None] = []  # advance_reachable per candidate
     dest_lps: list[float] = []
     post_move_rels: list[list[float]] = []
     pmr_tensors: list[torch.Tensor] = []
@@ -307,19 +304,24 @@ def _batched_sample_tactical_no_grad(
         req = requests[i]
         uid = unit_list[i]
         mt = move_list[i]
+        is_shaken_i = is_shaken_batch[i].item()
 
-        # Destination pointer for advance/rush
-        # Look up per-unit candidates from the request (keyed by unit slot)
+        # Destination pointer for MOVE_MOVE (unless shaken)
         _has_per_unit = (hasattr(req, 'dest_candidates_per_unit')
                          and req.dest_candidates_per_unit is not None
                          and uid in req.dest_candidates_per_unit)
-        # Also support legacy single-candidate fields
         _has_single = (hasattr(req, 'dest_candidates')
                        and req.dest_candidates is not None)
-        if mt in (MOVE_ADVANCE, MOVE_RUSH) and (_has_per_unit or _has_single):
+        if mt == MOVE_MOVE and not is_shaken_i and (_has_per_unit or _has_single):
             if _has_per_unit:
                 dest_candidates_i = req.dest_candidates_per_unit[uid]
                 dest_mask_i = req.dest_mask_per_unit[uid]
+                # Get advance_reachable from request
+                dest_ar_i = None
+                if (hasattr(req, 'dest_advance_reachable_per_unit')
+                        and req.dest_advance_reachable_per_unit is not None
+                        and uid in req.dest_advance_reachable_per_unit):
+                    dest_ar_i = req.dest_advance_reachable_per_unit[uid]
                 # Lazy feature computation: compute only for selected unit
                 _has_precomputed_feats = (
                     req.dest_features_per_unit is not None
@@ -340,15 +342,17 @@ def _batched_sample_tactical_no_grad(
                         req.dest_lazy_melee_matchups,
                         move_budget,
                         enemy_cache=req.dest_lazy_enemy_cache,
+                        advance_reachable=dest_ar_i,
                     )
                 else:
-                    # Fallback: zero features (should not happen in practice)
+                    _n_dc = int(dest_mask_i.sum()) if dest_mask_i is not None else 1
                     dest_features_i = np.zeros(
-                        (MAX_DEST_CANDIDATES, DEST_FEATURE_DIM), dtype=np.float32)
+                        (max(_n_dc, dest_candidates_i.shape[0]), DEST_FEATURE_DIM), dtype=np.float32)
             else:
                 dest_candidates_i = req.dest_candidates
                 dest_mask_i = req.dest_mask
                 dest_features_i = req.dest_features
+                dest_ar_i = getattr(req, 'dest_advance_reachable', None)
 
             dest_features_t = torch.from_numpy(dest_features_i).float().unsqueeze(0)
             dest_mask_t = torch.from_numpy(dest_mask_i).unsqueeze(0)
@@ -363,17 +367,28 @@ def _batched_sample_tactical_no_grad(
             dest_masks_list.append([True] * n_valid)
             dest_feats_list.append(None)  # recomputed during PPO replay
             dest_selected_list.append(dest_idx)
+            # Store advance_reachable (unpadded)
+            if dest_ar_i is not None:
+                dest_ar_list.append(dest_ar_i[:n_valid].tolist() if hasattr(dest_ar_i, 'tolist') else list(dest_ar_i[:n_valid]))
+            else:
+                dest_ar_list.append([True] * n_valid)
             dest_lps.append(dlp)
 
-            # Post-move from selected hex (game-space → model-space for post_move_rel)
+            # Post-move from selected hex in MODEL-SPACE
+            # (dest_candidates are game-space; enemy_positions are model-space
+            # — flip game-space dest for player B so frames match.)
             dcol = int(dest_candidates_i[dest_idx, 0])
             drow = int(dest_candidates_i[dest_idx, 1])
             px, py = float(dcol), float(drow)
+            if req.player == "B":
+                px = _flip_x(px)
+                py = _flip_y(py)
         else:
             dest_cands_list.append([])
             dest_masks_list.append([])
             dest_feats_list.append([])
             dest_selected_list.append(-1)
+            dest_ar_list.append(None)
             dest_lps.append(0.0)
 
             ucx, ucy = req.friendly_positions[uid]
@@ -383,17 +398,18 @@ def _batched_sample_tactical_no_grad(
         post_move_rels.append(pmr.numpy())
         pmr_tensors.append(pmr)
 
-    # --- Batched shoot target head ---
+    # --- Batched shoot pointer head ---
     pmr_batch = torch.stack(pmr_tensors)
-    shoot_input_batch = torch.cat([h, unit_features, move_onehot, pmr_batch], dim=-1)
-    shoot_logits_batch = model.shoot_target_head(shoot_input_batch)
 
     max_wr_list = [requests[i].max_weapon_ranges[unit_list[i]] for i in range(n)]
     max_wr_t = torch.tensor(max_wr_list, dtype=torch.float32)
     shoot_mask_batch = compute_in_range_mask_batched(pmr_batch, max_wr_t, enemy_alive_batch)
     shoot_mask_batch = shoot_mask_batch & ~is_shaken_batch.unsqueeze(-1)
 
-    shoot_logits_batch = shoot_logits_batch.masked_fill(~shoot_mask_batch, float('-inf'))
+    shoot_logits_batch = model.compute_shoot_logits(
+        h, units, unit_indices, pmr_batch, enemy_alive_batch,
+        shoot_range_mask=shoot_mask_batch,
+    )
     no_shootable = ~shoot_mask_batch.any(dim=-1)
     shoot_logits_batch = shoot_logits_batch.masked_fill(no_shootable.unsqueeze(-1), 0.0)
     shoot_logits_batch = torch.nan_to_num(shoot_logits_batch, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -423,10 +439,10 @@ def _batched_sample_tactical_no_grad(
     results = []
     for i in range(n):
         mt = move_list[i]
+        is_shaken_i = is_shaken_batch[i].item()
         total_lp = lp_list[i] + move_lp[i].item()
-        if mt in (MOVE_ADVANCE, MOVE_RUSH):
+        if mt == MOVE_MOVE and not is_shaken_i:
             total_lp += dest_lps[i]
-        if mt in (MOVE_HOLD, MOVE_ADVANCE):
             total_lp += shoot_lps[i]
         if mt == MOVE_CHARGE:
             total_lp += charge_lp[i].item()
@@ -438,6 +454,7 @@ def _batched_sample_tactical_no_grad(
             dest_mask=dest_masks_list[i],
             dest_features=dest_feats_list[i],
             dest_selected_idx=dest_selected_list[i],
+            dest_advance_reachable=dest_ar_list[i],
             charge_target_idx=charge_list[i],
             shoot_target_idx=shoot_indices_list[i],
             target_ranking=rankings_list[i],

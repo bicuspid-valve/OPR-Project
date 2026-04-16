@@ -24,7 +24,10 @@ from ml_training.collection import (
     _init_shared_worker, _collect_episodes_shared_worker,
 )
 from ml_training.gae import compute_gae
-from ml_training.loss import replay_tactical_log_probs_flat, compute_loss_flat
+from ml_training.loss import (
+    replay_tactical_log_probs_flat, compute_loss_flat,
+    prepare_replay_data, replay_from_prepared,
+)
 from ml_training.metrics import (
     TrainingMetrics, _load_hof_armies, _load_hof_ml_armies, _generate_army_pair,
 )
@@ -83,6 +86,8 @@ def run_training(
             _ckpt = torch.load(final_path, map_location="cpu", weights_only=False)
             if isinstance(_ckpt, dict) and "batch_num" in _ckpt:
                 start_batch = _ckpt["batch_num"]
+            if isinstance(_ckpt, dict) and "n_iters" in _ckpt:
+                model.n_iters = _ckpt["n_iters"]
             if verbose:
                 print(f"Resumed from {final_path} (batch {start_batch})")
         else:
@@ -196,6 +201,7 @@ def run_training(
             "plan_argmax_rate",
             "plan_dl_unit", "plan_dl_move",
             "plan_dl_charge", "plan_dl_shoot",
+            "wr_side_a", "wr_side_b", "val_side_a", "val_side_b",
         ])
     _log_writer.writerow([datetime.now().isoformat(), "---",
                           f"Training started (start_batch={start_batch})",
@@ -231,26 +237,24 @@ def run_training(
                   config.use_c_ext),
     )
 
-    for batch_num in range(start_batch + 1, start_batch + config.num_batches + 1):
-        batch_start = time.time()
-        heuristic_fraction = get_heuristic_fraction(metrics.heuristic_win_rate)
+    # --- Helper: build game specs, load opponent weights, dispatch workers ---
+    def _build_and_dispatch(batch_num_for_specs, async_mode=False):
+        """Build game specs and dispatch episode collection.
 
-        # --- Phase 1: build game specs and deduplicate opponent weights ---
-        # Copy current training weights to shared memory (map to CPU for workers)
-        cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()} if device.type != "cpu" else model.state_dict()
-        shared_model.load_state_dict(cpu_sd)
+        Returns (async_result, shaping_scale) if async_mode, else
+        (trajectories, shaping_scale).
+        """
+        hf = get_heuristic_fraction(metrics.heuristic_win_rate)
 
-        game_specs = []           # per-game: (res_a, res_b, sa_data, sb_data, opp_type, opp_sd_index)
-        opponent_state_dicts = [] # deduplicated list of opponent state dicts
-        _opp_path_cache: dict[str, int] = {}  # checkpoint path -> index into opponent_state_dicts
+        game_specs = []
+        opponent_state_dicts = []
+        _opp_path_cache: dict[str, int] = {}
 
-        for game_idx in range(config.batch_size):
-            # Select opponent
-            if random.random() < heuristic_fraction:
+        for _ in range(config.batch_size):
+            if random.random() < hf:
                 opp_type = "heuristic"
                 opp_sd_idx = -1
             elif random.random() < 0.5:
-                # Mirror self-play: current model plays both sides, learn from both
                 opp_type = "selfplay_mirror"
                 opp_sd_idx = -1
             else:
@@ -264,11 +268,9 @@ def run_training(
                             checkpoint_pool.load_state_dict(opp_path))
                     opp_sd_idx = _opp_path_cache[path_key]
                 else:
-                    # No checkpoints available yet, fall back to mirror
                     opp_type = "selfplay_mirror"
                     opp_sd_idx = -1
 
-            # Generate or sample armies
             if army_pairs is not None:
                 res_a, res_b = random.choice(army_pairs)
                 states_a_data = [("killer", "ranged", -1)] * len(res_a)
@@ -283,47 +285,35 @@ def run_training(
 
             game_specs.append((res_a, res_b, states_a_data, states_b_data, opp_type, opp_sd_idx, army_type))
 
-        # --- Phase 2: load opponent weights into shared memory, dispatch ---
-        # Copy unique opponent state dicts into shared opponent model slots
         opp_slot_map: dict[int, int] = {}
         for i, sd in enumerate(opponent_state_dicts):
             if i < _MAX_SHARED_OPPONENTS:
                 shared_opponents[i].load_state_dict(sd, strict=False)
                 opp_slot_map[i] = i
 
-        # Compute reward shaping scale (anneals linearly to 0)
-        # When resuming a prior run, disable shaping entirely — the model
-        # has already graduated past the shaping phase.
+        # Shaping scale
         if not restart and start_batch > 0:
-            shaping_scale = 0.0
+            ss = 0.0
         elif config.shaping_anneal_end > 0:
-            shaping_progress = (batch_num - start_batch) / config.num_batches
+            sp = (batch_num_for_specs - start_batch) / config.num_batches
             if config.time_limit is not None:
-                elapsed_min = (time.time() - start_time) / 60.0
-                shaping_progress = max(shaping_progress, elapsed_min / config.time_limit)
-            shaping_progress = min(shaping_progress, 1.0)
-            shaping_scale = max(0.0, 1.0 - shaping_progress / config.shaping_anneal_end)
+                sp = max(sp, (time.time() - start_time) / 60.0 / config.time_limit)
+            sp = min(sp, 1.0)
+            ss = max(0.0, 1.0 - sp / config.shaping_anneal_end)
         else:
-            shaping_scale = 0.0
+            ss = 0.0
 
-        # Build planning config for workers (if planning is enabled)
-        planning_config_for_workers = None
+        # Planning config
+        pcw = None
         if config.planning_rate > 0:
-            # Compute effective planning rate (with optional annealing)
-            _plan_progress = (batch_num - start_batch) / config.num_batches
+            pp = (batch_num_for_specs - start_batch) / config.num_batches
             if config.time_limit is not None:
-                _plan_progress = max(_plan_progress,
-                                     (time.time() - start_time) / 60.0 / config.time_limit)
-            _plan_progress = min(_plan_progress, 1.0)
-            if config.planning_rate_end is not None:
-                effective_planning_rate = (
-                    config.planning_rate
-                    + _plan_progress * (config.planning_rate_end - config.planning_rate)
-                )
-            else:
-                effective_planning_rate = config.planning_rate
-            planning_config_for_workers = {
-                "planning_rate": effective_planning_rate,
+                pp = max(pp, (time.time() - start_time) / 60.0 / config.time_limit)
+            pp = min(pp, 1.0)
+            epr = (config.planning_rate + pp * (config.planning_rate_end - config.planning_rate)
+                   if config.planning_rate_end is not None else config.planning_rate)
+            pcw = {
+                "planning_rate": epr,
                 "planning_params": {
                     "K_UNITS": config.training_planning_K,
                     "C_SAMPLES_PER_UNIT": config.training_planning_C,
@@ -333,30 +323,66 @@ def run_training(
             }
 
         n_chunks = worker_count
-        chunk_size = max(1, len(game_specs) // n_chunks)
+        chunk_sz = max(1, len(game_specs) // n_chunks)
         chunks = []
-        for i in range(0, len(game_specs), chunk_size):
-            chunk = game_specs[i : i + chunk_size]
-            chunks.append((opp_slot_map, chunk, shaping_scale,
-                           planning_config_for_workers))
+        for ci in range(0, len(game_specs), chunk_sz):
+            chunks.append((opp_slot_map, game_specs[ci:ci + chunk_sz], ss, pcw))
 
-        chunk_results = list(pool.map(_collect_episodes_shared_worker, chunks))
+        if async_mode:
+            return pool.map_async(_collect_episodes_shared_worker, chunks), ss
+        else:
+            results = list(pool.map(_collect_episodes_shared_worker, chunks))
+            return [ep for chunk in results for ep in chunk], ss
+
+    # --- Dispatch first batch synchronously ---
+    cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()} if device.type != "cpu" else model.state_dict()
+    shared_model.load_state_dict(cpu_sd)
+    pending_result, _ = _build_and_dispatch(start_batch + 1, async_mode=True)
+
+    for batch_num in range(start_batch + 1, start_batch + config.num_batches + 1):
+        batch_start = time.time()
+
+        # --- Wait for current batch's episode collection ---
+        chunk_results = pending_result.get()
         trajectories = [ep for chunk in chunk_results for ep in chunk]
+        heuristic_fraction = get_heuristic_fraction(metrics.heuristic_win_rate)
+
+        # --- Dispatch NEXT batch's collection (overlaps with PPO below) ---
+        is_last = batch_num >= start_batch + config.num_batches
+        if not is_last:
+            # Time limit: skip dispatch if we'd exceed it
+            _skip_next = False
+            if config.time_limit is not None:
+                if (time.time() - start_time) >= config.time_limit * 60:
+                    _skip_next = True
+            if not _skip_next:
+                cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()} if device.type != "cpu" else model.state_dict()
+                shared_model.load_state_dict(cpu_sd)
+                pending_result, _ = _build_and_dispatch(batch_num + 1, async_mode=True)
+            else:
+                is_last = True  # will not enter another iteration
 
         # --- Phase 3: compute GAE advantages (fixed across PPO epochs) ---
         model.train()
-        all_trajs = [traj_rounds for traj_rounds, _, _, _ in trajectories]
+        all_trajs = [traj_rounds for traj_rounds, _, _, _, _ in trajectories]
         all_advantages, all_returns = compute_gae(
             all_trajs, gamma=1.0, gae_lambda=config.gae_lambda,
             unit_local_blend=config.unit_local_advantage_blend,
         )
 
         # Record game outcomes for metrics tracking
-        # Skip mirror_b entries — they share the same game as the A-side entry
+        # Skip mirror_b entries for overall win-rate stats (avoid double-counting),
+        # but DO record them for per-side tracking (mirror matches are the
+        # cleanest signal for A/B symmetry).
         opp_types = []
-        for _, result, opp_type, army_type in trajectories:
+        for _, result, opp_type, army_type, phys_side in trajectories:
             if opp_type != "mirror_b":
-                metrics.record_game(result, opp_type, army_type)
+                metrics.record_game(result, opp_type, army_type,
+                                    physical_side=phys_side)
+            else:
+                # Record B-side of mirror match for side-symmetry tracking only
+                metrics.record_game(result, opp_type, army_type,
+                                    physical_side=phys_side)
             opp_types.append(opp_type)
 
         # --- Phase 4: PPO multi-epoch update ---
@@ -391,6 +417,10 @@ def run_training(
             for gi in range(1, len(all_trajs)):
                 game_step_offsets[gi] = game_step_offsets[gi - 1] + game_step_counts[gi - 1]
 
+            # Pre-build all replay tensors ONCE (the key optimisation)
+            prepared = prepare_replay_data(all_trajs, device=device)
+            all_flat_steps = [s for traj in all_trajs for s in traj]
+
         # Snapshot model weights before PPO epochs so we can rollback on NaN
         pre_ppo_state = {k: v.clone() for k, v in model.state_dict().items()}
 
@@ -407,8 +437,7 @@ def run_training(
                 for mb_start in range(0, len(game_indices), minibatch_games):
                     mb_game_idx = game_indices[mb_start:mb_start + minibatch_games]
 
-                    # Gather trajectories and flat tensor slices for this minibatch
-                    mb_trajs = [all_trajs[i] for i in mb_game_idx]
+                    # Gather flat tensor slices for this minibatch
                     mb_flat_idx: list[int] = []
                     for gi in mb_game_idx:
                         off = game_step_offsets[gi]
@@ -420,10 +449,13 @@ def run_training(
                     mb_advantages = flat_advantages_t[idx_t]
                     mb_returns = flat_returns_t[idx_t]
 
-                    # Forward pass + loss on minibatch (device-aware)
+                    # Forward pass using pre-built tensors (no _force_tensor_device needed)
+                    mb_flat_result = replay_from_prepared(
+                        model, prepared, idx_t,
+                        n_episodes=len(mb_game_idx),
+                    )
+                    mb_flat_steps = [all_flat_steps[i] for i in mb_flat_idx]
                     with _force_tensor_device(device):
-                        mb_flat_result = replay_tactical_log_probs_flat(model, mb_trajs)
-                        mb_flat_steps = [s for traj in mb_trajs for s in traj]
                         loss, loss_metrics = compute_loss_flat(
                             mb_flat_result, mb_old_lps, mb_advantages, mb_returns,
                             config.clip_epsilon, config.value_coeff, entropy_coeff,
@@ -469,15 +501,18 @@ def run_training(
                     for k, v in loss_metrics.items():
                         if isinstance(v, (int, float)):
                             epoch_metrics[k] = epoch_metrics.get(k, 0.0) + v * n_mb
-                    # Accumulate per-head entropy separately
                     phe_mb = loss_metrics.get("per_head_entropy", {})
+                    phn_mb = loss_metrics.get("per_head_n", {})
                     for hk, hv in phe_mb.items():
-                        epoch_metrics[f"_phe_{hk}"] = epoch_metrics.get(f"_phe_{hk}", 0.0) + hv * n_mb
-                    # Accumulate per-opponent-type value estimates
+                        # Weight by per-head gated sample count so the aggregate is
+                        # a true mean over active samples, not diluted by minibatches
+                        # that happened to contain few samples where the head is active.
+                        w = phn_mb.get(hk, n_mb)
+                        epoch_metrics[f"_phe_{hk}"] = epoch_metrics.get(f"_phe_{hk}", 0.0) + hv * w
+                        epoch_metrics[f"_phn_{hk}"] = epoch_metrics.get(f"_phn_{hk}", 0.0) + w
                     opp_val_mb = loss_metrics.get("per_opp_type_mean_values", {})
                     for ok, ov in opp_val_mb.items():
                         epoch_metrics[f"_opv_{ok}"] = epoch_metrics.get(f"_opv_{ok}", 0.0) + ov * n_mb
-                    # Accumulate per-head planning distillation sub-losses
                     pds_mb = loss_metrics.get("planning_distill_sub", {})
                     for pk, pv in pds_mb.items():
                         epoch_metrics[f"_pds_{pk}"] = epoch_metrics.get(f"_pds_{pk}", 0.0) + pv * n_mb
@@ -491,9 +526,18 @@ def run_training(
                     opv_agg = {}
                     pds_agg = {}
                     non_phe = {}
+                    # First pass: pull out per-head weight sums so we can divide
+                    # per-head entropies by their true gated-sample total.
+                    phn_sums = {
+                        k[5:]: v for k, v in epoch_metrics.items() if k.startswith("_phn_")
+                    }
                     for k, v in epoch_metrics.items():
                         if k.startswith("_phe_"):
-                            phe_agg[k[5:]] = v / epoch_count
+                            head = k[5:]
+                            w = phn_sums.get(head, 0.0)
+                            phe_agg[head] = (v / w) if w > 0 else 0.0
+                        elif k.startswith("_phn_"):
+                            continue
                         elif k.startswith("_opv_"):
                             opv_agg[k[5:]] = v / epoch_count
                         elif k.startswith("_pds_"):
@@ -507,14 +551,17 @@ def run_training(
 
             elif is_tactical:
                 # Full-batch tactical path (minibatch disabled or batch too small)
+                all_idx_t = torch.arange(prepared.n_steps, dtype=torch.long, device=device)
+                flat_result = replay_from_prepared(
+                    model, prepared, all_idx_t,
+                    n_episodes=len(all_trajs),
+                )
                 with _force_tensor_device(device):
-                    flat_result = replay_tactical_log_probs_flat(model, all_trajs)
-                    _flat_steps = [s for traj in all_trajs for s in traj]
                     loss, loss_metrics = compute_loss_flat(
                         flat_result, flat_old_lps, flat_advantages_t, flat_returns_t,
                         config.clip_epsilon, config.value_coeff, entropy_coeff,
                         aux_coeff=config.aux_coeff, aux_ratio=config.aux_ratio,
-                        flat_steps=_flat_steps,
+                        flat_steps=all_flat_steps,
                         entropy_tuner=entropy_tuner,
                         planning_distill_max_weight=(
                             config.planning_distill_max_weight
@@ -644,6 +691,10 @@ def run_training(
             f"{loss_metrics.get('planning_argmax_rate', 0.0):.4f}",
             *[f"{loss_metrics.get('planning_distill_sub', {}).get(k, 0.0):.6f}"
               for k in ("unit", "move", "charge", "shoot")],
+            f"{metrics.a_side_win_rate:.3f}",
+            f"{metrics.b_side_win_rate:.3f}",
+            f"{_opp_val_dict.get('mean_value_side_a', '')}",
+            f"{_opp_val_dict.get('mean_value_side_b', '')}",
         ])
         _log_file.flush()
 
@@ -676,7 +727,11 @@ def run_training(
     # Save final model
     final_path = Path(config.checkpoint_dir) / "final_model.pt"
     final_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model_state_dict": model.state_dict(), "batch_num": batch_num}, final_path)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "batch_num": batch_num,
+        "n_iters": model.n_iters,
+    }, final_path)
 
     # Save entropy tuner state (separate file for easy loading)
     if entropy_tuner is not None:

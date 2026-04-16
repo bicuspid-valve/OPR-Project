@@ -16,7 +16,7 @@ from ml_features import (
 )
 from ml_integration_tactical import compute_destination_features
 from ml_model_tactical import (
-    TacticalModel, NUM_MOVE_TYPES, MOVE_HOLD, MOVE_ADVANCE, MOVE_RUSH, MOVE_CHARGE,
+    TacticalModel, NUM_MOVE_TYPES, MOVE_MOVE, MOVE_CHARGE,
     NUM_OPPONENT_TYPES,
 )
 
@@ -47,8 +47,8 @@ class FlatReplayResult:
     charge_entropies: torch.Tensor | None = None   # (N,)
     shoot_entropies: torch.Tensor | None = None    # (N,)
     # Per-step masks for conditional heads
-    is_adv_rush: torch.Tensor | None = None        # (N,) bool
-    is_hold_adv: torch.Tensor | None = None        # (N,) bool
+    is_move: torch.Tensor | None = None            # (N,) bool — dest active (non-charge, non-shaken)
+    is_can_shoot: torch.Tensor | None = None       # (N,) bool — shoot active (advance-reachable dest)
     is_charge: torch.Tensor | None = None          # (N,) bool
     alive_mask: torch.Tensor | None = None         # (N, 10)
     enemy_alive_mask: torch.Tensor | None = None   # (N, 10)
@@ -72,7 +72,7 @@ class FlatReplayResult:
     per_opp_type_mean_values: dict[str, float] | None = None
     # Logits for planning distillation loss
     unit_logits: torch.Tensor | None = None    # (N, 10) — raw logits after alive masking
-    move_logits: torch.Tensor | None = None    # (N, 4) — move type logits conditioned on chosen unit
+    move_logits: torch.Tensor | None = None    # (N, 2) — move type logits conditioned on chosen unit
     charge_logits: torch.Tensor | None = None  # (N, 10) — charge target logits (masked)
     shoot_logits: torch.Tensor | None = None   # (N, 10) — shoot target logits (masked)
     # Destination pointer: number of valid candidates per step (for normalised entropy)
@@ -80,117 +80,151 @@ class FlatReplayResult:
 
 
 # ---------------------------------------------------------------------------
-# Replay
+# Pre-built replay data (avoids rebuilding tensors per minibatch)
 # ---------------------------------------------------------------------------
 
-def replay_tactical_log_probs_flat(
-    model: TacticalModel,
-    all_trajectories: list[list[TacticalActivationRecord]],
-) -> FlatReplayResult:
-    """Replay trajectories through the v2 tactical model and compute log-probs.
+@dataclass
+class PreparedReplayData:
+    """Pre-built tensors for efficient minibatched replay.
 
-    Returns flat (N,) tensors for direct use by compute_loss_flat.
-    Handles mixed log-prob computation: discrete heads (unit, move_type,
-    charge_target, shoot_target) + continuous heads (direction, distance).
+    Built once via ``prepare_replay_data`` before the PPO epoch loop.
+    ``replay_from_prepared`` slices these by step indices per minibatch,
+    avoiding the expensive Python data-prep that previously ran 12× per batch.
+    """
+    # Fixed-shape tensors on the target device, indexed by flat step index
+    state_batch: torch.Tensor           # (N, FEAT_DIM)
+    alive_mask: torch.Tensor            # (N, 10) bool
+    enemy_alive_mask: torch.Tensor      # (N, 10) bool
+    unit_indices: torch.Tensor          # (N,) long
+    move_indices: torch.Tensor          # (N,) long
+    dest_selected_indices: torch.Tensor  # (N,) long
+    dest_is_ar: torch.Tensor            # (N,) bool
+    post_move_rel: torch.Tensor         # (N, 30) float
+    opp_type_indices: torch.Tensor      # (N,) long
+    side_indices: torch.Tensor          # (N,) long
+    charge_indices: torch.Tensor        # (N,) long
+    shoot_indices: torch.Tensor         # (N,) long
+    shoot_mask: torch.Tensor            # (N, 10) bool
+    rewards: torch.Tensor               # (N,) float (for total_reward)
+    # Compact dest feature storage (avoids multi-GB padded arrays).
+    # Per-minibatch, replay_from_prepared pads to the local max and transfers.
+    dest_buffer: np.ndarray               # (total_cands, DEST_FEATURE_DIM) float32 — compact
+    dest_offsets: np.ndarray              # (N,) int64 — offset into buffer per step
+    dest_counts: np.ndarray               # (N,) int32 — number of valid candidates per step
+    # Metadata
+    n_steps: int
+    n_episodes: int
+    device: torch.device
+
+
+def prepare_replay_data(
+    all_trajectories: list[list[TacticalActivationRecord]],
+    device: torch.device = torch.device('cpu'),
+) -> PreparedReplayData:
+    """Build all replay tensors once for the entire batch.
+
+    This is the expensive data-prep step (numpy stacking, alive-mask
+    construction, destination-feature recomputation).  Calling it once
+    before the PPO epoch loop and slicing per-minibatch via
+    ``replay_from_prepared`` eliminates ~92% of the original Python
+    overhead.
     """
     flat_steps: list[TacticalActivationRecord] = []
     for traj in all_trajectories:
         flat_steps.extend(traj)
-
     n_steps = len(flat_steps)
-    if n_steps == 0:
-        return FlatReplayResult(
-            log_probs=torch.zeros(0),
-            entropies=torch.zeros(0),
-            values=torch.zeros(0),
-            n_episodes=len(all_trajectories),
-            total_reward=0.0,
-        )
-
     n_units = MAX_UNITS_PER_SIDE
 
-    # Stack state vectors → (N, feat) — np.stack is fast when elements are arrays
-    state_batch = torch.from_numpy(
-        np.stack([s.state_vec for s in flat_steps]))
+    if n_steps == 0:
+        empty_f = torch.zeros(0, device=device)
+        empty_b = torch.zeros(0, dtype=torch.bool, device=device)
+        empty_l = torch.zeros(0, dtype=torch.long, device=device)
+        return PreparedReplayData(
+            state_batch=torch.zeros(0, 1, device=device),
+            alive_mask=empty_b.unsqueeze(0), enemy_alive_mask=empty_b.unsqueeze(0),
+            unit_indices=empty_l, move_indices=empty_l,
+            dest_selected_indices=empty_l, dest_is_ar=empty_b,
+            post_move_rel=torch.zeros(0, 30, device=device),
+            opp_type_indices=empty_l, side_indices=empty_l,
+            charge_indices=empty_l, shoot_indices=empty_l,
+            shoot_mask=empty_b.unsqueeze(0), rewards=empty_f,
+            dest_buffer=np.zeros((0, DEST_FEATURE_DIM), dtype=np.float32),
+            dest_offsets=np.zeros(0, dtype=np.int64),
+            dest_counts=np.zeros(0, dtype=np.int32),
+            n_steps=0, n_episodes=len(all_trajectories), device=device,
+        )
 
-    # Build alive masks → (N, 10) — vectorized via numpy
+    # --- State vectors (one np.stack) ---
+    state_np = np.stack([s.state_vec for s in flat_steps])
+    state_batch = torch.from_numpy(state_np).to(device)
+
+    # --- Alive masks (vectorized numpy) ---
     alive_np = np.zeros((n_steps, n_units), dtype=np.bool_)
     enemy_alive_np = np.zeros((n_steps, n_units), dtype=np.bool_)
     for i, s in enumerate(flat_steps):
-        n_a = min(n_units, len(s.alive_mask))
-        alive_np[i, :n_a] = s.alive_mask[:n_a]
-        n_e = min(n_units, len(s.enemy_alive_mask))
-        enemy_alive_np[i, :n_e] = s.enemy_alive_mask[:n_e]
-    alive_batch = torch.from_numpy(alive_np)
-    enemy_alive_batch = torch.from_numpy(enemy_alive_np)
+        alive_np[i, :min(n_units, len(s.alive_mask))] = s.alive_mask[:n_units]
+        enemy_alive_np[i, :min(n_units, len(s.enemy_alive_mask))] = s.enemy_alive_mask[:n_units]
 
-    # === Trunk ===
-    h, units, round_onehot = model.trunk(state_batch)              # (N, 512), (N, 20, 200), (N, 4)
-    if torch.isnan(h).any() or torch.isinf(h).any():
-        print("  WARNING: NaN/Inf in trunk output during replay — clamping")
-        h = torch.nan_to_num(h, nan=0.0, posinf=50.0, neginf=-50.0)
+    # --- Scalar per-step metadata (vectorized via numpy) ---
+    unit_idx_np = np.array([s.unit_idx for s in flat_steps], dtype=np.int64)
+    move_idx_np = np.array([s.move_type for s in flat_steps], dtype=np.int64)
+    charge_idx_np = np.array([s.charge_target_idx for s in flat_steps], dtype=np.int64)
+    shoot_idx_np = np.array([s.shoot_target_idx for s in flat_steps], dtype=np.int64)
+    opp_type_np = np.array([s.opponent_type_idx for s in flat_steps], dtype=np.int64)
+    reward_np = np.array([s.reward for s in flat_steps], dtype=np.float32)
+    post_move_np = np.stack([s.post_move_rel for s in flat_steps]).astype(np.float32)
 
-    # === Unit selection head ===
-    unit_logits = model.unit_selection_head(h)                    # (N, 10)
-    unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
+    # --- Side indices (vectorized) ---
+    _side_map = {"A": 0, "B": 1}
+    side_np = np.zeros(n_steps, dtype=np.int64)
+    for i, s in enumerate(flat_steps):
+        _dr = getattr(s, 'dest_recomp', None)
+        if _dr:
+            side_np[i] = _side_map.get(_dr.get('player', 'A'), 0)
 
-    # === Extract unit features from unit embeddings ===
-    unit_indices = torch.tensor([s.unit_idx for s in flat_steps], dtype=torch.long)
-    unit_features = units[:, :n_units, :].gather(
-        1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n_steps, 1, TACTICAL_UNIT_FEATURES),
-    ).squeeze(1).detach()
+    # --- Shoot mask ---
+    if hasattr(flat_steps[0], 'shoot_mask') and flat_steps[0].shoot_mask is not None:
+        shoot_mask_np = np.array([s.shoot_mask for s in flat_steps], dtype=np.bool_)
+    else:
+        shoot_mask_np = enemy_alive_np.copy()
+    # Will apply is_shaken masking after tensor conversion
 
-    # === Move type head ===
-    # Extract can_charge mask for each sample's stored unit
-    can_charge_batch = extract_can_charge_mask(state_batch, unit_indices)  # (N, 10)
-    # Extract Shaken flag for each sample's stored unit
-    is_shaken_batch = extract_is_shaken(state_batch, unit_indices)  # (N,) bool
+    # --- Destination features (precompute once, compact buffer storage) ---
+    dest_selected_np = np.zeros(n_steps, dtype=np.int64)
+    dest_is_ar_np = np.ones(n_steps, dtype=np.bool_)
+    dest_counts_np = np.zeros(n_steps, dtype=np.int32)
+    dest_offsets_np = np.zeros(n_steps, dtype=np.int64)
 
-    h_uf = torch.cat([h, unit_features], dim=-1)
-    move_logits = model.move_type_head(h_uf)                      # (N, 4)
-    # Mask charge when no enemy is in charge range
-    no_chargeable = ~can_charge_batch.any(dim=-1)                 # (N,)
-    move_logits = move_logits.clone()
-    move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(no_chargeable, float('-inf'))
-    # Shaken units must hold — mask advance, rush, charge
-    move_logits[:, MOVE_ADVANCE] = move_logits[:, MOVE_ADVANCE].masked_fill(is_shaken_batch, float('-inf'))
-    move_logits[:, MOVE_RUSH] = move_logits[:, MOVE_RUSH].masked_fill(is_shaken_batch, float('-inf'))
-    move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(is_shaken_batch, float('-inf'))
+    # Collect per-step features into a flat list, then concatenate
+    _feat_chunks: list[np.ndarray] = []
+    _offset = 0
 
-    # Conditioning: stored move_type → one-hot
-    move_indices = torch.from_numpy(np.array([s.move_type for s in flat_steps], dtype=np.int64))
-    move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()
-
-    h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)  # (N, H+UF+4)
-
-    # === Destination pointer head (padded candidate features from stored records) ===
-    # Reconstruct padded tensors from unpadded stored data
-    dest_features_np = np.zeros((n_steps, MAX_DEST_CANDIDATES, DEST_FEATURE_DIM), dtype=np.float32)
-    dest_mask_np = np.zeros((n_steps, MAX_DEST_CANDIDATES), dtype=np.bool_)
-    dest_selected_indices = np.zeros(n_steps, dtype=np.int64)
     for i, s in enumerate(flat_steps):
         if s.dest_candidates is not None and len(s.dest_candidates) > 0:
             n_cand = min(len(s.dest_candidates), MAX_DEST_CANDIDATES)
-            dest_mask_np[i, :n_cand] = True
-            dest_selected_indices[i] = s.dest_selected_idx
+            dest_selected_np[i] = s.dest_selected_idx
+            dest_counts_np[i] = n_cand
+            dest_offsets_np[i] = _offset
+
+            if (s.dest_advance_reachable is not None
+                    and s.dest_selected_idx >= 0
+                    and s.dest_selected_idx < len(s.dest_advance_reachable)):
+                dest_is_ar_np[i] = s.dest_advance_reachable[s.dest_selected_idx]
+
+            padded_ar = np.ones(n_cand, dtype=np.bool_)
+            if s.dest_advance_reachable is not None:
+                n_ar = min(len(s.dest_advance_reachable), n_cand)
+                padded_ar[:n_ar] = s.dest_advance_reachable[:n_ar]
 
             if s.dest_features is not None and len(s.dest_features) > 0:
-                # Stored features (legacy path)
-                feats = s.dest_features
-                if isinstance(feats, np.ndarray):
-                    dest_features_np[i, :n_cand] = feats[:n_cand]
-                else:
-                    for ci in range(n_cand):
-                        dest_features_np[i, ci] = feats[ci]
+                feats = np.asarray(s.dest_features, dtype=np.float32)[:n_cand]
             elif s.dest_recomp is not None:
-                # Recompute features on the fly (~0.1ms per step)
                 rc = s.dest_recomp
-                padded_cands = np.zeros((MAX_DEST_CANDIDATES, 2), dtype=np.int32)
-                padded_mask = np.zeros(MAX_DEST_CANDIDATES, dtype=np.bool_)
+                padded_cands = np.zeros((n_cand, 2), dtype=np.int32)
                 padded_cands[:n_cand] = s.dest_candidates[:n_cand]
-                padded_mask[:n_cand] = True
-                recomp_feats = compute_destination_features(
-                    padded_cands, padded_mask,
+                padded_mask_rc = np.ones(n_cand, dtype=np.bool_)
+                feats = np.asarray(compute_destination_features(
+                    padded_cands, padded_mask_rc,
                     None, s.unit_idx, rc['player'],
                     None, rc['enemy_alive_mask'],
                     rc['fr_matchups'], rc['er_matchups'], rc['melee_matchups'],
@@ -198,43 +232,156 @@ def replay_tactical_log_probs_flat(
                     enemy_cache=rc['enemy_cache'],
                     unit_centre=(rc['unit_cx'], rc['unit_cy']),
                     unit_alive_frac=rc['unit_alive_frac'],
-                )
-                dest_features_np[i, :n_cand] = recomp_feats[:n_cand]
+                    advance_reachable=padded_ar,
+                ), dtype=np.float32)[:n_cand]
+            else:
+                feats = np.zeros((n_cand, DEST_FEATURE_DIM), dtype=np.float32)
+            _feat_chunks.append(feats)
+            _offset += n_cand
 
-    dest_features_batch = torch.from_numpy(dest_features_np)
-    dest_mask_batch = torch.from_numpy(dest_mask_np)
-    dest_selected_batch = torch.from_numpy(dest_selected_indices)
-
-    # Run pointer attention
-    dest_logits = model.compute_dest_logits(h_uf_m, dest_features_batch, dest_mask_batch)
-    # (N, MAX_DEST_CANDIDATES) — invalid candidates are -inf
-
-    # === Charge target head — mask by alive AND chargeable ===
-    charge_logits = model.charge_target_head(h_uf_m)              # (N, 10)
-    charge_logits = charge_logits.masked_fill(~enemy_alive_batch, float('-inf'))
-    charge_logits = charge_logits.masked_fill(~can_charge_batch, float('-inf'))
-
-    # === Shoot target head (with stored post-move features + shoot mask) ===
-    post_move_rel_batch = torch.from_numpy(
-        np.stack([s.post_move_rel for s in flat_steps])).float()  # (N, 30)
-    shoot_input = torch.cat([h, unit_features, move_onehot, post_move_rel_batch], dim=-1)
-    shoot_logits = model.shoot_target_head(shoot_input)           # (N, 10)
-    # Use stored shoot_mask (alive AND in-range) if available, else fall back to enemy_alive
-    if hasattr(flat_steps[0], 'shoot_mask') and flat_steps[0].shoot_mask is not None:
-        shoot_mask_batch = torch.tensor(
-            [s.shoot_mask for s in flat_steps], dtype=torch.bool)
+    if _feat_chunks:
+        dest_buffer = np.concatenate(_feat_chunks)  # (total_cands, DEST_FEATURE_DIM)
     else:
-        shoot_mask_batch = enemy_alive_batch
-    # Shaken units cannot shoot — mask all targets
-    shoot_mask_batch = shoot_mask_batch & ~is_shaken_batch.unsqueeze(-1)
-    shoot_logits = shoot_logits.masked_fill(~shoot_mask_batch, float('-inf'))
+        dest_buffer = np.zeros((0, DEST_FEATURE_DIM), dtype=np.float32)
+    del _feat_chunks
 
-    # === Value (round + opponent conditioned) ===
-    # Build per-step opponent type embeddings for value head
-    opp_type_indices = torch.tensor(
-        [s.opponent_type_idx for s in flat_steps], dtype=torch.long)
-    opp_embed_batch = model.opponent_embedding(opp_type_indices)  # (N, OPP_EMBED_DIM)
-    values = model.value_head(h, round_onehot, opp_embed_batch)
+    # --- Move everything to device ---
+    alive_t = torch.from_numpy(alive_np).to(device)
+    enemy_alive_t = torch.from_numpy(enemy_alive_np).to(device)
+    unit_idx_t = torch.from_numpy(unit_idx_np).to(device)
+    move_idx_t = torch.from_numpy(move_idx_np).to(device)
+    charge_idx_t = torch.from_numpy(charge_idx_np).to(device)
+    shoot_idx_t = torch.from_numpy(shoot_idx_np).to(device)
+    opp_type_t = torch.from_numpy(opp_type_np).to(device)
+    side_t = torch.from_numpy(side_np).to(device)
+    reward_t = torch.from_numpy(reward_np).to(device)
+    post_move_t = torch.from_numpy(post_move_np).to(device)
+    dest_sel_t = torch.from_numpy(dest_selected_np).to(device)
+    dest_is_ar_t = torch.from_numpy(dest_is_ar_np).to(device)
+    # dest_buffer stays on CPU (compact storage, per-minibatch padding in replay)
+
+    # Apply is_shaken to shoot_mask
+    is_shaken_np = extract_is_shaken(
+        torch.from_numpy(state_np), torch.from_numpy(unit_idx_np)).numpy()
+    shoot_mask_np = shoot_mask_np & ~np.expand_dims(is_shaken_np, -1)
+    shoot_mask_t = torch.from_numpy(shoot_mask_np).to(device)
+
+    return PreparedReplayData(
+        state_batch=state_batch,
+        alive_mask=alive_t, enemy_alive_mask=enemy_alive_t,
+        unit_indices=unit_idx_t, move_indices=move_idx_t,
+        dest_selected_indices=dest_sel_t, dest_is_ar=dest_is_ar_t,
+        post_move_rel=post_move_t,
+        opp_type_indices=opp_type_t, side_indices=side_t,
+        charge_indices=charge_idx_t, shoot_indices=shoot_idx_t,
+        shoot_mask=shoot_mask_t, rewards=reward_t,
+        dest_buffer=dest_buffer,
+        dest_offsets=dest_offsets_np, dest_counts=dest_counts_np,
+        n_steps=n_steps, n_episodes=len(all_trajectories), device=device,
+    )
+
+
+def replay_from_prepared(
+    model: TacticalModel,
+    prepared: PreparedReplayData,
+    step_indices: torch.Tensor,
+    n_episodes: int = 0,
+) -> FlatReplayResult:
+    """Run model forward + log-prob computation on a slice of pre-built data.
+
+    ``step_indices`` is a (M,) long tensor (on ``prepared.device``) that
+    selects which steps from the prepared batch to include.  All heavy
+    data-prep has already happened in ``prepare_replay_data``.
+    """
+    n_steps = step_indices.shape[0]
+    n_units = MAX_UNITS_PER_SIDE
+
+    if n_steps == 0:
+        return FlatReplayResult(
+            log_probs=torch.zeros(0, device=prepared.device),
+            entropies=torch.zeros(0, device=prepared.device),
+            values=torch.zeros(0, device=prepared.device),
+            n_episodes=n_episodes, total_reward=0.0,
+        )
+
+    # --- Slice pre-built tensors (fast GPU indexing) ---
+    sb = prepared.state_batch[step_indices]
+    alive_batch = prepared.alive_mask[step_indices]
+    enemy_alive_batch = prepared.enemy_alive_mask[step_indices]
+    unit_indices = prepared.unit_indices[step_indices]
+    move_indices = prepared.move_indices[step_indices]
+    dest_selected_batch = prepared.dest_selected_indices[step_indices]
+    dest_is_ar_batch = prepared.dest_is_ar[step_indices]
+    post_move_rel_batch = prepared.post_move_rel[step_indices]
+    opp_type_indices = prepared.opp_type_indices[step_indices]
+    side_indices = prepared.side_indices[step_indices]
+    charge_indices = prepared.charge_indices[step_indices]
+    shoot_indices_t = prepared.shoot_indices[step_indices]
+    shoot_mask_batch = prepared.shoot_mask[step_indices]
+    rewards_batch = prepared.rewards[step_indices]
+
+    # --- Dest features: pad compact buffer to minibatch-local max, transfer ---
+    step_idx_cpu = step_indices.cpu().numpy()
+    mb_counts = prepared.dest_counts[step_idx_cpu]
+    mb_max_cands = max(int(mb_counts.max()), 1) if len(mb_counts) > 0 else 1
+    dest_feat_np = np.zeros((n_steps, mb_max_cands, DEST_FEATURE_DIM), dtype=np.float32)
+    dest_mask_np = np.zeros((n_steps, mb_max_cands), dtype=np.bool_)
+    for j in range(n_steps):
+        nc = mb_counts[j]
+        if nc > 0:
+            off = prepared.dest_offsets[step_idx_cpu[j]]
+            dest_feat_np[j, :nc] = prepared.dest_buffer[off:off + nc]
+            dest_mask_np[j, :nc] = True
+    dest_features_batch = torch.from_numpy(dest_feat_np).to(prepared.device)
+    dest_mask_batch = torch.from_numpy(dest_mask_np).to(prepared.device)
+
+    # === Trunk ===
+    h, units, round_onehot = model.trunk(sb)
+    if torch.isnan(h).any() or torch.isinf(h).any():
+        print("  WARNING: NaN/Inf in trunk output during replay — clamping")
+        h = torch.nan_to_num(h, nan=0.0, posinf=50.0, neginf=-50.0)
+
+    # === Unit selection head ===
+    unit_logits = model.unit_selection_head(h)
+    unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
+
+    # === Extract unit features ===
+    unit_features = units[:, :n_units, :].gather(
+        1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n_steps, 1, TACTICAL_UNIT_FEATURES),
+    ).squeeze(1).detach()
+
+    # === Move type head ===
+    can_charge_batch = extract_can_charge_mask(sb, unit_indices)
+    is_shaken_batch = extract_is_shaken(sb, unit_indices)
+
+    h_uf = torch.cat([h, unit_features], dim=-1)
+    move_logits_out = model.move_type_head(h_uf)
+    no_chargeable = ~can_charge_batch.any(dim=-1)
+    move_logits_out = move_logits_out.clone()
+    move_logits_out[:, MOVE_CHARGE] = move_logits_out[:, MOVE_CHARGE].masked_fill(no_chargeable, float('-inf'))
+    move_logits_out[:, MOVE_CHARGE] = move_logits_out[:, MOVE_CHARGE].masked_fill(is_shaken_batch, float('-inf'))
+
+    move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()
+    h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
+
+    # === Destination pointer ===
+    dest_logits = model.compute_dest_logits(h_uf_m, dest_features_batch, dest_mask_batch)
+
+    # === Charge target pointer head ===
+    charge_logits_out = model.compute_charge_logits(
+        h, units, unit_indices, enemy_alive_batch, can_charge_batch,
+    )
+
+    # === Shoot target pointer head ===
+    shoot_logits_out = model.compute_shoot_logits(
+        h, units, unit_indices, post_move_rel_batch,
+        enemy_alive_batch, shoot_range_mask=shoot_mask_batch,
+    )
+
+    # === Value head ===
+    opp_embed_batch = model.opponent_embedding(opp_type_indices)
+    side_embed_batch = model.side_embedding(side_indices)
+    values = model.value_head(h, round_onehot, opp_embed_batch, side_embed_batch)
 
     # Per-opponent-type mean value estimates (diagnostic)
     _opp_type_names = ["heuristic", "sp_mirror", "sp_hof", "sp_ml", "sp_random"]
@@ -244,89 +391,76 @@ def replay_tactical_log_probs_flat(
             mask = opp_type_indices == ot_idx
             if mask.any():
                 per_opp_type_mean_values[f"mean_value_{ot_name}"] = values[mask].mean().item()
+        _mirror_mask = opp_type_indices == 1
+        _a_mask = (side_indices == 0) & _mirror_mask
+        _b_mask = (side_indices == 1) & _mirror_mask
+        if _a_mask.any():
+            per_opp_type_mean_values["mean_value_side_a"] = values[_a_mask].mean().item()
+        if _b_mask.any():
+            per_opp_type_mean_values["mean_value_side_b"] = values[_b_mask].mean().item()
 
     # === Log-probs & entropies ===
-    eps = 1e-8
-
-    # Unit selection — guard against all-dead rows (all -inf logits → NaN softmax)
-    # and against NaN logits from diverged model weights
-    all_dead = ~alive_batch.any(dim=1, keepdim=True)  # (N, 1)
-    safe_unit_logits = unit_logits.masked_fill(all_dead, 0.0)   # uniform fallback
+    all_dead = ~alive_batch.any(dim=1, keepdim=True)
+    safe_unit_logits = unit_logits.masked_fill(all_dead, 0.0)
     safe_unit_logits = torch.nan_to_num(safe_unit_logits, nan=0.0, posinf=50.0, neginf=-50.0)
     unit_log_probs = torch.log_softmax(safe_unit_logits, dim=-1)
     unit_lp = unit_log_probs.gather(1, unit_indices.unsqueeze(1)).squeeze(1)
     unit_ent = torch.distributions.Categorical(logits=safe_unit_logits).entropy()
 
-    # Move type
-    move_logits = torch.nan_to_num(move_logits, nan=0.0, posinf=50.0, neginf=-50.0)
-    move_dist = torch.distributions.Categorical(logits=move_logits)
+    move_logits_safe = torch.nan_to_num(move_logits_out, nan=0.0, posinf=50.0, neginf=-50.0)
+    move_dist = torch.distributions.Categorical(logits=move_logits_safe)
     move_lp = move_dist.log_prob(move_indices)
     move_ent = move_dist.entropy()
 
-    # Destination pointer log-prob and entropy — simple masked categorical
-    # Guard: for hold/charge rows where dest_mask is all-False, all logits are -inf.
-    has_dest = dest_mask_batch.any(dim=-1)  # (N,) — True for advance/rush with valid candidates
-    # Safe logits for log-prob computation (avoid NaN from all-inf rows)
+    has_dest = dest_mask_batch.any(dim=-1)
     safe_dest_logits = dest_logits.clone()
-    safe_dest_logits[~has_dest] = 0.0  # uniform fallback for rows without valid candidates
+    safe_dest_logits[~has_dest] = 0.0
     safe_dest_logits = torch.nan_to_num(safe_dest_logits, nan=0.0, posinf=50.0, neginf=-50.0)
-
     dest_log_probs = torch.log_softmax(safe_dest_logits, dim=-1)
-    dest_lp = dest_log_probs.gather(1, dest_selected_batch.unsqueeze(1)).squeeze(1)  # (N,)
-    dest_lp = dest_lp.masked_fill(~has_dest, 0.0)  # zero for hold/charge
-
-    # Destination entropy: categorical entropy of the masked distribution
+    dest_lp = dest_log_probs.gather(1, dest_selected_batch.unsqueeze(1)).squeeze(1)
+    dest_lp = dest_lp.masked_fill(~has_dest, 0.0)
     dest_probs = torch.softmax(safe_dest_logits, dim=-1)
-    dest_ent = -(dest_probs * torch.log(dest_probs + 1e-8)).sum(dim=-1)  # (N,)
-    dest_ent = dest_ent.masked_fill(~has_dest, 0.0)  # zero for hold/charge
+    dest_ent = -(dest_probs * torch.log(dest_probs + 1e-8)).sum(dim=-1)
+    dest_ent = dest_ent.masked_fill(~has_dest, 0.0)
 
-    # Charge target — guard against all-dead rows before softmax
-    charge_indices = torch.from_numpy(np.array([s.charge_target_idx for s in flat_steps], dtype=np.int64))
     enemy_all_dead = ~enemy_alive_batch.any(dim=-1, keepdim=True)
-    safe_charge_logits = charge_logits.masked_fill(enemy_all_dead, 0.0)
+    safe_charge_logits = charge_logits_out.masked_fill(enemy_all_dead, 0.0)
     safe_charge_logits = torch.nan_to_num(safe_charge_logits, nan=0.0, posinf=50.0, neginf=-50.0)
     charge_log_probs = torch.log_softmax(safe_charge_logits, dim=-1)
     charge_lp = charge_log_probs.gather(1, charge_indices.unsqueeze(1)).squeeze(1)
     charge_ent = torch.distributions.Categorical(logits=safe_charge_logits).entropy()
 
-    # Shoot target — guard against no-shootable-target rows before softmax
-    shoot_indices = torch.from_numpy(np.array([s.shoot_target_idx for s in flat_steps], dtype=np.int64))
     no_shootable = ~shoot_mask_batch.any(dim=-1, keepdim=True)
-    safe_shoot_logits = shoot_logits.masked_fill(no_shootable, 0.0)
+    safe_shoot_logits = shoot_logits_out.masked_fill(no_shootable, 0.0)
     safe_shoot_logits = torch.nan_to_num(safe_shoot_logits, nan=0.0, posinf=50.0, neginf=-50.0)
     shoot_log_probs = torch.log_softmax(safe_shoot_logits, dim=-1)
-    shoot_lp = shoot_log_probs.gather(1, shoot_indices.unsqueeze(1)).squeeze(1)
-    # Zero out log-prob for no-shootable rows to match collection path
+    shoot_lp = shoot_log_probs.gather(1, shoot_indices_t.unsqueeze(1)).squeeze(1)
     shoot_lp = shoot_lp.masked_fill(no_shootable.squeeze(-1), 0.0)
     shoot_ent = torch.distributions.Categorical(logits=safe_shoot_logits).entropy()
 
-    # === Combine log-probs based on move type ===
-    # Always: unit + move_type
+    # === Combine log-probs ===
     total_lp = unit_lp + move_lp
     total_ent = unit_ent + move_ent
-    n_heads = torch.full((n_steps,), 2.0)  # count active heads for entropy averaging
+    n_heads = torch.full((n_steps,), 2.0, device=prepared.device)
 
-    # Advance/rush: + destination mixture
-    is_adv_rush = (move_indices == MOVE_ADVANCE) | (move_indices == MOVE_RUSH)
-    total_lp = total_lp + torch.where(is_adv_rush, dest_lp, torch.zeros_like(dest_lp))
-    total_ent = total_ent + torch.where(is_adv_rush, dest_ent, torch.zeros_like(dest_ent))
-    n_heads = n_heads + torch.where(is_adv_rush, torch.tensor(1.0), torch.tensor(0.0))
+    is_move = (move_indices == MOVE_MOVE) & ~is_shaken_batch
+    _zero = torch.zeros_like(dest_lp)
+    total_lp = total_lp + torch.where(is_move, dest_lp, _zero)
+    total_ent = total_ent + torch.where(is_move, dest_ent, _zero)
+    n_heads = n_heads + is_move.float()
 
-    # Hold/advance: + shoot_target
-    is_hold_adv = (move_indices == MOVE_HOLD) | (move_indices == MOVE_ADVANCE)
-    total_lp = total_lp + torch.where(is_hold_adv, shoot_lp, torch.zeros_like(shoot_lp))
-    total_ent = total_ent + torch.where(is_hold_adv, shoot_ent, torch.zeros_like(shoot_ent))
-    n_heads = n_heads + torch.where(is_hold_adv, torch.tensor(1.0), torch.tensor(0.0))
+    is_can_shoot = is_move & dest_is_ar_batch
+    total_lp = total_lp + torch.where(is_can_shoot, shoot_lp, _zero)
+    total_ent = total_ent + torch.where(is_can_shoot, shoot_ent, _zero)
+    n_heads = n_heads + is_can_shoot.float()
 
-    # Charge: + charge_target
     is_charge = move_indices == MOVE_CHARGE
-    total_lp = total_lp + torch.where(is_charge, charge_lp, torch.zeros_like(charge_lp))
-    total_ent = total_ent + torch.where(is_charge, charge_ent, torch.zeros_like(charge_ent))
-    n_heads = n_heads + torch.where(is_charge, torch.tensor(1.0), torch.tensor(0.0))
+    total_lp = total_lp + torch.where(is_charge, charge_lp, _zero)
+    total_ent = total_ent + torch.where(is_charge, charge_ent, _zero)
+    n_heads = n_heads + is_charge.float()
 
     mean_ent = total_ent / n_heads.clamp(min=1.0)
-
-    total_reward = sum(s.reward for s in flat_steps)
+    total_reward = rewards_batch.sum().item()
 
     # === Auxiliary prediction heads ===
     aux_fs_alpha = aux_fs_beta = aux_es_alpha = aux_es_beta = None
@@ -334,59 +468,38 @@ def replay_tactical_log_probs_flat(
     aux_fs_alpha_short = aux_fs_beta_short = aux_es_alpha_short = aux_es_beta_short = None
     aux_obj_logits_short = None
     if hasattr(model, 'aux_friendly_survival_head'):
-        # Long-horizon (end-of-game)
         fs_raw = model.aux_friendly_survival_head(h).view(n_steps, n_units, 2)
-        aux_fs_alpha = F.softplus(fs_raw[..., 0]) + 0.01   # (N, 10), > 0
-        aux_fs_beta = F.softplus(fs_raw[..., 1]) + 0.01    # (N, 10), > 0
-
+        aux_fs_alpha = F.softplus(fs_raw[..., 0]) + 0.01
+        aux_fs_beta = F.softplus(fs_raw[..., 1]) + 0.01
         es_raw = model.aux_enemy_survival_head(h).view(n_steps, n_units, 2)
         aux_es_alpha = F.softplus(es_raw[..., 0]) + 0.01
         aux_es_beta = F.softplus(es_raw[..., 1]) + 0.01
-
         aux_obj_logits = model.aux_obj_control_head(h).view(n_steps, 5, 3)
-
-        # Short-horizon (end-of-current-round)
         if hasattr(model, 'aux_friendly_survival_head_short'):
             fs_raw_s = model.aux_friendly_survival_head_short(h).view(n_steps, n_units, 2)
             aux_fs_alpha_short = F.softplus(fs_raw_s[..., 0]) + 0.01
             aux_fs_beta_short = F.softplus(fs_raw_s[..., 1]) + 0.01
-
             es_raw_s = model.aux_enemy_survival_head_short(h).view(n_steps, n_units, 2)
             aux_es_alpha_short = F.softplus(es_raw_s[..., 0]) + 0.01
             aux_es_beta_short = F.softplus(es_raw_s[..., 1]) + 0.01
-
             aux_obj_logits_short = model.aux_obj_control_head_short(h).view(n_steps, 5, 3)
 
-    # Activation countdown heads
     aux_f_act_rem = aux_e_act_rem = None
     if hasattr(model, 'aux_friendly_activations_head'):
-        aux_f_act_rem = F.softplus(model.aux_friendly_activations_head(h).squeeze(-1))  # (N,), ≥ 0
-        aux_e_act_rem = F.softplus(model.aux_enemy_activations_head(h).squeeze(-1))     # (N,), ≥ 0
+        aux_f_act_rem = F.softplus(model.aux_friendly_activations_head(h).squeeze(-1))
+        aux_e_act_rem = F.softplus(model.aux_enemy_activations_head(h).squeeze(-1))
 
     return FlatReplayResult(
-        log_probs=total_lp,
-        entropies=mean_ent,
-        values=values,
-        n_episodes=len(all_trajectories),
-        total_reward=total_reward,
-        # Per-head entropies
-        unit_entropies=unit_ent,
-        move_entropies=move_ent,
-        dest_entropies=dest_ent,
-        charge_entropies=charge_ent,
+        log_probs=total_lp, entropies=mean_ent, values=values,
+        n_episodes=n_episodes, total_reward=total_reward,
+        unit_entropies=unit_ent, move_entropies=move_ent,
+        dest_entropies=dest_ent, charge_entropies=charge_ent,
         shoot_entropies=shoot_ent,
-        # Conditional head masks
-        is_adv_rush=is_adv_rush,
-        is_hold_adv=is_hold_adv,
-        is_charge=is_charge,
-        alive_mask=alive_batch,
-        enemy_alive_mask=enemy_alive_batch,
+        is_move=is_move, is_can_shoot=is_can_shoot, is_charge=is_charge,
+        alive_mask=alive_batch, enemy_alive_mask=enemy_alive_batch,
         shoot_mask=shoot_mask_batch,
-        # Auxiliary heads
-        aux_friendly_surv_alpha=aux_fs_alpha,
-        aux_friendly_surv_beta=aux_fs_beta,
-        aux_enemy_surv_alpha=aux_es_alpha,
-        aux_enemy_surv_beta=aux_es_beta,
+        aux_friendly_surv_alpha=aux_fs_alpha, aux_friendly_surv_beta=aux_fs_beta,
+        aux_enemy_surv_alpha=aux_es_alpha, aux_enemy_surv_beta=aux_es_beta,
         aux_obj_control_logits=aux_obj_logits,
         aux_friendly_surv_alpha_short=aux_fs_alpha_short,
         aux_friendly_surv_beta_short=aux_fs_beta_short,
@@ -396,12 +509,38 @@ def replay_tactical_log_probs_flat(
         aux_friendly_act_remaining=aux_f_act_rem,
         aux_enemy_act_remaining=aux_e_act_rem,
         per_opp_type_mean_values=per_opp_type_mean_values,
-        unit_logits=unit_logits,
-        move_logits=move_logits,
-        charge_logits=charge_logits,
-        shoot_logits=shoot_logits,
-        dest_n_valid=dest_mask_batch.sum(dim=-1),  # (N,) — number of valid candidates per step
+        unit_logits=unit_logits, move_logits=move_logits_out,
+        charge_logits=charge_logits_out, shoot_logits=shoot_logits_out,
+        dest_n_valid=dest_mask_batch.sum(dim=-1),
     )
+
+
+# ---------------------------------------------------------------------------
+# Replay (legacy single-call interface, used by profiling scripts)
+# ---------------------------------------------------------------------------
+
+def replay_tactical_log_probs_flat(
+    model: TacticalModel,
+    all_trajectories: list[list[TacticalActivationRecord]],
+) -> FlatReplayResult:
+    """Replay trajectories through the tactical model and compute log-probs.
+
+    Legacy interface — calls prepare_replay_data + replay_from_prepared
+    in a single shot.  For PPO minibatching, use the two-step API directly
+    to avoid redundant data preparation.
+    """
+    device = next(model.parameters()).device
+    prepared = prepare_replay_data(all_trajectories, device=device)
+    if prepared.n_steps == 0:
+        return FlatReplayResult(
+            log_probs=torch.zeros(0),
+            entropies=torch.zeros(0),
+            values=torch.zeros(0),
+            n_episodes=len(all_trajectories),
+            total_reward=0.0,
+        )
+    all_indices = torch.arange(prepared.n_steps, dtype=torch.long, device=device)
+    return replay_from_prepared(model, prepared, all_indices, n_episodes=len(all_trajectories))
 
 
 # ---------------------------------------------------------------------------
@@ -486,15 +625,37 @@ def compute_loss_flat(
     # Entropy (aggregate + per-head)
     mean_entropy = flat_result.entropies.mean()
     per_head_entropy = {}
+    per_head_n = {}
     if flat_result.unit_entropies is not None:
-        for name, ent_t in [
-            ("unit", flat_result.unit_entropies),
-            ("move", flat_result.move_entropies),
-            ("dest", flat_result.dest_entropies),
-            ("charge", flat_result.charge_entropies),
-            ("shoot", flat_result.shoot_entropies),
+        # Conditional heads are averaged only over samples where the head is active,
+        # matching the alpha tuner's view (entropy.py). Unit and move are active for
+        # every sample, so their gate is implicit. per_head_n carries the effective
+        # sample count so minibatch aggregation can weight correctly.
+        is_move = flat_result.is_move
+        is_can_shoot = flat_result.is_can_shoot
+        is_charge_m = flat_result.is_charge
+        n_total = flat_result.unit_entropies.shape[0]
+        for name, ent_t, gate in [
+            ("unit", flat_result.unit_entropies, None),
+            ("move", flat_result.move_entropies, None),
+            ("dest", flat_result.dest_entropies, is_move),
+            ("charge", flat_result.charge_entropies, is_charge_m),
+            ("shoot", flat_result.shoot_entropies, is_can_shoot),
         ]:
-            per_head_entropy[name] = ent_t.mean().item() if ent_t is not None else 0.0
+            if ent_t is None:
+                per_head_entropy[name] = 0.0
+                per_head_n[name] = 0
+            elif gate is None:
+                per_head_entropy[name] = ent_t.mean().item()
+                per_head_n[name] = n_total
+            else:
+                n_gate = int(gate.sum().item())
+                if n_gate == 0:
+                    per_head_entropy[name] = 0.0
+                    per_head_n[name] = 0
+                else:
+                    per_head_entropy[name] = ((ent_t * gate).sum() / n_gate).item()
+                    per_head_n[name] = n_gate
     alpha_loss_val = 0.0
 
     if entropy_tuner is not None and flat_result.unit_entropies is not None:
@@ -505,8 +666,8 @@ def compute_loss_flat(
             flat_result.dest_entropies,
             flat_result.charge_entropies,
             flat_result.shoot_entropies,
-            flat_result.is_adv_rush,
-            flat_result.is_hold_adv,
+            flat_result.is_move,
+            flat_result.is_can_shoot,
             flat_result.is_charge,
         )
         loss = mean_policy_loss + value_coeff * mean_value_loss - entropy_bonus
@@ -518,8 +679,8 @@ def compute_loss_flat(
             flat_result.dest_entropies,
             flat_result.charge_entropies,
             flat_result.shoot_entropies,
-            flat_result.is_adv_rush,
-            flat_result.is_hold_adv,
+            flat_result.is_move,
+            flat_result.is_can_shoot,
             flat_result.is_charge,
             flat_result.alive_mask,
             flat_result.enemy_alive_mask,
@@ -588,6 +749,7 @@ def compute_loss_flat(
         "non_aux_loss": non_aux_loss,
         "clip_frac": clip_frac,
         "per_head_entropy": per_head_entropy,
+        "per_head_n": per_head_n,
         "alpha_loss": alpha_loss_val,
         "_alpha_loss_tensor": alpha_loss,  # for backprop (not serialized)
         "per_opp_type_mean_values": flat_result.per_opp_type_mean_values or {},
@@ -838,8 +1000,8 @@ def _compute_planning_distill_loss(
             charge_targets.append(target)
             charge_weights.append(w)
 
-        # --- Shoot target head: chosen move is hold/advance AND ≥2 distinct targets ---
-        if (s.move_type in (MOVE_HOLD, MOVE_ADVANCE)
+        # --- Shoot target head: chosen move can shoot (advance-reachable dest) AND ≥2 distinct targets ---
+        if (s.move_type == MOVE_MOVE
                 and s.planning_shoot_values is not None
                 and s.planning_shoot_indices is not None
                 and len(s.planning_shoot_indices) >= 2):

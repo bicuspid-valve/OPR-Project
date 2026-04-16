@@ -380,7 +380,8 @@ def build_unit_templates() -> list[UnitTemplate]:
         upgrade_slots=[UpgradeSlot("weapon_swap", "Replace all Distortion Guns", [
             UpgradeOption("wraith_cannons", 50,
                           removes_weapon="Distortion Gun", removes_count=3,
-                          adds_weapons=[Weapon("Wraith Cannon", 12, 3, ap=4)] * 3),
+                          adds_weapons=[Weapon("Wraith Cannon", 12, 3, ap=4)] * 3,
+                          applies_to_all=True),
         ])],
     ))
 
@@ -985,7 +986,8 @@ def _generate_combined_templates(
             tough=tpl.tough,
             fearless=tpl.fearless,
             regeneration=tpl.regeneration,
-            base_weapons=list(tpl.base_weapons) * 2,
+            base_weapons=[w for i in range(0, len(tpl.base_weapons), tpl.size)
+                         for w in list(tpl.base_weapons[i:i + tpl.size]) * 2],
             upgrade_slots=new_slots,
             scout=tpl.scout,
             stealth=tpl.stealth,

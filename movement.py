@@ -570,7 +570,7 @@ def consolidation_move(survivor, board: Board,
             d = dist_sq((int(sc[0]), int(sc[1])), obj)
             if d < best_dist:
                 best_dist = d
-                best_goal = obj
+                best_goal = (int(round(obj[0])), int(round(obj[1])))
     else:
         for e in enemies:
             if e.models_alive <= 0:

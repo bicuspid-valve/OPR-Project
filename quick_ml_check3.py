@@ -7,6 +7,7 @@ Agent B is the standard argmax ML agent.
 
 import json
 import random
+import multiprocessing as mp
 from pathlib import Path
 from ml_training import load_model_state_dict
 from ml_model_tactical import TacticalModel
@@ -16,6 +17,13 @@ from game import simulate_game, simulate_game_recorded
 from viewer import show_game
 
 _DIR = Path(__file__).resolve().parent
+
+PLANNING_PARAMS = {
+    "K_UNITS": 4,
+    "C_SAMPLES_PER_UNIT": 4,
+    "M_ROLLOUTS": 8,
+    "NUM_WORKERS": 1,
+}
 
 
 def load_army_from_hof(hof_entry: dict) -> ArmyList:
@@ -29,6 +37,37 @@ def load_army_from_hof(hof_entry: dict) -> ArmyList:
         entry.combat_preference = e.get("combat_preference", "ranged")
         army.entries.append(entry)
     return army
+
+
+_WORKER_MODEL = None
+_WORKER_HOF_ML = None
+
+
+def _worker_init(checkpoint_path, hof_ml_data):
+    global _WORKER_MODEL, _WORKER_HOF_ML
+    import torch
+    torch.set_num_threads(1)
+    random.seed()
+    state_dict = load_model_state_dict(checkpoint_path)
+    model = TacticalModel()
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    _WORKER_MODEL = model
+    _WORKER_HOF_ML = hof_ml_data
+
+
+def _play_one_game(_idx):
+    army_a = load_army_from_hof(random.choice(_WORKER_HOF_ML))
+    army_b = load_army_from_hof(random.choice(_WORKER_HOF_ML))
+    res_a = resolve_army(army_a)
+    res_b = resolve_army(army_b)
+    sa = _make_unit_states(army_a, res_a, "A")
+    sb = _make_unit_states(army_b, res_b, "B")
+    return simulate_game(
+        res_a, res_b, mode="objectives", states_a=sa, states_b=sb,
+        ml_model_a=_WORKER_MODEL, ml_model_b=_WORKER_MODEL,
+        ml_planning="A", planning_params=PLANNING_PARAMS,
+    )
 
 
 if __name__ == '__main__':
@@ -45,32 +84,22 @@ if __name__ == '__main__':
     model.eval()
     print(f"Loaded {model_label} model from {checkpoint_path}")
 
-    PLANNING_PARAMS = {
-        "K_UNITS": 4,
-        "C_SAMPLES_PER_UNIT": 4,
-        "M_ROLLOUTS": 8,
-    }
-
-    NUM_GAMES = 50
+    NUM_GAMES = 200
+    NUM_WORKERS = 4
     wins = {"A": 0, "B": 0, "draw": 0}
     winner_labels = {"A": "ML+Planning", "B": "ML", "draw": "Draw"}
 
     print(f"Playing {NUM_GAMES} games: ML+Planning (K=4,C=10,M=64) vs ML (argmax)...")
     print(f"  Both sides use random ML HoF armies (different each game).")
-    for i in range(NUM_GAMES):
-        army_a = load_army_from_hof(random.choice(hof_ml_data))
-        army_b = load_army_from_hof(random.choice(hof_ml_data))
-        res_a = resolve_army(army_a)
-        res_b = resolve_army(army_b)
-        sa = _make_unit_states(army_a, res_a, "A")
-        sb = _make_unit_states(army_b, res_b, "B")
-        result = simulate_game(
-            res_a, res_b, mode="objectives", states_a=sa, states_b=sb,
-            ml_model_a=model, ml_model_b=model,
-            ml_planning="A", planning_params=PLANNING_PARAMS,
-        )
-        wins[result] += 1
-        print(f"  Game {i+1}/{NUM_GAMES}: {winner_labels.get(result, result)}", end="\r")
+    print(f"  Using {NUM_WORKERS} worker processes.")
+    with mp.Pool(
+        processes=NUM_WORKERS,
+        initializer=_worker_init,
+        initargs=(checkpoint_path, hof_ml_data),
+    ) as pool:
+        for i, result in enumerate(pool.imap_unordered(_play_one_game, range(NUM_GAMES))):
+            wins[result] += 1
+            print(f"  Game {i+1}/{NUM_GAMES}: {winner_labels.get(result, result)}", end="\r")
 
     print()
     if NUM_GAMES > 0:

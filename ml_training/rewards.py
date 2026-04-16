@@ -194,17 +194,23 @@ def _compute_obj_control_target(
 
     0 = controlled by player (friendly), 1 = controlled by opponent (enemy),
     2 = neutral / uncontrolled.
+
+    Indices are in model-space order (matching _objective_control_mapped /
+    _get_model_objectives in ml_features), so index 1 is always the player's
+    own side and index 2 the enemy side regardless of physical deployment.
     """
     enemy = "B" if player == "A" else "A"
-    target = []
-    for ctrl in obj_control:
+    order = [0, 1, 2, 3, 4] if player == "A" else [0, 2, 1, 4, 3]
+
+    def _cls(idx: int) -> int:
+        ctrl = obj_control[idx]
         if ctrl == player:
-            target.append(0)
-        elif ctrl == enemy:
-            target.append(1)
-        else:
-            target.append(2)
-    return target
+            return 0
+        if ctrl == enemy:
+            return 1
+        return 2
+
+    return [_cls(i) for i in order]
 
 
 @dataclass

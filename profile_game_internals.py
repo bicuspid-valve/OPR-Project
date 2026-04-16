@@ -10,7 +10,7 @@ import io
 
 os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-from ml_training import _generate_army_pair, _run_single_episode_tactical
+from ml_training import _generate_army_pair, _run_games_batched_tactical
 from ml_model_tactical import TacticalModel
 from ml_features import encode_state_tactical, precompute_damage
 from game import simulate_game, deploy_armies, _collect_enemy_positions, _sync_dead_models
@@ -337,7 +337,8 @@ def main():
         res_a, res_b, states_a, states_b, *_ = _generate_army_pair()
         states_a_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_a]
         states_b_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_b]
-        _run_single_episode_tactical(model, None, res_a, res_b, states_a_data, states_b_data, "heuristic", OBJECTIVES)
+        game_specs = [(res_a, res_b, states_a_data, states_b_data, "heuristic", -1, "random")]
+        _run_games_batched_tactical(model, game_specs, {})
     pr.disable()
 
     s = io.StringIO()

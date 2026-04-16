@@ -23,6 +23,7 @@ from ml_training import (
     get_heuristic_fraction, _generate_army_pair,
     _collect_episodes_shared_worker, _init_shared_worker,
     replay_tactical_log_probs_flat, compute_loss_flat, compute_gae,
+    prepare_replay_data, replay_from_prepared,
     _WORKER_COUNT, _MAX_SHARED_OPPONENTS,
     _load_hof_armies, _load_hof_ml_armies,
     _make_model, _resolve_device, _force_tensor_device,
@@ -33,7 +34,7 @@ from ml_model_tactical import TacticalModel
 NUM_BATCHES = 5
 BATCH_SIZE = 512
 WORKER_COUNT = 6
-MINIBATCH_GAMES = 64
+MINIBATCH_GAMES = 128
 DEVICE = "cuda"
 
 
@@ -112,37 +113,17 @@ def main():
     t_pool = time.perf_counter() - t0
     print(f"Pool setup: {t_pool:.3f}s")
 
-    # ── Run batches with phase timing ──
-    print(f"\n{'─'*70}")
-    print(f"{'Phase':<25} {'Time(s)':>8}  {'%':>5}")
-    print(f"{'─'*70}")
-
-    phase_totals = {}
-
-    for batch_num in range(1, NUM_BATCHES + 1):
-        batch_start = time.perf_counter()
-        phases = {}
-        heuristic_fraction = get_heuristic_fraction(metrics.heuristic_win_rate)
-
-        # -- Weight sync --
-        t0 = time.perf_counter()
-        cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()}
-        shared_model.load_state_dict(cpu_sd)
-        phases["weight_sync"] = time.perf_counter() - t0
-
-        # -- Game spec generation (army gen + opponent scheduling) --
-        t0 = time.perf_counter()
+    # ── Helper: build specs, dispatch collection ──
+    def _build_specs_and_dispatch(async_mode=False):
+        hf = get_heuristic_fraction(metrics.heuristic_win_rate)
         game_specs = []
         opponent_state_dicts = []
         _opp_path_cache = {}
-
         for _ in range(BATCH_SIZE):
-            if random.random() < heuristic_fraction:
-                opp_type = "heuristic"
-                opp_sd_idx = -1
+            if random.random() < hf:
+                opp_type, opp_sd_idx = "heuristic", -1
             elif random.random() < 0.5:
-                opp_type = "selfplay_mirror"
-                opp_sd_idx = -1
+                opp_type, opp_sd_idx = "selfplay_mirror", -1
             else:
                 opp_path = checkpoint_pool.sample_opponent_path()
                 if opp_path is not None:
@@ -154,40 +135,55 @@ def main():
                             checkpoint_pool.load_state_dict(opp_path))
                     opp_sd_idx = _opp_path_cache[path_key]
                 else:
-                    opp_type = "selfplay_mirror"
-                    opp_sd_idx = -1
-
+                    opp_type, opp_sd_idx = "selfplay_mirror", -1
             res_a, res_b, states_a, states_b, army_type = _generate_army_pair(
                 opp_type=opp_type, hof_armies=hof_armies,
                 hof_ml_armies=hof_ml_armies)
             states_a_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_a]
             states_b_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_b]
             game_specs.append((res_a, res_b, states_a_data, states_b_data, opp_type, opp_sd_idx, army_type))
-        phases["game_specs"] = time.perf_counter() - t0
-
-        # -- Opponent weight loading --
-        t0 = time.perf_counter()
         opp_slot_map = {}
         for i, sd in enumerate(opponent_state_dicts):
             if i < _MAX_SHARED_OPPONENTS:
                 shared_opponents[i].load_state_dict(sd, strict=False)
                 opp_slot_map[i] = i
-        phases["opp_weight_load"] = time.perf_counter() - t0
-
-        # -- Shaping scale --
-        shaping_scale = 0.0  # matches resumed training
-
-        # -- Episode collection (workers) --
-        t0 = time.perf_counter()
         n_chunks = WORKER_COUNT
         chunk_size = max(1, len(game_specs) // n_chunks)
-        chunks = []
-        for i in range(0, len(game_specs), chunk_size):
-            chunk = game_specs[i : i + chunk_size]
-            chunks.append((opp_slot_map, chunk, shaping_scale))
-        chunk_results = list(pool.map(_collect_episodes_shared_worker, chunks))
+        chunks = [(opp_slot_map, game_specs[ci:ci+chunk_size], 0.0)
+                   for ci in range(0, len(game_specs), chunk_size)]
+        if async_mode:
+            return pool.map_async(_collect_episodes_shared_worker, chunks)
+        return list(pool.map(_collect_episodes_shared_worker, chunks))
+
+    # ── Run batches with phase timing (pipelined) ──
+    print(f"\n{'─'*70}")
+    print(f"{'Phase':<25} {'Time(s)':>8}  {'%':>5}")
+    print(f"{'─'*70}")
+
+    phase_totals = {}
+
+    # Dispatch first batch
+    cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()}
+    shared_model.load_state_dict(cpu_sd)
+    pending_result = _build_specs_and_dispatch(async_mode=True)
+
+    for batch_num in range(1, NUM_BATCHES + 1):
+        batch_start = time.perf_counter()
+        phases = {}
+
+        # -- Wait for current batch's episodes --
+        t0 = time.perf_counter()
+        chunk_results = pending_result.get()
         trajectories = [ep for chunk in chunk_results for ep in chunk]
-        phases["episode_sim"] = time.perf_counter() - t0
+        phases["episode_wait"] = time.perf_counter() - t0
+
+        # -- Dispatch NEXT batch (overlaps with PPO below) --
+        t0 = time.perf_counter()
+        if batch_num < NUM_BATCHES:
+            cpu_sd = {k: v.cpu() for k, v in model.state_dict().items()}
+            shared_model.load_state_dict(cpu_sd)
+            pending_result = _build_specs_and_dispatch(async_mode=True)
+        phases["next_dispatch"] = time.perf_counter() - t0
 
         # -- GAE --
         t0 = time.perf_counter()
@@ -198,7 +194,7 @@ def main():
                 metrics.record_game(traj_tuple[1], traj_tuple[2])
         phases["gae"] = time.perf_counter() - t0
 
-        # -- Flatten tensors --
+        # -- Flatten + prepare replay data --
         t0 = time.perf_counter()
         flat_old_lps = torch.tensor(
             [s.old_log_prob for traj in all_trajs for s in traj],
@@ -213,17 +209,28 @@ def main():
         game_step_offsets = [0] * len(all_trajs)
         for gi in range(1, len(all_trajs)):
             game_step_offsets[gi] = game_step_offsets[gi - 1] + game_step_counts[gi - 1]
-        phases["flatten"] = time.perf_counter() - t0
+        prepared = prepare_replay_data(all_trajs, device=device)
+        all_flat_steps = [s for traj in all_trajs for s in traj]
+        phases["prepare"] = time.perf_counter() - t0
 
-        # -- PPO update --
+        # -- PPO update (with sub-phase timing) --
         t0 = time.perf_counter()
+        ppo_t_replay = 0.0
+        ppo_t_loss = 0.0
+        ppo_t_backward = 0.0
+        ppo_t_optim = 0.0
+        ppo_t_index = 0.0
+        ppo_n_minibatches = 0
+        ppo_total_steps = 0
         pre_ppo_state = {k: v.clone() for k, v in model.state_dict().items()}
         for _ppo_epoch in range(config.ppo_epochs):
             game_indices = list(range(len(all_trajs)))
             random.shuffle(game_indices)
             for mb_start in range(0, len(game_indices), MINIBATCH_GAMES):
                 mb_game_idx = game_indices[mb_start:mb_start + MINIBATCH_GAMES]
-                mb_trajs = [all_trajs[i] for i in mb_game_idx]
+
+                # -- Index gathering --
+                _t = time.perf_counter()
                 mb_flat_idx = []
                 for gi in mb_game_idx:
                     off = game_step_offsets[gi]
@@ -234,10 +241,20 @@ def main():
                 mb_old_lps = flat_old_lps[idx_t]
                 mb_advantages = flat_advantages_t[idx_t]
                 mb_returns = flat_returns_t[idx_t]
+                ppo_t_index += time.perf_counter() - _t
 
+                # -- Replay forward pass (using pre-built data) --
+                _t = time.perf_counter()
+                mb_flat_result = replay_from_prepared(
+                    model, prepared, idx_t, n_episodes=len(mb_game_idx))
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                ppo_t_replay += time.perf_counter() - _t
+
+                # -- Loss computation --
+                _t = time.perf_counter()
+                mb_flat_steps = [all_flat_steps[i] for i in mb_flat_idx]
                 with _force_tensor_device(device):
-                    mb_flat_result = replay_tactical_log_probs_flat(model, mb_trajs)
-                    mb_flat_steps = [s for traj in mb_trajs for s in traj]
                     loss, loss_metrics = compute_loss_flat(
                         mb_flat_result, mb_old_lps, mb_advantages, mb_returns,
                         config.clip_epsilon, config.value_coeff, 0.01,
@@ -245,7 +262,12 @@ def main():
                         flat_steps=mb_flat_steps,
                         entropy_tuner=entropy_tuner,
                     )
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                ppo_t_loss += time.perf_counter() - _t
 
+                # -- Backward + optimizer --
+                _t = time.perf_counter()
                 optimizer.zero_grad()
                 alpha_optimizer.zero_grad()
                 if not (torch.isnan(loss) or torch.isinf(loss)):
@@ -255,10 +277,26 @@ def main():
                         alpha_loss_tensor.backward()
                         alpha_optimizer.step()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                ppo_t_backward += time.perf_counter() - _t
+
+                _t = time.perf_counter()
+                optimizer.step()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                ppo_t_optim += time.perf_counter() - _t
+
+                ppo_n_minibatches += 1
+                ppo_total_steps += len(mb_flat_idx)
+
         phases["ppo_update"] = time.perf_counter() - t0
+        phases["  ppo_replay"] = ppo_t_replay
+        phases["  ppo_loss"] = ppo_t_loss
+        phases["  ppo_backward"] = ppo_t_backward
+        phases["  ppo_optim"] = ppo_t_optim
+        phases["  ppo_index"] = ppo_t_index
+        phases["  ppo_overhead"] = phases["ppo_update"] - ppo_t_replay - ppo_t_loss - ppo_t_backward - ppo_t_optim - ppo_t_index
 
         total = time.perf_counter() - batch_start
         phases["TOTAL"] = total
@@ -285,15 +323,16 @@ def main():
         print(f"  {phase:<22} {avg:>8.3f}s  {pct:>5.1f}%")
     print(f"\n  Games/sec: {BATCH_SIZE / avg_total:.1f}")
 
-    # ── Comparison with profiling script ──
+    # ── PPO sub-phase summary ──
     print(f"\n{'─'*70}")
-    print("Compare with profiling script (cuda, MB=64, workers=6):")
-    print("  Profiling: 11.0s/batch, sim=5.8s, replay=3.6s, loss=0.5s")
-    print(f"  Real:      {avg_total:.1f}s/batch, "
-          f"sim={phase_totals['episode_sim']/NUM_BATCHES:.1f}s, "
-          f"ppo={phase_totals['ppo_update']/NUM_BATCHES:.1f}s")
-    gap = avg_total - 11.0
-    print(f"  Gap: {gap:+.1f}s — see breakdown above for where it goes")
+    print(f"PPO UPDATE BREAKDOWN (avg per batch):")
+    ppo_total = phase_totals.get("ppo_update", 0) / NUM_BATCHES
+    for sub in ["  ppo_replay", "  ppo_loss", "  ppo_backward", "  ppo_optim", "  ppo_index", "  ppo_overhead"]:
+        sub_avg = phase_totals.get(sub, 0) / NUM_BATCHES
+        sub_pct = 100 * sub_avg / ppo_total if ppo_total > 0 else 0
+        print(f"  {sub.strip():<20} {sub_avg:>8.3f}s  {sub_pct:>5.1f}% of PPO")
+    print(f"  {'minibatches/batch':<20} {ppo_n_minibatches / NUM_BATCHES:.0f}")
+    print(f"  {'steps/batch':<20} {ppo_total_steps / NUM_BATCHES:.0f}")
 
 
 if __name__ == "__main__":

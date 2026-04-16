@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from ml_model_tactical import TacticalModel
+from ml_model_tactical import TacticalModel, DEFAULT_CORE_ITERS
 
 
 # ---------------------------------------------------------------------------
@@ -59,32 +59,25 @@ def _make_model(model_type: str = "tactical") -> nn.Module:
 def load_model_state_dict(path) -> dict:
     """Load a model state dict from a checkpoint file.
 
-    Handles both the legacy format (raw state_dict) and the new format
-    (dict with 'model_state_dict' and 'batch_num' keys).
-
-    For old checkpoints without opponent conditioning, drops value_head.*
-    keys (shape mismatch) so they reinitialise cleanly with strict=False.
+    Handles migration from older checkpoints that lack the side embedding
+    by zero-padding the value_proj weight matrix.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    else:
-        state_dict = ckpt
-    # Checkpoint compat: old checkpoints lack opponent_embedding and have
-    # value_head.value_proj with wrong input dim (H vs H+OPP_EMBED_DIM).
-    # Drop value_head keys so they reinitialise; policy heads are unaffected.
-    if "opponent_embedding.weight" not in state_dict:
-        state_dict = {k: v for k, v in state_dict.items()
-                      if not k.startswith("value_head.")}
-    # Checkpoint compat: old checkpoints have direction_head/distance_head or
-    # destination_head instead of dest_embed/dest_query_proj. Drop them so
-    # the new pointer layers reinitialise.
-    if "direction_head.weight" in state_dict or "destination_head.weight" in state_dict:
-        state_dict = {k: v for k, v in state_dict.items()
-                      if not k.startswith("direction_head.")
-                      and not k.startswith("distance_head.")
-                      and not k.startswith("destination_head.")}
-    return state_dict
+    sd = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+
+    # Migrate value_proj if it's the old size (no side embedding)
+    from ml_model_tactical import SIDE_EMBED_DIM
+    vp_key = "value_head.value_proj.weight"
+    if vp_key in sd:
+        old_w = sd[vp_key]
+        model = TacticalModel()
+        expected_in = model.value_head.value_proj.in_features
+        if old_w.shape[1] < expected_in:
+            pad = expected_in - old_w.shape[1]
+            sd[vp_key] = torch.cat([old_w, torch.zeros(1, pad)], dim=1)
+        del model
+
+    return sd
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +108,10 @@ class CheckpointPool:
     def save(self, model: nn.Module, batch_num: int) -> None:
         """Save a checkpoint and add to pool, evicting oldest if full."""
         path = self.save_dir / f"checkpoint_batch_{batch_num:06d}.pt"
-        torch.save(model.state_dict(), path)
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "n_iters": getattr(model, "n_iters", DEFAULT_CORE_ITERS),
+        }, path)
         self.entries.append(path)
         # Evict oldest if over capacity
         while len(self.entries) > self.max_size:
@@ -132,7 +128,13 @@ class CheckpointPool:
             self.entries.remove(path)
             return None
         opponent = _make_model(self.model_type)
-        opponent.load_state_dict(torch.load(path, weights_only=True), strict=False)
+        ckpt = torch.load(path, weights_only=True)
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            opponent.load_state_dict(ckpt["model_state_dict"], strict=False)
+            opponent.n_iters = ckpt.get("n_iters", DEFAULT_CORE_ITERS)
+        else:
+            # Legacy bare state_dict
+            opponent.load_state_dict(ckpt, strict=False)
         opponent.eval()
         return opponent
 
@@ -144,7 +146,10 @@ class CheckpointPool:
         if not path.exists():
             self.entries.remove(path)
             return None
-        return torch.load(path, weights_only=True)
+        ckpt = torch.load(path, weights_only=True)
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            return ckpt["model_state_dict"]
+        return ckpt
 
     def sample_opponent_path(self) -> Path | None:
         """Return a random checkpoint path (without loading). Returns None if empty."""
@@ -158,7 +163,10 @@ class CheckpointPool:
 
     def load_state_dict(self, path: Path) -> dict:
         """Load a checkpoint's state_dict from the given path."""
-        return torch.load(path, weights_only=True)
+        ckpt = torch.load(path, weights_only=True)
+        if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+            return ckpt["model_state_dict"]
+        return ckpt
 
     def __len__(self) -> int:
         return len(self.entries)
