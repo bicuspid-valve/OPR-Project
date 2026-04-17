@@ -34,6 +34,8 @@ from ml_training.config import (
 from ml_training.rewards import (
     compute_round_reward, terminal_reward, _make_round_snapshot,
     compute_objective_capture_reward, _any_friendly_on_objective,
+    compute_shooting_efficiency_reward,
+    compute_charge_efficiency_reward,
 )
 from board import OBJECTIVES as _OBJECTIVES_FOR_REWARD, OBJ_SEIZE_RANGE as _OBJ_SEIZE_RANGE
 from ml_training.sampling import sample_tactical_actions_no_grad, _batched_sample_tactical_no_grad
@@ -220,6 +222,12 @@ def _episode_tactical_generator(opponent_model,
     prev_b_kill_pts = 0.0
     prev_b_fkp = 0.0
     prev_b_ekp = 0.0
+
+    # Heuristic opponent efficiency tracking (for baseline comparison)
+    _h_shoot_eff_total = 0.0
+    _h_charge_eff_total = 0.0
+    _h_shoot_count = 0
+    _h_charge_count = 0
 
     # Activation counters for countdown targets
     _a_act_total = 0
@@ -697,6 +705,8 @@ def _episode_tactical_generator(opponent_model,
                 if not is_mirror:
                     _b_act_total += 1
 
+            _shoot_target = None  # track ranged shooting for efficiency reward
+
             # --- Execute the activation ---
             if current_is_a:
                 action = _a_tac_action
@@ -774,6 +784,7 @@ def _episode_tactical_generator(opponent_model,
                     else:
                         target = pick_target(active, opp_units, target_multipliers=my_mults)
                     if target is not None:
+                        _shoot_target = target
                         resolve_shooting(active, target)
                         check_morale(target)
                         _sync_dead_models(target, board)
@@ -784,9 +795,68 @@ def _episode_tactical_generator(opponent_model,
                 else:
                     target = pick_target(active, opp_units, target_multipliers=my_mults)
                 if target is not None:
+                    _shoot_target = target
                     resolve_shooting(active, target)
                     check_morale(target)
                     _sync_dead_models(target, board)
+
+            # Per-activation shooting efficiency reward
+            if _shoot_target is not None:
+                _st_idx = next((i for i, u in enumerate(opp_units) if u is _shoot_target), -1)
+                if _st_idx >= 0:
+                    if current_is_a and round_step_indices:
+                        _sr = compute_shooting_efficiency_reward(
+                            active, _shoot_target, sel_idx, _st_idx,
+                            fr_a, pts_a, round_num,
+                        )
+                        if _sr != 0.0:
+                            trajectory[round_step_indices[-1]].reward += shaping_scale * _sr
+                            trajectory[round_step_indices[-1]].shooting_efficiency_reward += _sr
+                    elif is_mirror and round_step_indices_b:
+                        _sr = compute_shooting_efficiency_reward(
+                            active, _shoot_target, sel_b, _st_idx,
+                            fr_b, pts_b, round_num,
+                        )
+                        if _sr != 0.0:
+                            trajectory_b[round_step_indices_b[-1]].reward += shaping_scale * _sr
+                            trajectory_b[round_step_indices_b[-1]].shooting_efficiency_reward += _sr
+                    elif not current_is_a and not _opp_tac_decision:
+                        _h_atk_idx = next((i for i, u in enumerate(units_b) if u is active), -1)
+                        if _h_atk_idx >= 0 and _st_idx < MAX_UNITS_PER_SIDE:
+                            _h_shoot_eff_total += compute_shooting_efficiency_reward(
+                                active, _shoot_target, _h_atk_idx, _st_idx,
+                                fr_b, pts_b, round_num,
+                            )
+                            _h_shoot_count += 1
+
+            # Per-activation charge efficiency reward
+            if action == "charge" and charge_target is not None:
+                _ct_idx = next((i for i, u in enumerate(opp_units) if u is charge_target), -1)
+                if _ct_idx >= 0:
+                    if current_is_a and round_step_indices:
+                        _cr = compute_charge_efficiency_reward(
+                            active, charge_target, sel_idx, _ct_idx,
+                            fm_a, pts_a, round_num,
+                        )
+                        if _cr != 0.0:
+                            trajectory[round_step_indices[-1]].reward += shaping_scale * _cr
+                            trajectory[round_step_indices[-1]].charge_efficiency_reward += _cr
+                    elif is_mirror and round_step_indices_b:
+                        _cr = compute_charge_efficiency_reward(
+                            active, charge_target, sel_b, _ct_idx,
+                            fm_b, pts_b, round_num,
+                        )
+                        if _cr != 0.0:
+                            trajectory_b[round_step_indices_b[-1]].reward += shaping_scale * _cr
+                            trajectory_b[round_step_indices_b[-1]].charge_efficiency_reward += _cr
+                    elif not current_is_a and not _opp_tac_decision:
+                        _h_atk_idx = next((i for i, u in enumerate(units_b) if u is active), -1)
+                        if _h_atk_idx >= 0 and _ct_idx < MAX_UNITS_PER_SIDE:
+                            _h_charge_eff_total += compute_charge_efficiency_reward(
+                                active, charge_target, _h_atk_idx, _ct_idx,
+                                fm_b, pts_b, round_num,
+                            )
+                            _h_charge_count += 1
 
             # Per-activation objective capture reward
             if _pre_move_friendly_on_objs_g is not None and active is not None and active.models_alive > 0:
@@ -881,7 +951,13 @@ def _episode_tactical_generator(opponent_model,
             step.friendly_activations_remaining = float(_b_act_total - b_so_far)
             step.enemy_activations_remaining = float(_a_act_total - a_so_far)
 
-    return trajectory, result, opponent_type, trajectory_b
+    heuristic_eff = {
+        'shoot': _h_shoot_eff_total,
+        'charge': _h_charge_eff_total,
+        'shoot_n': _h_shoot_count,
+        'charge_n': _h_charge_count,
+    } if opponent_type == "heuristic" else None
+    return trajectory, result, opponent_type, trajectory_b, heuristic_eff
 
 
 def _run_games_batched_tactical(
@@ -1080,10 +1156,10 @@ def _run_games_batched_tactical(
 
     results = []
     for i in range(len(generators)):
-        traj, result, opp_type, traj_b = finished[i]
+        traj, result, opp_type, traj_b, h_eff = finished[i]
         m_side = game_model_sides[i]
-        results.append((traj, _to_main(result, m_side), opp_type, game_army_types[i], m_side))
+        results.append((traj, _to_main(result, m_side), opp_type, game_army_types[i], m_side, h_eff))
         if traj_b is not None:
             opp_m_side = "B" if m_side == "A" else "A"
-            results.append((traj_b, _to_main(result, opp_m_side), "mirror_b", game_army_types[i], opp_m_side))
+            results.append((traj_b, _to_main(result, opp_m_side), "mirror_b", game_army_types[i], opp_m_side, None))
     return results

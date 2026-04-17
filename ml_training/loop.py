@@ -202,6 +202,12 @@ def run_training(
             "plan_dl_unit", "plan_dl_move",
             "plan_dl_charge", "plan_dl_shoot",
             "wr_side_a", "wr_side_b", "val_side_a", "val_side_b",
+            "shoot_eff_reward",
+            "charge_eff_reward",
+            "ml_h_shoot_eff",
+            "ml_h_charge_eff",
+            "h_shoot_eff_reward",
+            "h_charge_eff_reward",
         ])
     _log_writer.writerow([datetime.now().isoformat(), "---",
                           f"Training started (start_batch={start_batch})",
@@ -364,7 +370,7 @@ def run_training(
 
         # --- Phase 3: compute GAE advantages (fixed across PPO epochs) ---
         model.train()
-        all_trajs = [traj_rounds for traj_rounds, _, _, _, _ in trajectories]
+        all_trajs = [traj_rounds for traj_rounds, _, _, _, _, _ in trajectories]
         all_advantages, all_returns = compute_gae(
             all_trajs, gamma=1.0, gae_lambda=config.gae_lambda,
             unit_local_blend=config.unit_local_advantage_blend,
@@ -375,7 +381,15 @@ def run_training(
         # but DO record them for per-side tracking (mirror matches are the
         # cleanest signal for A/B symmetry).
         opp_types = []
-        for _, result, opp_type, army_type, phys_side in trajectories:
+        _h_shoot_eff_sum = 0.0
+        _h_charge_eff_sum = 0.0
+        _h_shoot_n = 0
+        _h_charge_n = 0
+        _ml_h_shoot_eff_sum = 0.0
+        _ml_h_charge_eff_sum = 0.0
+        _ml_h_shoot_n = 0
+        _ml_h_charge_n = 0
+        for traj, result, opp_type, army_type, phys_side, h_eff in trajectories:
             if opp_type != "mirror_b":
                 metrics.record_game(result, opp_type, army_type,
                                     physical_side=phys_side)
@@ -384,6 +398,18 @@ def run_training(
                 metrics.record_game(result, opp_type, army_type,
                                     physical_side=phys_side)
             opp_types.append(opp_type)
+            if h_eff is not None:
+                _h_shoot_eff_sum += h_eff['shoot']
+                _h_charge_eff_sum += h_eff['charge']
+                _h_shoot_n += h_eff['shoot_n']
+                _h_charge_n += h_eff['charge_n']
+                for s in traj:
+                    if s.shooting_efficiency_reward != 0.0:
+                        _ml_h_shoot_eff_sum += s.shooting_efficiency_reward
+                        _ml_h_shoot_n += 1
+                    if s.charge_efficiency_reward != 0.0:
+                        _ml_h_charge_eff_sum += s.charge_efficiency_reward
+                        _ml_h_charge_n += 1
 
         # --- Phase 4: PPO multi-epoch update ---
         # Anneal entropy coefficient: linear from start to end
@@ -695,6 +721,12 @@ def run_training(
             f"{metrics.b_side_win_rate:.3f}",
             f"{_opp_val_dict.get('mean_value_side_a', '')}",
             f"{_opp_val_dict.get('mean_value_side_b', '')}",
+            f"{loss_metrics.get('mean_shoot_eff_reward', 0.0):.6f}",
+            f"{loss_metrics.get('mean_charge_eff_reward', 0.0):.6f}",
+            f"{_ml_h_shoot_eff_sum / max(_ml_h_shoot_n, 1):.6f}",
+            f"{_ml_h_charge_eff_sum / max(_ml_h_charge_n, 1):.6f}",
+            f"{_h_shoot_eff_sum / max(_h_shoot_n, 1):.6f}",
+            f"{_h_charge_eff_sum / max(_h_charge_n, 1):.6f}",
         ])
         _log_file.flush()
 

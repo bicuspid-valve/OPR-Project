@@ -282,17 +282,44 @@ def main():
     ax9b.set_title("Value by Physical Side (mirror self-play)")
     ax9b.grid(alpha=0.3)
 
-    # --- Panel 10: Dest 4th component objective proximity loss ---
+    # --- Panel 10: Shooting & Charge efficiency rewards ---
+    # Primary comparison: ML vs heuristic from the SAME heuristic-opponent games
+    # (ml_h_* columns). All-games ML metric (shoot/charge_eff_reward) shown
+    # as faint dotted lines for reference.
     ax10_dest = fig.add_subplot(gs[5, :])
-    if "dest_obj_prox" in data:
-        bx, by = block_average(data, "dest_obj_prox", block_size)
-        ax10_dest.plot(bx, by, marker="o", markersize=2, linewidth=1.5, color="#27AE60")
+    _has_eff = False
+    if "ml_h_shoot_eff" in data:
+        bx, by = block_average(data, "ml_h_shoot_eff", block_size)
+        ax10_dest.plot(bx, by, marker="o", markersize=2, linewidth=1.5, color="#E67E22", label="Shooting (ML)")
+        _has_eff = True
+    elif "shoot_eff_reward" in data:
+        bx, by = block_average(data, "shoot_eff_reward", block_size)
+        ax10_dest.plot(bx, by, marker="o", markersize=2, linewidth=1.5, color="#E67E22", label="Shooting (ML, all games)")
+        _has_eff = True
+    if "ml_h_charge_eff" in data:
+        bx, by = block_average(data, "ml_h_charge_eff", block_size)
+        ax10_dest.plot(bx, by, marker="o", markersize=2, linewidth=1.5, color="#8E44AD", label="Charge (ML)")
+        _has_eff = True
+    elif "charge_eff_reward" in data:
+        bx, by = block_average(data, "charge_eff_reward", block_size)
+        ax10_dest.plot(bx, by, marker="o", markersize=2, linewidth=1.5, color="#8E44AD", label="Charge (ML, all games)")
+        _has_eff = True
+    if "h_shoot_eff_reward" in data:
+        bx, by = block_average(data, "h_shoot_eff_reward", block_size)
+        ax10_dest.plot(bx, by, linewidth=1.5, linestyle="--", color="#E67E22", alpha=0.6, label="Shooting (heuristic)")
+        _has_eff = True
+    if "h_charge_eff_reward" in data:
+        bx, by = block_average(data, "h_charge_eff_reward", block_size)
+        ax10_dest.plot(bx, by, linewidth=1.5, linestyle="--", color="#8E44AD", alpha=0.6, label="Charge (heuristic)")
+        _has_eff = True
+    if _has_eff:
+        ax10_dest.legend(fontsize=8)
     else:
-        ax10_dest.text(0.5, 0.5, "dest_obj_prox not in CSV\n(older log format)",
+        ax10_dest.text(0.5, 0.5, "shoot/charge_eff_reward not in CSV\n(older log format)",
                        transform=ax10_dest.transAxes, ha="center", va="center",
                        fontsize=10, color="gray")
-    ax10_dest.set_ylabel("Mean Distance to Nearest Obj")
-    ax10_dest.set_title("4th Dest Component: Objective Proximity (advance/rush only)")
+    ax10_dest.set_ylabel("Mean Efficiency Reward")
+    ax10_dest.set_title("Target Efficiency Rewards (expected pts of damage per episode, vs heuristic)")
     ax10_dest.set_ylim(bottom=0)
     ax10_dest.grid(alpha=0.3)
 

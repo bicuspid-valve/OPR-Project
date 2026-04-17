@@ -157,6 +157,8 @@ class TacticalActivationRecord:
     shoot_mask: list[bool] | None = None   # enemy alive AND in weapon range (10 bools)
     post_move_rel: np.ndarray | None = None  # (30,) post-move relative features
     reward: float = 0.0
+    shooting_efficiency_reward: float = 0.0  # shooting efficiency shaping component (for logging)
+    charge_efficiency_reward: float = 0.0    # charge efficiency shaping component (for logging)
     old_log_prob: float = 0.0             # sum of log-probs under collection policy
     old_value: float = 0.0                # value estimate under collection policy
     # Opponent conditioning (CTDE — value head only)

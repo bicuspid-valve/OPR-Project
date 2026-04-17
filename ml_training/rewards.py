@@ -4,9 +4,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
+
 from board import Board, OBJECTIVES, OBJ_SEIZE_RANGE
 from models import UnitState
-from ml_features import MAX_UNITS_PER_SIDE
+from ml_features import MAX_UNITS_PER_SIDE, RANGE_THRESHOLDS
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +142,119 @@ def compute_objective_capture_reward(
                 break
 
     return shaping_scale * reward
+
+
+def compute_shooting_efficiency_reward(
+    attacker: UnitState,
+    target: UnitState,
+    attacker_idx: int,
+    target_idx: int,
+    ranged_matchups: np.ndarray,
+    total_army_points: int,
+    round_num: int,
+) -> float:
+    """Per-activation reward for shooting efficiency (pre-anneal).
+
+    Returns the reward value **before** shaping_scale is applied.  The caller
+    is responsible for multiplying by shaping_scale when adding to the
+    trajectory reward, so that the raw (pre-anneal) value can be logged
+    separately for diagnostics.
+
+    The expected damage is looked up from the precomputed ranged matchup
+    table (kill fraction at the appropriate range bucket), scaled by the
+    attacker's surviving model fraction, and converted to points.
+
+    Parameters
+    ----------
+    attacker : the shooting unit (post-move)
+    target : the target unit (pre-resolve)
+    attacker_idx : index of attacker in its side's unit list
+    target_idx : index of target in the opposing unit list
+    ranged_matchups : precomputed array, shape (n_friendly, MAX_UNITS, NUM_RANGE)
+    total_army_points : total points of the attacker's army (for normalisation)
+    round_num : 1-4
+    """
+    # Distance between attacker and target centres
+    ax, ay = attacker.centre()
+    tx, ty = target.centre()
+    dist = math.sqrt((ax - tx) ** 2 + (ay - ty) ** 2)
+
+    # Find the largest range threshold <= dist (conservative: may slightly
+    # overestimate by including weapons that can't quite reach).
+    # If dist < smallest threshold, use bucket 0 (all ranged weapons).
+    bucket = 0
+    for k, threshold in enumerate(RANGE_THRESHOLDS):
+        if threshold <= dist:
+            bucket = k
+        else:
+            break
+
+    # Kill fraction (precomputed assuming all models alive)
+    kill_frac = float(ranged_matchups[attacker_idx, target_idx, bucket])
+
+    # Scale by attacker's surviving model fraction (fewer models = fewer weapons)
+    alive_frac = attacker.models_alive / max(attacker.unit.models, 1)
+
+    # Expected points of damage
+    expected_pts = kill_frac * alive_frac * target.unit.points
+
+    # Normalise by total army points (same scale as kill reward)
+    pts = max(total_army_points, 1)
+
+    # Phase-dependent weight: stronger early when shooting decisions
+    # matter most and kill shaping is also active.
+    t = (round_num - 1) / 3.0           # 0.0 in round 1 → 1.0 in round 4
+    weight = 0.20 - 0.10 * t            # 0.20 → 0.10
+
+    return weight * expected_pts / pts
+
+
+def compute_charge_efficiency_reward(
+    attacker: UnitState,
+    target: UnitState,
+    attacker_idx: int,
+    target_idx: int,
+    melee_matchups: np.ndarray,
+    total_army_points: int,
+    round_num: int,
+) -> float:
+    """Per-activation reward for charge target efficiency (pre-anneal).
+
+    Returns the reward value **before** shaping_scale is applied.  The caller
+    is responsible for multiplying by shaping_scale when adding to the
+    trajectory reward, so that the raw (pre-anneal) value can be logged
+    separately for diagnostics.
+
+    Uses the precomputed melee matchup table (expected kill fraction) scaled
+    by the attacker's surviving model fraction, converted to points.
+
+    Parameters
+    ----------
+    attacker : the charging unit (pre-combat)
+    target : the charge target (pre-combat)
+    attacker_idx : index of attacker in its side's unit list
+    target_idx : index of target in the opposing unit list
+    melee_matchups : precomputed array, shape (n_friendly, MAX_UNITS)
+    total_army_points : total points of the attacker's army (for normalisation)
+    round_num : 1-4
+    """
+    # Kill fraction (precomputed assuming all models alive)
+    kill_frac = float(melee_matchups[attacker_idx, target_idx])
+
+    # Scale by attacker's surviving model fraction (fewer models = fewer attacks)
+    alive_frac = attacker.models_alive / max(attacker.unit.models, 1)
+
+    # Expected points of damage
+    expected_pts = kill_frac * alive_frac * target.unit.points
+
+    # Normalise by total army points (same scale as kill reward)
+    pts = max(total_army_points, 1)
+
+    # Phase-dependent weight: same schedule as shooting efficiency
+    t = (round_num - 1) / 3.0           # 0.0 in round 1 → 1.0 in round 4
+    weight = 0.20 - 0.10 * t            # 0.20 → 0.10
+
+    return weight * expected_pts / pts
 
 
 def terminal_reward(result: str, player: str, a_objs: int = 0, b_objs: int = 0) -> float:

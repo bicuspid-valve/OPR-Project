@@ -40,6 +40,10 @@ class FlatReplayResult:
     values: torch.Tensor       # (N,) — value estimates
     n_episodes: int
     total_reward: float        # pre-computed sum of all rewards
+    total_shoot_eff_reward: float = 0.0  # shooting efficiency shaping component (for logging)
+    total_charge_eff_reward: float = 0.0  # charge efficiency shaping component (for logging)
+    total_shoot_eff_count: int = 0       # number of activations that shot (for per-activation avg)
+    total_charge_eff_count: int = 0      # number of activations that charged (for per-activation avg)
     # Per-head entropies for entropy target tuning
     unit_entropies: torch.Tensor | None = None     # (N,)
     move_entropies: torch.Tensor | None = None     # (N,)
@@ -106,6 +110,10 @@ class PreparedReplayData:
     shoot_indices: torch.Tensor         # (N,) long
     shoot_mask: torch.Tensor            # (N, 10) bool
     rewards: torch.Tensor               # (N,) float (for total_reward)
+    total_shoot_eff_reward: float        # shooting efficiency shaping total (for logging)
+    total_charge_eff_reward: float       # charge efficiency shaping total (for logging)
+    total_shoot_eff_count: int           # activations that shot
+    total_charge_eff_count: int          # activations that charged
     # Compact dest feature storage (avoids multi-GB padded arrays).
     # Per-minibatch, replay_from_prepared pads to the local max and transfers.
     dest_buffer: np.ndarray               # (total_cands, DEST_FEATURE_DIM) float32 — compact
@@ -275,6 +283,10 @@ def prepare_replay_data(
         opp_type_indices=opp_type_t, side_indices=side_t,
         charge_indices=charge_idx_t, shoot_indices=shoot_idx_t,
         shoot_mask=shoot_mask_t, rewards=reward_t,
+        total_shoot_eff_reward=sum(s.shooting_efficiency_reward for s in flat_steps),
+        total_charge_eff_reward=sum(s.charge_efficiency_reward for s in flat_steps),
+        total_shoot_eff_count=sum(1 for s in flat_steps if s.shooting_efficiency_reward != 0.0),
+        total_charge_eff_count=sum(1 for s in flat_steps if s.charge_efficiency_reward != 0.0),
         dest_buffer=dest_buffer,
         dest_offsets=dest_offsets_np, dest_counts=dest_counts_np,
         n_steps=n_steps, n_episodes=len(all_trajectories), device=device,
@@ -461,6 +473,10 @@ def replay_from_prepared(
 
     mean_ent = total_ent / n_heads.clamp(min=1.0)
     total_reward = rewards_batch.sum().item()
+    total_shoot_eff_reward = prepared.total_shoot_eff_reward
+    total_charge_eff_reward = prepared.total_charge_eff_reward
+    total_shoot_eff_count = prepared.total_shoot_eff_count
+    total_charge_eff_count = prepared.total_charge_eff_count
 
     # === Auxiliary prediction heads ===
     aux_fs_alpha = aux_fs_beta = aux_es_alpha = aux_es_beta = None
@@ -492,6 +508,10 @@ def replay_from_prepared(
     return FlatReplayResult(
         log_probs=total_lp, entropies=mean_ent, values=values,
         n_episodes=n_episodes, total_reward=total_reward,
+        total_shoot_eff_reward=total_shoot_eff_reward,
+        total_charge_eff_reward=total_charge_eff_reward,
+        total_shoot_eff_count=total_shoot_eff_count,
+        total_charge_eff_count=total_charge_eff_count,
         unit_entropies=unit_ent, move_entropies=move_ent,
         dest_entropies=dest_ent, charge_entropies=charge_ent,
         shoot_entropies=shoot_ent,
@@ -744,6 +764,8 @@ def compute_loss_flat(
         "value_loss": mean_value_loss.item(),
         "mean_entropy": mean_entropy.item(),
         "mean_reward": flat_result.total_reward / max(flat_result.n_episodes, 1),
+        "mean_shoot_eff_reward": flat_result.total_shoot_eff_reward / max(flat_result.total_shoot_eff_count, 1),
+        "mean_charge_eff_reward": flat_result.total_charge_eff_reward / max(flat_result.total_charge_eff_count, 1),
         "aux_loss": aux_loss_val,
         "weighted_aux": weighted_aux,
         "non_aux_loss": non_aux_loss,
