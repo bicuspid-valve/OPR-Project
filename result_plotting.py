@@ -75,13 +75,13 @@ def main():
     n = len(data["batch"])
     print(f"Loaded {n} batches from {path.name}")
 
-    fig = plt.figure(figsize=(16, 30))
+    fig = plt.figure(figsize=(16, 34))
     fig.suptitle(
         f"Tactical Training Dashboard  (block avg = {block_size} batches)",
         fontsize=14,
         fontweight="bold",
     )
-    gs = GridSpec(7, 2, figure=fig, hspace=0.45, wspace=0.28)
+    gs = GridSpec(8, 2, figure=fig, hspace=0.45, wspace=0.28)
 
     # --- Panel 1: Win rates vs heuristic ---
     ax1 = fig.add_subplot(gs[0, 0])
@@ -336,6 +336,78 @@ def main():
     ax10.set_title("Adaptive Entropy Coefficients (per head)")
     ax10.legend(fontsize=7, ncol=2)
     ax10.grid(alpha=0.3)
+
+    # --- Panel 12: Per-phase value head diagnostics (phase_reencode only) ---
+    # Left: per-phase MSE against GAE returns; right: per-phase mean V output.
+    # "Are the per-phase V heads learning?" — a yes looks like:
+    #   • losses decreasing over time (heads finding a useful signal at all)
+    #   • losses converging toward the main V loss (calibration)
+    #   • mean outputs moving away from 0 (heads not stuck at init)
+    #   • phases spreading (phase embedding differentiating decision stages)
+    # A no looks like: loss stays flat at ~var(returns), mean output sticks
+    # near 0 throughout, or all four phase curves overlap exactly.
+    pp_phase_cols = [
+        ("pp_v_loss_pre",  "pp_v_mean_pre",  "PRE_SELECT",    "#3266AD"),
+        ("pp_v_loss_sel",  "pp_v_mean_sel",  "POST_SELECT",   "#1D9E75"),
+        ("pp_v_loss_mt",   "pp_v_mean_mt",   "POST_MOVETYPE", "#E67E22"),
+        ("pp_v_loss_dest", "pp_v_mean_dest", "POST_DEST",     "#C0392B"),
+    ]
+    _has_pp = any(lcol in data for lcol, _, _, _ in pp_phase_cols)
+
+    ax_pp_loss = fig.add_subplot(gs[7, 0])
+    if _has_pp:
+        # Main value loss as a reference — per-phase V heads are trained
+        # against the same target and *should* converge toward this curve.
+        if "value_loss" in data:
+            bx, by = block_average(data, "value_loss", block_size)
+            ax_pp_loss.plot(bx, by, linewidth=1.8, color="black",
+                             linestyle="--", alpha=0.5, label="Main V loss")
+        for lcol, _, label, color in pp_phase_cols:
+            if lcol in data:
+                bx, by = block_average(data, lcol, block_size)
+                ax_pp_loss.plot(bx, by, marker="o", markersize=2,
+                                 linewidth=1.4, color=color, label=label)
+        ax_pp_loss.legend(fontsize=7, ncol=2)
+    else:
+        ax_pp_loss.text(
+            0.5, 0.5,
+            "pp_v_* columns not in CSV\n"
+            "(phase_reencode flag was off or older log format)",
+            transform=ax_pp_loss.transAxes, ha="center", va="center",
+            fontsize=10, color="gray",
+        )
+    ax_pp_loss.set_ylabel("MSE vs returns")
+    ax_pp_loss.set_title("Per-Phase Value Head Loss")
+    ax_pp_loss.set_xlabel("Batch")
+    ax_pp_loss.set_ylim(bottom=0)
+    ax_pp_loss.grid(alpha=0.3)
+
+    ax_pp_mean = fig.add_subplot(gs[7, 1])
+    if _has_pp:
+        # mean_reward as a reference — the target the heads should approach.
+        if "mean_reward" in data:
+            bx, by = block_average(data, "mean_reward", block_size)
+            ax_pp_mean.plot(bx, by, linewidth=1.8, color="black",
+                             linestyle="--", alpha=0.5, label="Mean reward")
+        ax_pp_mean.axhline(0, color="black", linewidth=0.8, alpha=0.3)
+        for _, mcol, label, color in pp_phase_cols:
+            if mcol in data:
+                bx, by = block_average(data, mcol, block_size)
+                ax_pp_mean.plot(bx, by, marker="o", markersize=2,
+                                 linewidth=1.4, color=color, label=label)
+        ax_pp_mean.legend(fontsize=7, ncol=2)
+    else:
+        ax_pp_mean.text(
+            0.5, 0.5,
+            "pp_v_* columns not in CSV\n"
+            "(phase_reencode flag was off or older log format)",
+            transform=ax_pp_mean.transAxes, ha="center", va="center",
+            fontsize=10, color="gray",
+        )
+    ax_pp_mean.set_ylabel("Mean V output")
+    ax_pp_mean.set_title("Per-Phase Value Head Mean Output")
+    ax_pp_mean.set_xlabel("Batch")
+    ax_pp_mean.grid(alpha=0.3)
 
     # Enable minor gridlines on all panels for readability
     for ax in fig.get_axes():

@@ -76,6 +76,39 @@ MOVE_CHARGE = 1
 DEFAULT_CORE_ITERS = 6            # default recurrent iterations (hyperparameter)
 CORE_INPUT_WIDTH = TRUNK_WIDTH * 2  # 1024: concatenation of h and h0
 
+# Phase re-encode (commit-and-re-encode)
+# Phases at which the trunk is re-run during a single activation. Each phase
+# carries its own FiLM modulation on the shared core_block and its own
+# iteration count. h persists across phases (flavor-b); h0 is recomputed from
+# the stem each phase. is_acting is injected per-unit as a post-encoder
+# additive embedding (not via these constants — see IsActingEmbedding).
+PHASE_PRE_SELECT = 0   # no unit chosen; features pre-move
+PHASE_POST_SELECT = 1  # acting unit committed; features pre-move (unchanged)
+PHASE_POST_MOVETYPE = 2  # move/charge committed; features pre-move (unchanged)
+PHASE_POST_DEST = 3    # destination committed; features rebuilt from post-move state
+N_PHASES = 4
+
+# Default per-phase iteration counts. Cold-start on PRE_SELECT (full DEFAULT_CORE_ITERS),
+# warm continuation on each subsequent phase with h persisted.
+DEFAULT_PHASE_ITERS = {
+    PHASE_PRE_SELECT: DEFAULT_CORE_ITERS,
+    PHASE_POST_SELECT: 2,
+    PHASE_POST_MOVETYPE: 2,
+    PHASE_POST_DEST: 2,
+}
+
+# Bottleneck dimension for per-continuation-phase adjustment blocks. The blocks
+# produce a phase-specific delta added to the shared core_block's output.
+# 64 is modest — the phase refinement is low-rank (a 10-dim "which unit is
+# acting" one-hot plus related structure) — but expressive enough to capture
+# per-phase shifts without letting the block memorise noise.
+PHASE_ADJUSTMENT_BOTTLENECK = 64
+
+# (The former residual-scale anneal machinery has been removed — per-phase
+# differentiation is now provided by the phase_adjustment_blocks, and bootstrap
+# no-op behaviour is handled by zero-initialising the adjustment blocks' final
+# Linear rather than by a training-loop-level α ramp.)
+
 # Offset of global features within the flat observation vector
 _GLOBAL_OFFSET = N_TOTAL_UNITS * TACTICAL_UNIT_FEATURES  # 20 * 200 = 4000
 
@@ -164,11 +197,10 @@ class FiLMValueHead(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-SHOOT_CAND_FEATURES = 93   # per-candidate raw features (excl. h context)
 CHARGE_CAND_FEATURES = 96  # per-candidate raw features (excl. h context)
 POINTER_HIDDEN = 64        # shared MLP hidden width
-SHOOT_EMBED_DIM = 64       # key/query embedding for attention-style shoot pointer
 CHARGE_EMBED_DIM = 64      # key/query embedding for attention-style charge pointer
+SHOOT_SLOT_DIM = 8         # shoot head per-slot addressing vector width (bias pathway)
 
 
 class PointerScoreHead(nn.Module):
@@ -255,6 +287,46 @@ class TacticalModel(nn.Module):
         )
         self.n_iters = DEFAULT_CORE_ITERS
 
+        # Phase re-encode machinery (hybrid-block architecture).
+        # Modules exist but continuation phases are zero-initialised: at fresh
+        # init the new encode() path produces bit-identical output to trunk()
+        # for phase=PHASE_PRE_SELECT, and for continuation phases the
+        # adjustment blocks contribute 0 (their final Linear is zero).
+        #
+        # phase_adjustment_blocks: per-continuation-phase small bottleneck MLP
+        #   producing an additive delta to the shared core_block's output.
+        #   Structure:  Linear(1024 → 64) → LN → ReLU → Linear(64 → 512).
+        #   The final Linear is zero-initialised so continuation phases start
+        #   as no-ops and learn phase-specific refinements over training. Three
+        #   blocks for POST_SELECT / POST_MOVETYPE / POST_DEST (PRE_SELECT has
+        #   no adjustment block — it uses only the shared core_block).
+        self.phase_adjustment_blocks = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(CORE_INPUT_WIDTH, PHASE_ADJUSTMENT_BOTTLENECK),
+                nn.LayerNorm(PHASE_ADJUSTMENT_BOTTLENECK),
+                nn.ReLU(),
+                nn.Linear(PHASE_ADJUSTMENT_BOTTLENECK, TRUNK_WIDTH),
+            )
+            for _ in range(N_PHASES - 1)  # one per continuation phase
+        ])
+        for _adj in self.phase_adjustment_blocks:
+            nn.init.zeros_(_adj[-1].weight)
+            nn.init.zeros_(_adj[-1].bias)
+        # is_acting_embed: 2-row embedding added to acting unit's post-encoder row.
+        #   Row 0 = "not acting" (unused / zero), row 1 = "acting". Both zero-init so
+        #   initial model is identity; row 1 learns an informative direction over training.
+        self.is_acting_embed = nn.Embedding(2, UNIT_EMBED_DIM)
+        nn.init.zeros_(self.is_acting_embed.weight)
+        # per_phase_value_heads: auxiliary per-phase V heads used as baselines in
+        #   per-phase policy-gradient terms (Step 5). Predict same activation return
+        #   as the main FiLMValueHead. Zero-init so they start as no-ops.
+        self.per_phase_value_heads = nn.ModuleList([
+            nn.Linear(TRUNK_WIDTH, 1) for _ in range(N_PHASES)
+        ])
+        for _vh in self.per_phase_value_heads:
+            nn.init.zeros_(_vh.weight)
+            nn.init.zeros_(_vh.bias)
+
         H = TRUNK_WIDTH  # 512
         UF = TACTICAL_UNIT_FEATURES  # 200
 
@@ -280,19 +352,30 @@ class TacticalModel(nn.Module):
         )
         self.charge_query_proj = nn.Linear(H + UF, CHARGE_EMBED_DIM)
 
-        # 4) Shoot target pointer: attention-style scoring (mirrors dest pointer).
-        #    Per-candidate keys come from a small MLP over SHOOT_CAND_FEATURES;
-        #    the query comes from a projection of [h, acting_unit_features].
-        #    Using dot-product scoring puts per-candidate signal and shared
-        #    context in the same embedding space, avoiding the scale imbalance
-        #    of the old MLP-over-concat design where 9 cand dims competed
-        #    against 512 h dims for gradient flow.
-        self.shoot_embed = nn.Sequential(
-            nn.Linear(SHOOT_CAND_FEATURES, 64),
-            nn.ReLU(),
-            nn.Linear(64, SHOOT_EMBED_DIM),
+        # 4) Shoot target pointer: lightweight two-pathway head.
+        #    Key (per candidate): 2-dim raw scalars [expected_wound_frac, current_wound_frac].
+        #      No embedding MLP — the shaping gradient on expected_wound_frac makes
+        #      a trivial linear query sufficient for mechanical target selection.
+        #    Query (from h alone, no unit_feat concat): shoot_W_q(h), (H → 2).
+        #    Bias (per candidate j): (shoot_W_b(h)) · shoot_slot_embed[j],
+        #      a passive addressing pathway letting h arbitrate between otherwise
+        #      mechanically-identical candidates or override the mechanical signal.
+        #    logits_j = query · key_j + bias_j, then masked as before.
+        # shoot_W_q has a bias term so q=[+1, 0] at init gives the initial policy
+        # a prior of preferring high expected_wound_frac before any learning.
+        self.shoot_W_q = nn.Linear(H, 2, bias=True)
+        self.shoot_W_b = nn.Linear(H, SHOOT_SLOT_DIM, bias=False)
+        self.shoot_slot_embed = nn.Embedding(N_ENEMY, SHOOT_SLOT_DIM)
+        self.register_buffer(
+            "_shoot_slot_ids", torch.arange(N_ENEMY), persistent=False,
         )
-        self.shoot_query_proj = nn.Linear(H + UF, SHOOT_EMBED_DIM)
+        # Zero-init bias pathway so the scalar pathway is load-bearing at step 1.
+        # W_q weight: small so |h|-dependent noise is tiny at init; bias -> [+1, 0]
+        # so untrained policy already ranks by expected_wound_frac.
+        nn.init.zeros_(self.shoot_W_b.weight)
+        with torch.no_grad():
+            self.shoot_W_q.weight.normal_(mean=0.0, std=1e-3)
+            self.shoot_W_q.bias.copy_(torch.tensor([1.0, 0.0]))
 
         # Range thresholds as non-trainable buffer for searchsorted on GPU.
         self.register_buffer(
@@ -360,6 +443,103 @@ class TacticalModel(nn.Module):
             h = h + self.core_block(torch.cat([h, h0], dim=-1))
 
         return h, units, round_onehot
+
+    def encode(
+        self,
+        x: torch.Tensor,
+        phase: int = PHASE_PRE_SELECT,
+        acting_unit_idx: int | torch.Tensor | None = None,
+        h_prev: torch.Tensor | None = None,
+        n_iters: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Phase-aware trunk encode for the commit-and-re-encode architecture.
+
+        Runs per-unit encoder + aggregation + recurrent core, with two new
+        signals layered on top of the base trunk() path:
+
+        * Per-unit is_acting additive embedding added to the acting unit's
+          post-encoder (UNIT_EMBED_DIM) row, before aggregation. Both rows
+          zero-initialised so the untrained injection is a no-op at init.
+        * Per-continuation-phase adjustment block producing a small
+          bottleneck delta on top of the shared core_block's output. The
+          adjustment block's final Linear is zero-initialised so continuation
+          phases contribute exactly the same delta as PRE_SELECT at init
+          (pure shared-block output); they learn phase-specific refinements
+          over training.
+
+        h persists across phases via *h_prev* (flavor-b: we don't restart
+        from h0 each phase, we carry the previous phase's working memory).
+        h0 is always recomputed from the current state's stem output so the
+        anchor reflects any feature changes (e.g. post-move positions).
+
+        Parameters
+        ----------
+        x : (batch, TACTICAL_TOTAL_FEATURES) or (TACTICAL_TOTAL_FEATURES,)
+        phase : one of PHASE_PRE_SELECT / POST_SELECT / POST_MOVETYPE / POST_DEST
+        acting_unit_idx : friendly slot (0..N_FRIENDLY-1), (B,) tensor, or None
+            for PRE_SELECT where no unit is committed yet.
+        h_prev : persistent h from the previous phase, or None for a cold start
+            (h initialised to h0, matching trunk()'s behaviour).
+        n_iters : override iteration count; defaults to DEFAULT_PHASE_ITERS[phase].
+
+        Returns
+        -------
+        h : (..., TRUNK_WIDTH)
+        units : (..., N_TOTAL_UNITS, TACTICAL_UNIT_FEATURES) — raw per-unit slice.
+        round_onehot : (..., NUM_ROUNDS) — extracted from global features.
+        """
+        if n_iters is None:
+            n_iters = DEFAULT_PHASE_ITERS[phase]
+
+        glob = x[..., _GLOBAL_OFFSET:]
+        round_onehot = glob[..., :NUM_ROUNDS]
+        unit_block = x[..., :_GLOBAL_OFFSET]
+        units = unit_block.reshape(*x.shape[:-1], N_TOTAL_UNITS, TACTICAL_UNIT_FEATURES)
+
+        unit_embeds = self.unit_encoder(units)  # (..., 20, UNIT_EMBED_DIM)
+
+        # is_acting additive injection on the acting unit's row.
+        if acting_unit_idx is not None:
+            acting_vec = self.is_acting_embed.weight[1]  # (UNIT_EMBED_DIM,)
+            if isinstance(acting_unit_idx, int):
+                # Out-of-place add to avoid in-place autograd issues on
+                # the leaf tensor returned by unit_encoder.
+                delta = torch.zeros_like(unit_embeds)
+                delta[..., acting_unit_idx, :] = acting_vec
+                unit_embeds = unit_embeds + delta
+            else:
+                one_hot = F.one_hot(
+                    acting_unit_idx.long(), N_TOTAL_UNITS
+                ).to(unit_embeds.dtype)  # (B, 20)
+                delta = one_hot.unsqueeze(-1) * acting_vec  # (B, 20, UNIT_EMBED_DIM)
+                unit_embeds = unit_embeds + delta
+
+        unit_embeds_flat = unit_embeds.reshape(*x.shape[:-1], -1)
+        agg = torch.cat([unit_embeds_flat, glob], dim=-1)
+        h0 = self.stem(agg)
+
+        h = h0 if h_prev is None else h_prev
+
+        # Phase-specific adjustment: PRE_SELECT uses only the shared core_block;
+        # continuation phases add a small bottleneck delta on top. Adjustment
+        # blocks are zero-init, so at fresh init continuation phases produce
+        # the same delta as PRE_SELECT (pure shared-block output).
+        adj_block = (self.phase_adjustment_blocks[phase - 1]
+                     if phase != PHASE_PRE_SELECT else None)
+
+        for _ in range(n_iters):
+            combined = torch.cat([h, h0], dim=-1)
+            delta = self.core_block(combined)
+            if adj_block is not None:
+                delta = delta + adj_block(combined)
+            h = h + delta
+
+        return h, units, round_onehot
+
+    def per_phase_value(self, h: torch.Tensor, phase: int) -> torch.Tensor:
+        """Auxiliary per-phase value estimate. Zero-initialised — trained in Step 5
+        as a phase-local baseline for PPO's policy-gradient term at that phase."""
+        return self.per_phase_value_heads[phase](h).squeeze(-1)
 
     def _get_opp_embed(self, h: torch.Tensor, opponent_type: int | None) -> torch.Tensor:
         """Build opponent-type embedding for value head conditioning.
@@ -435,74 +615,47 @@ class TacticalModel(nn.Module):
         idx = chosen_idx.long().view(-1, 1, 1).expand(-1, 1, units.shape[-1])
         return units.gather(-2, idx).squeeze(-2)
 
-    def _build_shoot_candidates(
+    def _build_shoot_keys(
         self,
         units: torch.Tensor,          # (..., 20, UF)
         chosen_idx: int | torch.Tensor,
         post_move_rel: torch.Tensor,  # (..., 30)
     ) -> torch.Tensor:
-        """Per-candidate shoot features: (..., 10, SHOOT_CAND_FEATURES=93).
+        """Per-candidate shoot keys: (..., 10, 2).
 
         Layout per candidate (enemy slot j):
-          [matchup_at_bucket (1),
-           sinθ, cosθ, dist_norm (3),
-           models_proxy, survival_frac, points_frac, tough_norm,
-           has_activated, is_fatigued, is_shaken (7),
-           enemy_ranged_row (70),     # enemy j's ranged matchup vs all 10 friendlies × 7 thresholds
-           enemy_melee_row (10),      # enemy j's melee matchup vs all 10 friendlies
-           min_obj_dist_norm, within_seize_range (2)]
-        Total: 1 + 3 + 7 + 80 + 2 = 93.
+          [expected_wound_frac, current_wound_frac]
+
+        expected_wound_frac = acting unit's ranged matchup (expected wounds as
+        fraction of target's starting wounds, capped at 1.0) at the bucketed
+        post-move distance to enemy j. Already scaled by
+        models_alive/models at encoding time (see ml_features.precompute_damage
+        and the scale applied in _encode_unit), so a depleted shooter yields
+        proportionally lower values.
+
+        current_wound_frac = enemy j's survival_frac (remaining wounds / max).
         """
         enemies = units[..., N_FRIENDLY:, :]  # (..., 10, UF)
         acting = self._index_units(units, chosen_idx)  # (..., UF)
 
-        # Ranged matchup row of the acting unit: (..., 10, NUM_RANGE_THRESHOLDS)
+        # Acting unit's ranged matchup row: (..., 10, NUM_RANGE_THRESHOLDS)
         ranged_row = acting[..., _TOFF_RANGED:_TOFF_RANGED + N_ENEMY * NUM_RANGE_THRESHOLDS]
         ranged_row = ranged_row.reshape(*acting.shape[:-1], N_ENEMY, NUM_RANGE_THRESHOLDS)
 
-        # Per-candidate post-move geometry
-        pmr_reshaped = post_move_rel.reshape(*post_move_rel.shape[:-1], N_ENEMY, 3)
-        sin_t = pmr_reshaped[..., 0]
-        cos_t = pmr_reshaped[..., 1]
-        dist_norm = pmr_reshaped[..., 2]
+        # Bucketed expected_wound_frac at post-move distance.
+        dist_norm = post_move_rel.reshape(
+            *post_move_rel.shape[:-1], N_ENEMY, 3,
+        )[..., 2]
         dist_inches = dist_norm * BOARD_DIAG
-
-        # Bucketed matchup: first threshold ≥ dist.
         thresholds = self._range_thresholds
         k = torch.searchsorted(thresholds, dist_inches, right=False).clamp(
             max=NUM_RANGE_THRESHOLDS - 1
         )
-        matchup = ranged_row.gather(-1, k.unsqueeze(-1)).squeeze(-1)  # (..., 10)
+        expected_wound_frac = ranged_row.gather(-1, k.unsqueeze(-1)).squeeze(-1)
 
-        # Per-enemy defender scalars
-        tough_norm = enemies[..., 0]
-        starting_models_norm = enemies[..., 1]
-        survival_frac = enemies[..., 3]
-        points_frac = enemies[..., 4]
-        has_activated = enemies[..., _TOFF_ACTIVATED]
-        is_fatigued = enemies[..., _TOFF_FATIGUED]
-        is_shaken = enemies[..., _TOFF_SHAKEN]
-        models_proxy = starting_models_norm * survival_frac
+        current_wound_frac = enemies[..., 3]  # survival_frac
 
-        # Enemy's full offensive profile (their matchup rows, 80 dims)
-        enemy_ranged = enemies[..., _TOFF_RANGED:_TOFF_RANGED + N_FRIENDLY * NUM_RANGE_THRESHOLDS]
-        enemy_melee = enemies[..., _TOFF_MELEE:_TOFF_MELEE + N_FRIENDLY]
-
-        # Objective proximity: min dist over 5 objectives from the enemy's own
-        # obj-rel block (_TOFF_OBJ_REL + 2 is the distance element of each triple).
-        obj_dists = enemies[..., _TOFF_OBJ_REL + 2:_TOFF_OBJ_REL + 15:3]  # (..., 10, 5)
-        min_obj_dist = obj_dists.min(dim=-1).values                       # (..., 10)
-        within_seize = (min_obj_dist * BOARD_DIAG < OBJ_SEIZE_RANGE).to(acting.dtype)
-
-        scalars = torch.stack([
-            matchup, sin_t, cos_t, dist_norm,
-            models_proxy, survival_frac, points_frac, tough_norm,
-            has_activated, is_fatigued, is_shaken,
-            min_obj_dist, within_seize,
-        ], dim=-1)  # (..., 10, 13)
-
-        cand = torch.cat([scalars, enemy_ranged, enemy_melee], dim=-1)  # (..., 10, 93)
-        return cand
+        return torch.stack([expected_wound_frac, current_wound_frac], dim=-1)
 
     def _build_charge_candidates(
         self,
@@ -615,22 +768,31 @@ class TacticalModel(nn.Module):
         post_move_rel: torch.Tensor,  # (..., 30)
         enemy_alive_mask: torch.Tensor | None,  # (..., 10)
         shoot_range_mask: torch.Tensor | None = None,  # (..., 10)
-    ) -> torch.Tensor:
-        """Attention-style shoot pointer: return (..., 10) masked logits.
+        *,
+        return_components: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Lightweight two-pathway shoot pointer: return (..., 10) masked logits.
 
-        Keys = shoot_embed(cand_features)       (per-candidate, 9→64)
-        Query = shoot_query_proj([h, unit_features])   (per-state, (H+UF)→64)
-        Logits = (query · keys) / sqrt(dim)
+        Scalar pathway:  primary_j = (W_q h) · key_j
+          key_j = [expected_wound_frac_j, current_wound_frac_j] (2-dim, no MLP)
+        Bias pathway:    bias_j    = (W_b h) · slot_embed[j]
+          slot_embed acts as a passive addressing vector letting h write
+          per-slot biases independent of the key scalars.
+        logits_j = primary_j + bias_j, then masked as before.
+
+        Set return_components=True to also receive (primary, bias) for
+        diagnostics (both pre-mask).
         """
-        cand = self._build_shoot_candidates(units.detach(), chosen_idx, post_move_rel)
-        unit_features = self._index_units(units, chosen_idx).detach()
+        keys = self._build_shoot_keys(units.detach(), chosen_idx, post_move_rel)  # (..., 10, 2)
 
-        keys = self.shoot_embed(cand)                                   # (..., 10, SHOOT_EMBED_DIM)
-        query_in = torch.cat([h, unit_features], dim=-1)                # (..., H + UF)
-        query = self.shoot_query_proj(query_in)                         # (..., SHOOT_EMBED_DIM)
+        query = self.shoot_W_q(h)                                                 # (..., 2)
+        primary = (query.unsqueeze(-2) @ keys.transpose(-1, -2)).squeeze(-2)      # (..., 10)
 
-        scale = SHOOT_EMBED_DIM ** 0.5
-        logits = (query.unsqueeze(-2) @ keys.transpose(-1, -2)).squeeze(-2) / scale  # (..., 10)
+        slot_vecs = self.shoot_slot_embed(self._shoot_slot_ids)                   # (10, SHOOT_SLOT_DIM)
+        b_vec = self.shoot_W_b(h)                                                 # (..., SHOOT_SLOT_DIM)
+        bias = b_vec @ slot_vecs.T                                                # (..., 10)
+
+        logits = primary + bias
 
         mask = None
         if enemy_alive_mask is not None:
@@ -639,6 +801,9 @@ class TacticalModel(nn.Module):
             mask = shoot_range_mask if mask is None else (mask & shoot_range_mask)
         if mask is not None:
             logits = logits.masked_fill(~mask, float('-inf'))
+
+        if return_components:
+            return logits, primary, bias
         return logits
 
     def compute_dest_logits(

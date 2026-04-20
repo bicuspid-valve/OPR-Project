@@ -6,6 +6,7 @@ then a shooting target (for hold/advance).
 """
 from __future__ import annotations
 
+import copy
 import math
 import time
 from dataclasses import dataclass
@@ -39,6 +40,8 @@ from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
     NUM_MOVE_TYPES, MOVE_MOVE, MOVE_CHARGE,
     POST_MOVE_REL_FEATURES,
+    PHASE_PRE_SELECT, PHASE_POST_SELECT, PHASE_POST_MOVETYPE, PHASE_POST_DEST,
+    N_PHASES,
 )
 import fast_core as _fc
 
@@ -49,6 +52,30 @@ import fast_core as _fc
 MOVE_TYPE_NAMES = ["move", "charge"]
 
 _INV_BOARD_DIAG = 1.0 / BOARD_DIAG
+
+# ---------------------------------------------------------------------------
+# Phase re-encode flag (commit-and-re-encode refactor).
+# ---------------------------------------------------------------------------
+# When False (default) apply_tactical_model takes the legacy single-trunk path
+# (state_vec built once, trunk called 3–4× on the same input, post_move_rel as
+# the only post-move signal). When True it takes the 4-phase path: encode()
+# called once per phase with h persisted, POST_DEST using a post-move state_vec
+# built via project_post_move_unit_state. The flag is toggled at process
+# startup via set_phase_reencode_enabled() so the inference path is consistent
+# across all call sites (game loop, sampling opponent, profiler tools).
+
+_PHASE_REENCODE_ENABLED: bool = False
+
+
+def set_phase_reencode_enabled(enabled: bool) -> None:
+    """Toggle the phase-reencode inference path in apply_tactical_model."""
+    global _PHASE_REENCODE_ENABLED
+    _PHASE_REENCODE_ENABLED = bool(enabled)
+
+
+def is_phase_reencode_enabled() -> bool:
+    """Return the current phase-reencode flag (for tests / diagnostics)."""
+    return _PHASE_REENCODE_ENABLED
 
 # ---------------------------------------------------------------------------
 # Precomputed per-hex objective lookups (game-global, computed once)
@@ -161,6 +188,29 @@ class InferenceResult:
 # ---------------------------------------------------------------------------
 # Post-move relative features
 # ---------------------------------------------------------------------------
+
+def project_post_move_unit_state(
+    unit: UnitState,
+    dest: tuple[int, int],
+    is_rush: bool,
+) -> UnitState:
+    """Return a shallow copy of *unit* with model positions translated to *dest*.
+
+    All model positions shift by (dest - round(centre(unit))) so formation shape
+    is preserved; fatigued flips True when *is_rush*. Other fields (wounds,
+    weapons, hero refs) share state with the original — this projection is
+    intended for read-only feature re-encoding during the POST_DEST trunk pass
+    and callers must not mutate the returned object.
+    """
+    new_unit = copy.copy(unit)
+    cx, cy = unit.centre()
+    dx = dest[0] - int(round(cx))
+    dy = dest[1] - int(round(cy))
+    new_unit.positions = [(c + dx, r + dy) for (c, r) in unit.alive_positions()]
+    if is_rush:
+        new_unit.fatigued = True
+    return new_unit
+
 
 def compute_post_move_rel(
     post_x: float,
@@ -929,6 +979,307 @@ def batched_argmax_tactical(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _apply_tactical_model_phased(
+    model: TacticalModel,
+    friendly_units: list[UnitState],
+    enemy_units: list[UnitState],
+    round_num: int,
+    board: Board,
+    player: str,
+    *,
+    friendly_ranged_matchups=None,
+    friendly_melee_matchups=None,
+    enemy_ranged_matchups=None,
+    enemy_melee_matchups=None,
+    total_friendly_points: int | None = None,
+    total_enemy_points: int | None = None,
+) -> tuple[UnitState | None, list[int], str, tuple[int, int] | None, UnitState | None, str, dict]:
+    """Phase-reencode inference path.
+
+    Mirrors apply_tactical_model's signature and return shape but replaces the
+    single-trunk-plus-forward-twice structure with four explicit model.encode()
+    calls — one per phase (PRE_SELECT, POST_SELECT, POST_MOVETYPE, POST_DEST).
+    h persists across phases via h_prev; h0 recomputes each phase from the
+    current features. The POST_DEST encode consumes a post-move state_vec
+    built via project_post_move_unit_state (for MOVE_MOVE, not shaken);
+    otherwise the pre-move state_vec is reused.
+
+    At identity init (FiLM γ=1/β=0, is_acting_embed zero) and with all
+    continuation-phase iter counts set to 0, this path produces bit-identical
+    head outputs to the legacy apply_tactical_model — the Step 6 ablation gate.
+    """
+    global _timing_encode_s, _timing_forward_s, _timing_calls
+
+    # Build alive+unactivated mask
+    alive_mask_list = []
+    for i in range(MAX_UNITS_PER_SIDE):
+        if i < len(friendly_units):
+            us = friendly_units[i]
+            alive_mask_list.append(us.models_alive > 0 and not us.activated)
+        else:
+            alive_mask_list.append(False)
+
+    if not any(alive_mask_list):
+        return None, [], "hold", None, None, "no units available", {}
+
+    alive_mask = torch.tensor(alive_mask_list, dtype=torch.bool)
+    enemy_alive_mask_list = [(i < len(enemy_units) and enemy_units[i].models_alive > 0)
+                              for i in range(MAX_UNITS_PER_SIDE)]
+    enemy_alive_mask = torch.tensor(enemy_alive_mask_list, dtype=torch.bool)
+    enemy_alive_np = np.array(enemy_alive_mask_list, dtype=np.bool_)
+
+    # Pre-move state encoding
+    _t0 = time.perf_counter()
+    state_vec = encode_state_tactical(
+        friendly_units, enemy_units, round_num, board, player,
+        friendly_ranged_matchups=friendly_ranged_matchups,
+        friendly_melee_matchups=friendly_melee_matchups,
+        enemy_ranged_matchups=enemy_ranged_matchups,
+        enemy_melee_matchups=enemy_melee_matchups,
+        total_friendly_points=total_friendly_points,
+        total_enemy_points=total_enemy_points,
+    )
+    _t1 = time.perf_counter()
+    _timing_encode_s += _t1 - _t0
+
+    friendly_positions = _get_model_space_positions(friendly_units, player)
+    enemy_positions = _get_model_space_positions(enemy_units, player)
+
+    if friendly_ranged_matchups is None or friendly_melee_matchups is None:
+        friendly_ranged_matchups, friendly_melee_matchups = precompute_damage(
+            [u.unit for u in friendly_units], [u.unit for u in enemy_units])
+    if enemy_ranged_matchups is None or enemy_melee_matchups is None:
+        enemy_ranged_matchups, enemy_melee_matchups = precompute_damage(
+            [u.unit for u in enemy_units], [u.unit for u in friendly_units])
+
+    state_batched = state_vec.unsqueeze(0)
+    enemy_alive_batched = enemy_alive_mask.unsqueeze(0)
+
+    _tf0 = time.perf_counter()
+
+    # --- PHASE PRE_SELECT: unit selection ---
+    h_pre, _units_pre, round_onehot = model.encode(
+        state_batched, phase=PHASE_PRE_SELECT, acting_unit_idx=None, h_prev=None,
+    )
+    unit_logits = model.unit_selection_head(h_pre).squeeze(0)
+    unit_logits = unit_logits.masked_fill(~alive_mask, float('-inf'))
+    selected_idx = int(unit_logits.argmax().item())
+    selected_unit = friendly_units[selected_idx]
+
+    is_shaken = bool(extract_is_shaken(state_vec, selected_idx).item())
+    can_charge_mask = extract_can_charge_mask(state_vec, selected_idx)
+
+    # --- PHASE POST_SELECT: move-type head ---
+    h_sel, units_sel, _ = model.encode(
+        state_batched, phase=PHASE_POST_SELECT,
+        acting_unit_idx=selected_idx, h_prev=h_pre,
+    )
+    unit_features = model._extract_unit_features(units_sel, selected_idx)
+    h_uf = torch.cat([h_sel, unit_features], dim=-1)
+    move_logits = model.move_type_head(h_uf).squeeze(0)
+    if not can_charge_mask.any():
+        move_logits = move_logits.clone()
+        move_logits[MOVE_CHARGE] = float('-inf')
+    if is_shaken:
+        move_type = MOVE_MOVE
+    else:
+        move_type = int(move_logits.argmax().item())
+
+    # --- PHASE POST_MOVETYPE: destination head ---
+    h_mt, units_mt, _ = model.encode(
+        state_batched, phase=PHASE_POST_MOVETYPE,
+        acting_unit_idx=selected_idx, h_prev=h_sel,
+    )
+
+    unit_cx_ms, unit_cy_ms = friendly_positions[selected_idx]
+    dest_col, dest_row = int(round(unit_cx_ms)), int(round(unit_cy_ms))
+    dest_n_candidates = 0
+    dest_top3: list[tuple[int, int, float]] = []
+    dest_entropy = 0.0
+    is_advance_reachable = True
+
+    if move_type == MOVE_MOVE and not is_shaken:
+        enemy_pos_set: set[tuple[int, int]] = set()
+        for eu in enemy_units:
+            if eu.models_alive > 0:
+                for pos in eu.alive_positions():
+                    enemy_pos_set.add(pos)
+
+        candidates, cand_mask, adv_reachable = compute_destination_candidates(
+            selected_unit, board, enemy_pos_set, player)
+        budget = float(selected_unit.unit.rush_distance)
+        dest_feats = compute_destination_features(
+            candidates, cand_mask, selected_unit, selected_idx, player,
+            enemy_units, enemy_alive_np,
+            friendly_ranged_matchups, enemy_ranged_matchups, enemy_melee_matchups,
+            budget, advance_reachable=adv_reachable)
+
+        dest_features_t = torch.from_numpy(dest_feats).float()
+        dest_mask_t = torch.from_numpy(cand_mask)
+
+        move_onehot = F.one_hot(torch.tensor(move_type), NUM_MOVE_TYPES).float()
+        uf_mt = model._extract_unit_features(units_mt, selected_idx).detach()
+        h_uf_m = torch.cat([h_mt, uf_mt, move_onehot.unsqueeze(0)], dim=-1)
+        dest_logits = model.compute_dest_logits(
+            h_uf_m, dest_features_t.unsqueeze(0), dest_mask_t.unsqueeze(0)).squeeze(0)
+
+        dest_idx = int(dest_logits.argmax().item())
+        dest_col = int(candidates[dest_idx, 0])
+        dest_row = int(candidates[dest_idx, 1])
+        dest_n_candidates = int(cand_mask.sum())
+        is_advance_reachable = bool(adv_reachable[dest_idx])
+
+        dest_probs = torch.softmax(dest_logits, dim=-1)
+        top_k = min(3, dest_n_candidates)
+        top_vals, top_idxs = torch.topk(dest_probs, top_k)
+        dest_top3 = [(int(candidates[ti, 0]), int(candidates[ti, 1]), tv.item())
+                     for ti, tv in zip(top_idxs.tolist(), top_vals)]
+        dest_entropy = -(dest_probs * torch.log(dest_probs + 1e-8)).sum().item()
+
+    # post_move_rel: kept during transition (Steps 3–7) as the shoot head's side
+    # channel alongside the POST_DEST h; removed in Step 8 once validated.
+    if move_type == MOVE_MOVE and not is_shaken:
+        px, py = float(dest_col), float(dest_row)
+        if player == "B":
+            px = _flip_x(px)
+            py = _flip_y(py)
+    else:
+        px, py = unit_cx_ms, unit_cy_ms
+    post_move_rel = compute_post_move_rel(px, py, enemy_positions)
+
+    # --- PHASE POST_DEST: build post-move state_vec, encode, run charge + shoot heads ---
+    if move_type == MOVE_MOVE and not is_shaken:
+        is_rush = not is_advance_reachable
+        post_unit = project_post_move_unit_state(
+            selected_unit, (dest_col, dest_row), is_rush=is_rush)
+        friendly_post = list(friendly_units)
+        friendly_post[selected_idx] = post_unit
+
+        _t2 = time.perf_counter()
+        state_vec_post = encode_state_tactical(
+            friendly_post, enemy_units, round_num, board, player,
+            friendly_ranged_matchups=friendly_ranged_matchups,
+            friendly_melee_matchups=friendly_melee_matchups,
+            enemy_ranged_matchups=enemy_ranged_matchups,
+            enemy_melee_matchups=enemy_melee_matchups,
+            total_friendly_points=total_friendly_points,
+            total_enemy_points=total_enemy_points,
+        )
+        _t3 = time.perf_counter()
+        _timing_encode_s += _t3 - _t2
+    else:
+        state_vec_post = state_vec
+
+    h_dest, units_dest, _ = model.encode(
+        state_vec_post.unsqueeze(0), phase=PHASE_POST_DEST,
+        acting_unit_idx=selected_idx, h_prev=h_mt,
+    )
+
+    charge_logits_b = model.compute_charge_logits(
+        h_dest, units_dest, selected_idx,
+        enemy_alive_batched, can_charge_mask.unsqueeze(0),
+    ).squeeze(0)
+
+    shoot_logits_b = model.compute_shoot_logits(
+        h_dest, units_dest, selected_idx,
+        post_move_rel.unsqueeze(0), enemy_alive_batched,
+        shoot_range_mask=None,
+    ).squeeze(0)
+
+    max_wr = max(
+        (w.range_inches for w in selected_unit.unit.weapons if not w.melee),
+        default=0.0,
+    )
+    shoot_range_mask = compute_in_range_mask(post_move_rel, float(max_wr), enemy_alive_mask)
+    if is_shaken:
+        shoot_range_mask = torch.zeros_like(shoot_range_mask)
+    masked_shoot_logits = shoot_logits_b.masked_fill(~shoot_range_mask, float('-inf'))
+
+    charge_target_idx = int(charge_logits_b.argmax().item()) if enemy_alive_mask.any() else 0
+    shoot_target_idx = int(masked_shoot_logits.argmax().item()) if shoot_range_mask.any() else 0
+    target_ranking = torch.argsort(masked_shoot_logits, descending=True).tolist()
+
+    # Value: main V head reads h_pre (same GAE target as legacy). Per-phase V heads
+    # are computed but not used at inference — they become load-bearing in Step 5.
+    opp_embed = model._get_opp_embed(h_pre, None)
+    side_embed = model._get_side_embed(h_pre, None)
+    value = model.value_head(h_pre, round_onehot, opp_embed, side_embed).squeeze(0)
+
+    _tf1 = time.perf_counter()
+    _timing_forward_s += _tf1 - _tf0
+    _timing_calls += 1
+
+    # Execute decision
+    dest = None
+    if move_type == MOVE_MOVE:
+        dest = (float(dest_col), float(dest_row))
+    action, goal, charge_target, reason = execute_decoded_decision(
+        selected_unit, enemy_units, move_type, dest, charge_target_idx, shoot_target_idx,
+        is_advance_reachable=is_advance_reachable,
+    )
+
+    move_conf = torch.softmax(move_logits, dim=-1)
+    assessment = {
+        'value': value.item(),
+        'selected_slot': selected_idx,
+        'selected_name': selected_unit.unit.name,
+        'unit_selection_logits': unit_logits.tolist(),
+        'move_type': MOVE_TYPE_NAMES[move_type],
+        'move_type_confidence': move_conf[move_type].item(),
+        'move_type_probs': move_conf.tolist(),
+        'dest_selected': (dest_col, dest_row),
+        'dest_n_candidates': dest_n_candidates,
+        'dest_top3': dest_top3,
+        'dest_entropy': dest_entropy,
+        'charge_target_idx': charge_target_idx,
+        'charge_target_logits': charge_logits_b.tolist(),
+        'shoot_target_idx': shoot_target_idx,
+        'target_ranking': target_ranking,
+        'target_scores': torch.softmax(masked_shoot_logits, dim=-1).tolist(),
+        'action': action,
+        'reason': reason,
+        'friendly_names': [
+            fu.unit.name if i < len(friendly_units) and friendly_units[i].models_alive > 0
+            else None
+            for i, fu in enumerate(friendly_units)
+        ] + [None] * (MAX_UNITS_PER_SIDE - len(friendly_units)),
+        'enemy_names': [
+            eu.unit.name if i < len(enemy_units) and enemy_units[i].models_alive > 0
+            else None
+            for i, eu in enumerate(enemy_units)
+        ] + [None] * (MAX_UNITS_PER_SIDE - len(enemy_units)),
+    }
+
+    # Auxiliary prediction heads — read h_pre (pre-move scope matches training targets).
+    # One trunk call at most (aux shares h_pre with the main value head), down from
+    # the legacy path's redundant third model.trunk() call.
+    if hasattr(model, 'aux_friendly_survival_head'):
+        fs_raw = model.aux_friendly_survival_head(h_pre).view(MAX_UNITS_PER_SIDE, 2)
+        fs_alpha = F.softplus(fs_raw[:, 0]) + 0.01
+        fs_beta = F.softplus(fs_raw[:, 1]) + 0.01
+        fs_mean = (fs_alpha / (fs_alpha + fs_beta)).tolist()
+        assessment['friendly_survival'] = fs_mean
+
+        es_raw = model.aux_enemy_survival_head(h_pre).view(MAX_UNITS_PER_SIDE, 2)
+        es_alpha = F.softplus(es_raw[:, 0]) + 0.01
+        es_beta = F.softplus(es_raw[:, 1]) + 0.01
+        es_mean = (es_alpha / (es_alpha + es_beta)).tolist()
+        assessment['enemy_survival'] = es_mean
+
+        obj_logits = model.aux_obj_control_head(h_pre).view(5, 3)
+        obj_probs = torch.softmax(obj_logits, dim=-1).tolist()
+        assessment['obj_control_probs'] = obj_probs
+
+        if hasattr(model, 'aux_friendly_activations_head'):
+            f_act = F.softplus(model.aux_friendly_activations_head(h_pre).squeeze(-1)).item()
+            e_act = F.softplus(model.aux_enemy_activations_head(h_pre).squeeze(-1)).item()
+            assessment['friendly_activations_remaining'] = f_act
+            assessment['enemy_activations_remaining'] = e_act
+
+    return selected_unit, target_ranking, action, goal, charge_target, reason, assessment
+
+
+@torch.no_grad()
 def apply_tactical_model(
     model: TacticalModel,
     friendly_units: list[UnitState],
@@ -948,6 +1299,17 @@ def apply_tactical_model(
 
     Returns (selected_unit, target_ranking, action, goal, charge_target, reason, assessment).
     """
+    if _PHASE_REENCODE_ENABLED:
+        return _apply_tactical_model_phased(
+            model, friendly_units, enemy_units, round_num, board, player,
+            friendly_ranged_matchups=friendly_ranged_matchups,
+            friendly_melee_matchups=friendly_melee_matchups,
+            enemy_ranged_matchups=enemy_ranged_matchups,
+            enemy_melee_matchups=enemy_melee_matchups,
+            total_friendly_points=total_friendly_points,
+            total_enemy_points=total_enemy_points,
+        )
+
     global _timing_encode_s, _timing_forward_s, _timing_calls
 
     # Build alive+unactivated mask

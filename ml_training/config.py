@@ -113,7 +113,7 @@ class TrainingConfig:
     entropy_target_fraction: float = 0.25  # fraction of max entropy for masked categoricals
     entropy_target_move: float = 0.25 * math.log(2)      # ~0.173 (2-way: move/charge)
     entropy_target_dest_fraction: float = 0.25               # target 25% of max entropy for destination pointer (normalised by ln(N_valid))
-    entropy_alpha_lr: float = 1e-4                         # learning rate for entropy alpha params
+    entropy_alpha_lr: float = 3e-4                         # learning rate for entropy alpha params
     # Planning-augmented training (Expert Iteration)
     planning_rate: float = 0.0                # probability of planning per activation (0 = disabled)
     planning_rate_end: float | None = None    # if set, anneal planning_rate linearly to this value
@@ -124,6 +124,12 @@ class TrainingConfig:
     training_planning_N: int = 3              # lookahead activations (reduced from 4)
     # Unit-local advantage blending
     unit_local_advantage_blend: float = 0.0   # 0 = pure global GAE, 0.2-0.3 = blend in unit-local GAE
+    # Phase-reencode inference path (commit-and-re-encode refactor).
+    # When True, trajectory collection and PPO replay both use the 4-phase
+    # encode chain with h persisted across phases and a post-move state_vec
+    # built for the POST_DEST phase. When False, the legacy single-trunk path
+    # is used end-to-end. Defaults to True.
+    phase_reencode_enabled: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +143,7 @@ class TacticalActivationRecord:
     Stores the sequential decisions: unit, move_type, destination pointer
     (discrete), charge_target, shoot_target, plus masks and value.
     """
-    state_vec: np.ndarray                 # flattened encoded state (4016 float32)
+    state_vec: np.ndarray                 # flattened encoded state (4016 float32), pre-move
     alive_mask: list[bool]                # which friendly slots were alive+unactivated
     enemy_alive_mask: list[bool]          # which enemy slots were alive
     unit_idx: int                         # which unit was selected
@@ -156,6 +162,10 @@ class TacticalActivationRecord:
     shoot_target_idx: int = -1             # enemy slot for shooting (advance-reachable dest)
     shoot_mask: list[bool] | None = None   # enemy alive AND in weapon range (10 bools)
     post_move_rel: np.ndarray | None = None  # (30,) post-move relative features
+    # Post-move state_vec for the POST_DEST trunk re-encode (phase-reencode flag only).
+    # None when the flag is off, on charge/shaken activations (no move), or when dest
+    # is invalid — replay reuses state_vec in those cases.
+    state_vec_post: np.ndarray | None = None
     reward: float = 0.0
     shooting_efficiency_reward: float = 0.0  # shooting efficiency shaping component (for logging)
     charge_efficiency_reward: float = 0.0    # charge efficiency shaping component (for logging)

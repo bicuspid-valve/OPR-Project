@@ -25,6 +25,7 @@ from ml_integration_tactical import (
     compute_destination_candidates, compute_destination_features,
     build_dest_enemy_cache,
     _get_model_space_positions, _get_movement_budgets, _get_max_weapon_ranges,
+    project_post_move_unit_state, is_phase_reencode_enabled,
 )
 
 from ml_training.config import (
@@ -59,8 +60,68 @@ _g_shared_opponents: list[nn.Module] = []
 _g_worker_model_type: str = "tactical"
 
 
+def _maybe_build_post_move_state_vec(
+    *,
+    units_friendly: list,
+    units_enemy: list,
+    round_num: int,
+    board,
+    model_side: str,
+    sel_idx: int,
+    move_type: int,
+    dest_candidates,
+    dest_selected_idx: int,
+    dest_advance_reachable,
+    fr_matchups, fm_matchups,
+    er_matchups, em_matchups,
+    pts_friendly, pts_enemy,
+) -> np.ndarray | None:
+    """Build the post-move state_vec for the POST_DEST trunk re-encode.
+
+    Returns None when the phase-reencode flag is off, on charge/shaken
+    activations, or when the destination is invalid — replay reuses state_vec
+    in those cases (same h for all phases given state_vec_post == state_vec).
+
+    Only called once per activation during collection; the ~16 KB/activation
+    storage cost is the dominant buffer-size impact of the refactor.
+    """
+    if not is_phase_reencode_enabled():
+        return None
+    if move_type != MOVE_MOVE:
+        return None
+    selected_unit = units_friendly[sel_idx]
+    if selected_unit.shaken:
+        return None
+    if dest_selected_idx < 0 or len(dest_candidates) == 0:
+        return None
+
+    dest_hex = dest_candidates[dest_selected_idx]
+    dest_col = int(dest_hex[0])
+    dest_row = int(dest_hex[1])
+    is_rush = True
+    if dest_advance_reachable is not None and dest_selected_idx < len(dest_advance_reachable):
+        is_rush = not bool(dest_advance_reachable[dest_selected_idx])
+
+    post_unit = project_post_move_unit_state(
+        selected_unit, (dest_col, dest_row), is_rush=is_rush,
+    )
+    friendly_post = list(units_friendly)
+    friendly_post[sel_idx] = post_unit
+
+    state_vec_post = encode_state_tactical(
+        friendly_post, units_enemy, round_num, board, model_side,
+        friendly_ranged_matchups=fr_matchups,
+        friendly_melee_matchups=fm_matchups,
+        enemy_ranged_matchups=er_matchups,
+        enemy_melee_matchups=em_matchups,
+        total_friendly_points=pts_friendly,
+        total_enemy_points=pts_enemy,
+    )
+    return state_vec_post.numpy()
+
+
 def _init_shared_worker(shared_model, shared_opponents, model_type="tactical",
-                         use_c_ext=True):
+                         use_c_ext=True, phase_reencode_enabled=True):
     """Initialize worker process with references to shared-memory models."""
     global _g_shared_model, _g_shared_opponents, _g_worker_model_type
     _g_shared_model = shared_model
@@ -73,6 +134,11 @@ def _init_shared_worker(shared_model, shared_opponents, model_type="tactical",
     # Toggle C extension in worker processes
     import fast_core
     fast_core.USE_C_EXT = use_c_ext and fast_core.is_available()
+    # Worker processes have their own module-level state — flag must be set
+    # here or they'll collect under the legacy path while the main process
+    # uses the phased path.
+    from ml_integration_tactical import set_phase_reencode_enabled
+    set_phase_reencode_enabled(phase_reencode_enabled)
 
 
 def _collect_episodes_shared_worker(args) -> list[tuple[list[TacticalActivationRecord], str, str, str]]:
@@ -396,6 +462,18 @@ def _episode_tactical_generator(opponent_model,
                     'melee_matchups': fm_b,
                 }
 
+                _a_state_vec_post_np = _maybe_build_post_move_state_vec(
+                    units_friendly=units_a, units_enemy=units_b,
+                    round_num=round_num, board=board, model_side=model_side,
+                    sel_idx=sel_idx, move_type=move_type_a,
+                    dest_candidates=dest_cands_a,
+                    dest_selected_idx=dest_sel_a,
+                    dest_advance_reachable=dest_ar_a,
+                    fr_matchups=fr_a, fm_matchups=fm_a,
+                    er_matchups=fr_b, em_matchups=fm_b,
+                    pts_friendly=pts_a, pts_enemy=pts_b,
+                )
+
                 step = TacticalActivationRecord(
                     state_vec=state_vec_np,
                     alive_mask=alive_mask_list,
@@ -410,6 +488,7 @@ def _episode_tactical_generator(opponent_model,
                     shoot_target_idx=shoot_tgt_a,
                     shoot_mask=shoot_mask_a,
                     post_move_rel=pmr_a,
+                    state_vec_post=_a_state_vec_post_np,
                     old_log_prob=old_lp,
                     old_value=value_est,
                     opponent_type_idx=opponent_type_idx,
@@ -542,6 +621,17 @@ def _episode_tactical_generator(opponent_model,
                                 'fr_matchups': fr_b, 'er_matchups': fr_a,
                                 'melee_matchups': fm_a,
                             }
+                            _b_state_vec_post_np = _maybe_build_post_move_state_vec(
+                                units_friendly=units_b, units_enemy=units_a,
+                                round_num=round_num, board=board, model_side=_opp_side,
+                                sel_idx=sel_b, move_type=_b_inf.move_type,
+                                dest_candidates=_b_inf.dest_candidates,
+                                dest_selected_idx=_b_inf.dest_selected_idx,
+                                dest_advance_reachable=_b_inf.dest_advance_reachable,
+                                fr_matchups=fr_b, fm_matchups=fm_b,
+                                er_matchups=fr_a, em_matchups=fm_a,
+                                pts_friendly=pts_b, pts_enemy=pts_a,
+                            )
                             step_b = TacticalActivationRecord(
                                 state_vec=b_state_vec_np,
                                 alive_mask=b_alive_list,
@@ -556,6 +646,7 @@ def _episode_tactical_generator(opponent_model,
                                 shoot_target_idx=_b_inf.shoot_target_idx,
                                 shoot_mask=_b_inf.shoot_mask,
                                 post_move_rel=_b_inf.post_move_rel,
+                                state_vec_post=_b_state_vec_post_np,
                                 old_log_prob=_b_inf.old_log_prob,
                                 old_value=_b_inf.value,
                                 opponent_type_idx=opponent_type_idx,

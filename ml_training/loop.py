@@ -33,6 +33,28 @@ from ml_training.metrics import (
 )
 
 
+def _format_per_phase_value(loss_metrics: dict) -> list[str]:
+    """Format per-phase value-head diagnostics for CSV output.
+
+    Returns 9 cells: total_loss + 4 per-phase losses + 4 per-phase means.
+    Reads from the scalar-mirror keys (per_phase_value_{mean,loss}_{pre,sel,mt,dest})
+    rather than the list-valued keys — the PPO minibatch accumulator drops
+    non-scalar values, so the lists never survive minibatch aggregation.
+    Writes empty strings when the scalar keys are absent (flag was off).
+    """
+    # Presence of *any* per-phase scalar key signals the flag was on for at
+    # least one minibatch of this batch — enough to emit numeric cells.
+    phases = ("pre", "sel", "mt", "dest")
+    if not any(f"per_phase_value_mean_{p}" in loss_metrics for p in phases):
+        return [""] * 9
+    total = loss_metrics.get("per_phase_value_loss", 0.0)
+    return [
+        f"{total:.6f}",
+        *(f"{loss_metrics.get(f'per_phase_value_loss_{p}', 0.0):.6f}" for p in phases),
+        *(f"{loss_metrics.get(f'per_phase_value_mean_{p}', 0.0):.6f}" for p in phases),
+    ]
+
+
 def run_training(
     config: TrainingConfig | None = None,
     army_pairs: list[tuple[list[ResolvedUnit], list[ResolvedUnit]]] | None = None,
@@ -62,6 +84,13 @@ def run_training(
     import fast_core
     fast_core.USE_C_EXT = config.use_c_ext and fast_core.is_available()
     c_ext_label = "ON" if fast_core.USE_C_EXT else "OFF"
+
+    # Toggle phase-reencode path in main process (propagated to workers via initargs).
+    from ml_integration_tactical import set_phase_reencode_enabled, is_phase_reencode_enabled
+    set_phase_reencode_enabled(config.phase_reencode_enabled)
+    if verbose:
+        print(f"Phase re-encode: config={config.phase_reencode_enabled} "
+              f"flag={is_phase_reencode_enabled()}")
 
     # Load hall-of-fame armies for mixed training
     hof_armies = _load_hof_armies()
@@ -208,6 +237,15 @@ def run_training(
             "ml_h_charge_eff",
             "h_shoot_eff_reward",
             "h_charge_eff_reward",
+            # Main value loss — comparison baseline for per-phase V head loss.
+            "value_loss",
+            # Per-phase value head diagnostics (phase_reencode flag only).
+            # Empty when flag is off. Phase order: pre/sel/mt/dest matches
+            # PHASE_PRE_SELECT/POST_SELECT/POST_MOVETYPE/POST_DEST.
+            "pp_v_loss", "pp_v_loss_pre", "pp_v_loss_sel",
+            "pp_v_loss_mt", "pp_v_loss_dest",
+            "pp_v_mean_pre", "pp_v_mean_sel",
+            "pp_v_mean_mt", "pp_v_mean_dest",
         ])
     _log_writer.writerow([datetime.now().isoformat(), "---",
                           f"Training started (start_batch={start_batch})",
@@ -240,7 +278,7 @@ def run_training(
         processes=worker_count,
         initializer=_init_shared_worker,
         initargs=(shared_model, shared_opponents, config.model_type,
-                  config.use_c_ext),
+                  config.use_c_ext, config.phase_reencode_enabled),
     )
 
     # --- Helper: build game specs, load opponent weights, dispatch workers ---
@@ -727,6 +765,10 @@ def run_training(
             f"{_ml_h_charge_eff_sum / max(_ml_h_charge_n, 1):.6f}",
             f"{_h_shoot_eff_sum / max(_h_shoot_n, 1):.6f}",
             f"{_h_charge_eff_sum / max(_h_charge_n, 1):.6f}",
+            f"{loss_metrics.get('value_loss', 0.0):.6f}",
+            # Per-phase V head: aggregate loss, then per-phase loss + mean output.
+            # Empty strings when flag is off so the CSV round-trips cleanly.
+            *_format_per_phase_value(loss_metrics),
         ])
         _log_file.flush()
 

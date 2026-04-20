@@ -14,11 +14,24 @@ from ml_features import (
     extract_can_charge_mask, extract_is_shaken,
     MAX_DEST_CANDIDATES, DEST_FEATURE_DIM,
 )
-from ml_integration_tactical import compute_destination_features
+from ml_integration_tactical import compute_destination_features, is_phase_reencode_enabled
 from ml_model_tactical import (
     TacticalModel, NUM_MOVE_TYPES, MOVE_MOVE, MOVE_CHARGE,
     NUM_OPPONENT_TYPES,
+    PHASE_PRE_SELECT, PHASE_POST_SELECT, PHASE_POST_MOVETYPE, PHASE_POST_DEST,
+    N_PHASES,
 )
+
+# Phase-reencode auxiliary per-phase value loss weight (Step 5). Per-phase V
+# heads are trained as auxiliary regressors against the same GAE activation
+# return as the main value head. Small weight keeps the main V loss dominant
+# while giving per-phase heads gradient signal so they become usable as
+# per-phase baselines in a future Step 5b.
+_PER_PHASE_V_WEIGHT = 0.1
+
+# One-shot diagnostic: prints phase-reencode flag state on the first replay
+# call of a training run so we can confirm the expected branch is taken.
+_FIRST_REPLAY_FLAG_DIAG_PRINTED = False
 
 from ml_training.config import TacticalActivationRecord
 from ml_training.entropy import EntropyTargetTuner
@@ -81,6 +94,10 @@ class FlatReplayResult:
     shoot_logits: torch.Tensor | None = None   # (N, 10) — shoot target logits (masked)
     # Destination pointer: number of valid candidates per step (for normalised entropy)
     dest_n_valid: torch.Tensor | None = None  # (N,) — int, number of valid candidates
+    # Per-phase value head outputs — only populated when the phase-reencode flag
+    # is on. Shape (N, N_PHASES); columns indexed by PHASE_PRE_SELECT etc.
+    # Trained in compute_loss_flat as auxiliary regressors against flat_returns.
+    per_phase_values: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +140,12 @@ class PreparedReplayData:
     n_steps: int
     n_episodes: int
     device: torch.device
+    # Phase-reencode: per-step post-move state_vec for the POST_DEST encode.
+    # None when the phase-reencode flag is off. When on, every row is populated —
+    # activations that didn't produce a post-move state (charge, shaken, invalid
+    # dest) get state_vec as their post-move value so the POST_DEST encode is a
+    # no-op delta from the prior phase's input.
+    state_vec_post_batch: torch.Tensor | None = None
 
 
 def prepare_replay_data(
@@ -165,6 +188,19 @@ def prepare_replay_data(
     # --- State vectors (one np.stack) ---
     state_np = np.stack([s.state_vec for s in flat_steps])
     state_batch = torch.from_numpy(state_np).to(device)
+
+    # --- Post-move state vectors (Phase-reencode POST_DEST input) ---
+    # Only materialised when the phase-reencode flag is on. Rows without a
+    # stored state_vec_post fall back to the pre-move state_vec so the
+    # POST_DEST encode has the same input as prior phases (h_dest == h_mt).
+    if is_phase_reencode_enabled():
+        state_post_np = np.stack([
+            s.state_vec_post if s.state_vec_post is not None else s.state_vec
+            for s in flat_steps
+        ])
+        state_post_batch = torch.from_numpy(state_post_np).to(device)
+    else:
+        state_post_batch = None
 
     # --- Alive masks (vectorized numpy) ---
     alive_np = np.zeros((n_steps, n_units), dtype=np.bool_)
@@ -290,6 +326,7 @@ def prepare_replay_data(
         dest_buffer=dest_buffer,
         dest_offsets=dest_offsets_np, dest_counts=dest_counts_np,
         n_steps=n_steps, n_episodes=len(all_trajectories), device=device,
+        state_vec_post_batch=state_post_batch,
     )
 
 
@@ -347,8 +384,57 @@ def replay_from_prepared(
     dest_features_batch = torch.from_numpy(dest_feat_np).to(prepared.device)
     dest_mask_batch = torch.from_numpy(dest_mask_np).to(prepared.device)
 
-    # === Trunk ===
-    h, units, round_onehot = model.trunk(sb)
+    # === Trunk (single pass) or phase-reencode chain (4 encode calls) ===
+    per_phase_values: torch.Tensor | None = None
+    global _FIRST_REPLAY_FLAG_DIAG_PRINTED
+    _flag = is_phase_reencode_enabled()
+    _has_post = prepared.state_vec_post_batch is not None
+    if not _FIRST_REPLAY_FLAG_DIAG_PRINTED:
+        print(f"  [DIAG] first replay: phase_reencode_flag={_flag} "
+              f"state_vec_post_batch_present={_has_post} "
+              f"→ taking {'PHASED' if (_flag and _has_post) else 'LEGACY'} branch")
+        _FIRST_REPLAY_FLAG_DIAG_PRINTED = True
+    if _flag and _has_post:
+        # Phase-reencode replay: h persists across phases, h0 recomputes each phase.
+        h_pre, units_pre, round_onehot = model.encode(
+            sb, phase=PHASE_PRE_SELECT, acting_unit_idx=None, h_prev=None,
+        )
+        h_sel, _units_sel, _ = model.encode(
+            sb, phase=PHASE_POST_SELECT,
+            acting_unit_idx=unit_indices, h_prev=h_pre,
+        )
+        h_mt, _units_mt, _ = model.encode(
+            sb, phase=PHASE_POST_MOVETYPE,
+            acting_unit_idx=unit_indices, h_prev=h_sel,
+        )
+        sb_post = prepared.state_vec_post_batch[step_indices]
+        h_dest, units_dest, _ = model.encode(
+            sb_post, phase=PHASE_POST_DEST,
+            acting_unit_idx=unit_indices, h_prev=h_mt,
+        )
+        # Per-head h/units routing: pre-move h/units for unit/move/dest/value/aux
+        # (they reason about the choice to make); post-move h/units for
+        # charge/shoot (they reason about the state after committing).
+        h = h_pre
+        units = units_pre
+        h_move = h_sel
+        h_dest_query = h_mt
+        h_pointer = h_dest
+        units_pointer = units_dest
+        # Per-phase value heads — auxiliary regressors trained against flat_returns
+        # in compute_loss_flat (_PER_PHASE_V_WEIGHT).
+        per_phase_values = torch.stack([
+            model.per_phase_value(h_pre, PHASE_PRE_SELECT),
+            model.per_phase_value(h_sel, PHASE_POST_SELECT),
+            model.per_phase_value(h_mt, PHASE_POST_MOVETYPE),
+            model.per_phase_value(h_dest, PHASE_POST_DEST),
+        ], dim=-1)  # (N, N_PHASES)
+    else:
+        h, units, round_onehot = model.trunk(sb)
+        h_move = h
+        h_dest_query = h
+        h_pointer = h
+        units_pointer = units
     if torch.isnan(h).any() or torch.isinf(h).any():
         print("  WARNING: NaN/Inf in trunk output during replay — clamping")
         h = torch.nan_to_num(h, nan=0.0, posinf=50.0, neginf=-50.0)
@@ -366,7 +452,7 @@ def replay_from_prepared(
     can_charge_batch = extract_can_charge_mask(sb, unit_indices)
     is_shaken_batch = extract_is_shaken(sb, unit_indices)
 
-    h_uf = torch.cat([h, unit_features], dim=-1)
+    h_uf = torch.cat([h_move, unit_features], dim=-1)
     move_logits_out = model.move_type_head(h_uf)
     no_chargeable = ~can_charge_batch.any(dim=-1)
     move_logits_out = move_logits_out.clone()
@@ -374,20 +460,21 @@ def replay_from_prepared(
     move_logits_out[:, MOVE_CHARGE] = move_logits_out[:, MOVE_CHARGE].masked_fill(is_shaken_batch, float('-inf'))
 
     move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()
-    h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
+    h_uf_m = torch.cat([h_dest_query, unit_features, move_onehot], dim=-1)
 
     # === Destination pointer ===
     dest_logits = model.compute_dest_logits(h_uf_m, dest_features_batch, dest_mask_batch)
 
     # === Charge target pointer head ===
     charge_logits_out = model.compute_charge_logits(
-        h, units, unit_indices, enemy_alive_batch, can_charge_batch,
+        h_pointer, units_pointer, unit_indices, enemy_alive_batch, can_charge_batch,
     )
 
     # === Shoot target pointer head ===
-    shoot_logits_out = model.compute_shoot_logits(
-        h, units, unit_indices, post_move_rel_batch,
+    shoot_logits_out, shoot_primary, shoot_bias = model.compute_shoot_logits(
+        h_pointer, units_pointer, unit_indices, post_move_rel_batch,
         enemy_alive_batch, shoot_range_mask=shoot_mask_batch,
+        return_components=True,
     )
 
     # === Value head ===
@@ -410,6 +497,26 @@ def replay_from_prepared(
             per_opp_type_mean_values["mean_value_side_a"] = values[_a_mask].mean().item()
         if _b_mask.any():
             per_opp_type_mean_values["mean_value_side_b"] = values[_b_mask].mean().item()
+
+        # Shoot head diagnostics: is the scalar pathway load-bearing vs. the
+        # bias pathway? Ratio near 1 means logits are driven mostly by
+        # expected_wound_frac × current_wound_frac; near 0 means the bias
+        # pathway is bypassing the mechanical signal.
+        _valid = shoot_mask_batch
+        _n_valid = _valid.sum(dim=-1)
+        _eligible = _n_valid >= 2
+        if _eligible.any():
+            _v = _valid.float()
+            _n = _n_valid.clamp(min=1).float().unsqueeze(-1)
+            _primary_mean = (shoot_primary * _v).sum(dim=-1, keepdim=True) / _n
+            _total = shoot_primary + shoot_bias
+            _total_mean = (_total * _v).sum(dim=-1, keepdim=True) / _n
+            _primary_var = (((shoot_primary - _primary_mean) * _v) ** 2).sum(dim=-1) / _n.squeeze(-1)
+            _total_var = (((_total - _total_mean) * _v) ** 2).sum(dim=-1) / _n.squeeze(-1)
+            _ratio = _primary_var / _total_var.clamp(min=1e-8)
+            per_opp_type_mean_values["shoot_primary_var_ratio"] = _ratio[_eligible].mean().item()
+            per_opp_type_mean_values["shoot_primary_abs_mean"] = shoot_primary[_valid].abs().mean().item()
+            per_opp_type_mean_values["shoot_bias_abs_mean"] = shoot_bias[_valid].abs().mean().item()
 
     # === Log-probs & entropies ===
     all_dead = ~alive_batch.any(dim=1, keepdim=True)
@@ -532,6 +639,7 @@ def replay_from_prepared(
         unit_logits=unit_logits, move_logits=move_logits_out,
         charge_logits=charge_logits_out, shoot_logits=shoot_logits_out,
         dest_n_valid=dest_mask_batch.sum(dim=-1),
+        per_phase_values=per_phase_values,
     )
 
 
@@ -597,7 +705,7 @@ def compute_loss_flat(
         return zero, {
             "loss": 0.0, "policy_loss": 0.0, "value_loss": 0.0,
             "mean_entropy": 0.0, "mean_reward": 0.0, "aux_loss": 0.0,
-            "alpha_loss": 0.0,
+            "alpha_loss": 0.0, "per_phase_value_loss": 0.0,
         }
 
     # Normalize advantages (zero-mean, unit-variance) for stable gradients
@@ -641,6 +749,30 @@ def compute_loss_flat(
 
     # Value loss
     mean_value_loss = ((flat_result.values - flat_returns) ** 2).mean()
+
+    # Per-phase value loss (Step 5): aux regressors trained against the same
+    # flat_returns target as the main value head. Only attached when the
+    # phase-reencode path populated them — otherwise stays at 0.
+    per_phase_value_loss_val = 0.0
+    # Per-phase breakdown for logging (diagnostic — not used by training).
+    # Empty when flag is off. When on, two N_PHASES-long lists:
+    #   per_phase_value_mean_per_phase[p] = mean V output at phase p across batch
+    #   per_phase_value_loss_per_phase[p] = MSE between V@p and returns
+    per_phase_value_mean_per_phase: list[float] = []
+    per_phase_value_loss_per_phase: list[float] = []
+    if flat_result.per_phase_values is not None:
+        # flat_returns: (N,); per_phase_values: (N, N_PHASES)
+        _ppv_target = flat_returns.detach().unsqueeze(-1)
+        _pp_diff_sq = (flat_result.per_phase_values - _ppv_target) ** 2
+        mean_per_phase_value_loss = _pp_diff_sq.mean()
+        per_phase_value_loss_val = mean_per_phase_value_loss.item()
+        with torch.no_grad():
+            per_phase_value_mean_per_phase = (
+                flat_result.per_phase_values.mean(dim=0).tolist()
+            )
+            per_phase_value_loss_per_phase = _pp_diff_sq.mean(dim=0).tolist()
+    else:
+        mean_per_phase_value_loss = None
 
     # Entropy (aggregate + per-head)
     mean_entropy = flat_result.entropies.mean()
@@ -713,6 +845,10 @@ def compute_loss_flat(
         loss = mean_policy_loss + value_coeff * mean_value_loss - entropy_coeff * mean_entropy
         alpha_loss = None
 
+    # --- Per-phase value head auxiliary loss (phase-reencode only) ---
+    if mean_per_phase_value_loss is not None:
+        loss = loss + _PER_PHASE_V_WEIGHT * mean_per_phase_value_loss
+
     # --- Auxiliary prediction losses (adaptive coefficient) ---
     aux_loss_val = 0.0
     effective_aux_coeff = 0.0
@@ -769,6 +905,25 @@ def compute_loss_flat(
         "aux_loss": aux_loss_val,
         "weighted_aux": weighted_aux,
         "non_aux_loss": non_aux_loss,
+        "per_phase_value_loss": per_phase_value_loss_val,
+        "per_phase_value_mean_per_phase": per_phase_value_mean_per_phase,
+        "per_phase_value_loss_per_phase": per_phase_value_loss_per_phase,
+        # Scalar per-phase keys — the PPO minibatch accumulator in loop.py drops
+        # any non-(int|float) values, so the list-valued keys above never reach
+        # the CSV. These scalar mirrors survive the accumulation and are what
+        # _format_per_phase_value actually reads. Only populated when the flag
+        # is on; absent otherwise so the CSV emits empty strings for flag-off
+        # runs (distinguishable from a genuine 0.0).
+        **({
+            "per_phase_value_mean_pre":  per_phase_value_mean_per_phase[0],
+            "per_phase_value_mean_sel":  per_phase_value_mean_per_phase[1],
+            "per_phase_value_mean_mt":   per_phase_value_mean_per_phase[2],
+            "per_phase_value_mean_dest": per_phase_value_mean_per_phase[3],
+            "per_phase_value_loss_pre":  per_phase_value_loss_per_phase[0],
+            "per_phase_value_loss_sel":  per_phase_value_loss_per_phase[1],
+            "per_phase_value_loss_mt":   per_phase_value_loss_per_phase[2],
+            "per_phase_value_loss_dest": per_phase_value_loss_per_phase[3],
+        } if len(per_phase_value_mean_per_phase) == 4 else {}),
         "clip_frac": clip_frac,
         "per_head_entropy": per_head_entropy,
         "per_head_n": per_head_n,

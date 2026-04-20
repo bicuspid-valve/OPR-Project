@@ -441,9 +441,6 @@ def resolve_shooting(attacker: UnitState, defender: UnitState,
                         defender.apply_wounds(1, ignore_regen,
                                               allow_hero=w_takedown)
 
-            # Update defender positions cache after casualties
-            d_positions = defender.alive_positions()
-
     if stat_total_attacks == 0:
         return None
 
@@ -617,6 +614,7 @@ def resolve_melee(attacker: UnitState, defender: UnitState,
     # Per-model melee weapon iteration
     melee_range_sq = MELEE_RANGE_SQ
     has_any_melee = False
+    d_positions = defender.alive_positions()
 
     for model_idx in range(attacker.models_alive):
         if defender.models_alive <= 0:
@@ -628,7 +626,7 @@ def resolve_melee(attacker: UnitState, defender: UnitState,
         # Check if this model is in melee range of any defender model
         if not SIMPLE_MELEE:
             in_range = False
-            for tc, tr in defender.alive_positions():
+            for tc, tr in d_positions:
                 dc = m_col - tc
                 dr = m_row - tr
                 if dc * dc + dr * dr <= melee_range_sq:
