@@ -49,10 +49,12 @@ from ml_integration_tactical import (
     compute_destination_candidates, compute_destination_features,
     _get_model_space_positions, _get_movement_budgets,
     _get_max_weapon_ranges, MOVE_TYPE_NAMES,
+    project_post_move_unit_state,
 )
 from ml_model_tactical import (
     TacticalModel, TacticalModelOutput,
     NUM_MOVE_TYPES, MOVE_MOVE, MOVE_CHARGE,
+    PHASE_PRE_SELECT, PHASE_POST_SELECT, PHASE_POST_MOVETYPE, PHASE_POST_DEST,
 )
 from simulation import start_round, end_round, score_game
 
@@ -291,15 +293,16 @@ def _execute_activation(
         rt, wr = _kite_range_params(active, opp_units, reason)
         execute_movement(active, goal, budget, board, enemy_positions,
                          flying=active.unit.flying,
+                         strider=active.unit.strider,
                          range_target=rt, weapon_range=wr)
 
         if action != "rush":
             if active.shaken:
                 active.shaken = False
             else:
-                target = pick_target_from_ranking(active, opp_units, target_ranking)
+                target = pick_target_from_ranking(active, opp_units, target_ranking, board)
                 if target is not None:
-                    resolve_shooting(active, target)
+                    resolve_shooting(active, target, board=board)
                     check_morale(target)
                     _sync_dead_models(target, board)
 
@@ -307,9 +310,9 @@ def _execute_activation(
         if active.shaken:
             active.shaken = False
         else:
-            target = pick_target_from_ranking(active, opp_units, target_ranking)
+            target = pick_target_from_ranking(active, opp_units, target_ranking, board)
             if target is not None:
-                resolve_shooting(active, target)
+                resolve_shooting(active, target, board=board)
                 check_morale(target)
                 _sync_dead_models(target, board)
 
@@ -900,11 +903,56 @@ def _rollout_generator(
     return final_result.value
 
 
-def _run_chunk_batched(args, *, model_override=None):
+def _clone_unit_state(us: UnitState) -> UnitState:
+    """Cheap deep clone of a UnitState for per-rollout isolation.
+
+    Uses object.__new__ to skip __post_init__/reset() — we copy every mutable
+    field explicitly below, and share immutable references (unit, hero_unit).
+    Roughly 5× faster than pickle.loads round-trip for typical units.
+    """
+    new = object.__new__(UnitState)
+    new.unit = us.unit                              # immutable ResolvedUnit
+    new.models_alive = us.models_alive
+    new.wounds_per_model = us.wounds_per_model[:]
+    new.shaken = us.shaken
+    new.morale_checked = us.morale_checked
+    new.activated = us.activated
+    new.fatigued = us.fatigued
+    new.ai_role = us.ai_role
+    new.combat_preference = us.combat_preference
+    new.assigned_objective = us.assigned_objective
+    new.positions = us.positions[:]
+    new.weapons_per_model = [mw[:] for mw in us.weapons_per_model]
+    new._removed_positions = us._removed_positions[:]
+    new.owner = us.owner
+    new.movement_stance = us.movement_stance
+    new.hero_model_index = us.hero_model_index
+    new.hero_unit = us.hero_unit                    # immutable ResolvedUnit or None
+    return new
+
+
+def _clone_board(board: Board) -> Board:
+    """Cheap clone of a Board (occupancy grid + objective control list)."""
+    new = object.__new__(Board)
+    new.occupancy = bytearray(board.occupancy)
+    new.objective_control = list(board.objective_control)
+    return new
+
+
+def _run_chunk_batched_raw(args, *, model_override=None, live_state=None):
     """Per-worker function: evaluate a chunk of candidates with batched inference.
 
-    Called by pool.map() (uses _g_planning_model) or directly from main process
-    (uses model_override).
+    Returns raw per-rollout values (list[list[float]] of length len(candidate_chunk),
+    with each inner list holding M values). Call _run_chunk_batched to get
+    per-candidate averages (preserves the original signature for eval-path
+    callers going through pool.map).
+
+    Fast path: when ``live_state`` is a tuple
+    ``(master_ua, master_ub, master_bd, fr_a, fm_a, fr_b, fm_b, pts_a, pts_b)``
+    of in-process references, per-rollout state is cloned directly via
+    ``_clone_unit_state`` / ``_clone_board`` instead of deserialised from
+    ``state_bytes`` — saves ~60% of the pickle round-trip cost. ``state_bytes``
+    is ignored in this path but still passed for signature compatibility.
     """
     (state_bytes, candidate_chunk, M, N, round_num, mode, player,
      friendly_is_a, current_is_a) = args
@@ -915,6 +963,9 @@ def _run_chunk_batched(args, *, model_override=None):
     generators: dict[int, tuple] = {}  # gen_id → (gen, candidate_local_idx)
     finished_values: dict[int, list] = {}  # candidate_local_idx → list of values
     gen_to_cand: dict[int, int] = {}  # gen_id → candidate_local_idx
+
+    if live_state is not None:
+        master_ua, master_ub, master_bd, _fr_a, _fm_a, _fr_b, _fm_b, _pts_a, _pts_b = live_state
 
     gen_id = 0
     for ci, ca in enumerate(candidate_chunk):
@@ -927,8 +978,13 @@ def _run_chunk_batched(args, *, model_override=None):
         finished_values[ci] = []
 
         for _ in range(M):
-            # Each rollout needs independent game state
-            ua, ub, bd, _fr_a, _fm_a, _fr_b, _fm_b, _pts_a, _pts_b = pickle.loads(state_bytes)
+            # Each rollout needs independent game state.
+            if live_state is not None:
+                ua = [_clone_unit_state(u) for u in master_ua]
+                ub = [_clone_unit_state(u) for u in master_ub]
+                bd = _clone_board(master_bd)
+            else:
+                ua, ub, bd, _fr_a, _fm_a, _fr_b, _fm_b, _pts_a, _pts_b = pickle.loads(state_bytes)
 
             gen = _rollout_generator(
                 ua, ub, bd,
@@ -971,13 +1027,13 @@ def _run_chunk_batched(args, *, model_override=None):
 
         active = new_active
 
-    # Average M rollout values per candidate
-    avg_values = []
-    for ci in range(len(candidate_chunk)):
-        vals = finished_values[ci]
-        avg_values.append(sum(vals) / len(vals) if vals else 0.0)
+    return [list(finished_values[ci]) for ci in range(len(candidate_chunk))]
 
-    return avg_values
+
+def _run_chunk_batched(args, *, model_override=None):
+    """Average-returning wrapper around _run_chunk_batched_raw for eval paths."""
+    raw = _run_chunk_batched_raw(args, model_override=model_override)
+    return [sum(vs) / len(vs) if vs else 0.0 for vs in raw]
 
 
 # ---------------------------------------------------------------------------
@@ -985,6 +1041,335 @@ def _run_chunk_batched(args, *, model_override=None):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
+def _apply_with_dest_override_pp_v(
+    model, friendly_units, enemy_units, round_num, board, player,
+    num_dests: int,
+    friendly_ranged_matchups=None, friendly_melee_matchups=None,
+    enemy_ranged_matchups=None, enemy_melee_matchups=None,
+    total_friendly_points=None, total_enemy_points=None,
+):
+    """Standard inference, but for MOVE_MOVE the destination is overridden:
+    sample num_dests uniform-random legal dests, pick the one that maximises
+    pp_v_dest. Charge & shoot heads are re-computed from the new post-move
+    state so the chosen action is coherent.
+
+    Returns the same 7-tuple as apply_tactical_model.
+    """
+    import torch
+    import numpy as np
+    from ml_integration_tactical import (
+        _apply_tactical_model_phased, _flip_x as _fx, _flip_y as _fy,
+    )
+    from ml_features import extract_is_shaken
+
+    # 1. Run normal inference to get the policy's argmax decision (and to
+    #    let us know whether move_type is MOVE_MOVE without re-deriving
+    #    the entire chain twice).
+    decision = _apply_tactical_model_phased(
+        model, friendly_units, enemy_units, round_num, board, player,
+        friendly_ranged_matchups=friendly_ranged_matchups,
+        friendly_melee_matchups=friendly_melee_matchups,
+        enemy_ranged_matchups=enemy_ranged_matchups,
+        enemy_melee_matchups=enemy_melee_matchups,
+        total_friendly_points=total_friendly_points,
+        total_enemy_points=total_enemy_points,
+    )
+    selected_unit, target_ranking, action, goal, charge_target, reason, assessment = decision
+
+    move_type_name = assessment.get('move_type', '')
+    if move_type_name != MOVE_TYPE_NAMES[MOVE_MOVE]:
+        # Not a MOVE_MOVE — no override; return standard decision unchanged.
+        return decision
+
+    selected_idx = assessment.get('selected_slot', None)
+    if selected_idx is None:
+        return decision
+
+    # 2. Re-derive the phase chain up to h_mt for the overridden-dest pp_v_dest evaluation.
+    state_vec = encode_state_tactical(
+        friendly_units, enemy_units, round_num, board, player,
+        friendly_ranged_matchups=friendly_ranged_matchups,
+        friendly_melee_matchups=friendly_melee_matchups,
+        enemy_ranged_matchups=enemy_ranged_matchups,
+        enemy_melee_matchups=enemy_melee_matchups,
+        total_friendly_points=total_friendly_points,
+        total_enemy_points=total_enemy_points,
+    )
+    if bool(extract_is_shaken(state_vec, selected_idx).item()):
+        # Shaken units skip dest selection; can't override.
+        return decision
+
+    state_batched = state_vec.unsqueeze(0)
+    h_pre, _, _ = model.encode(state_batched, phase=PHASE_PRE_SELECT,
+                               acting_unit_idx=None, h_prev=None)
+    h_sel, _, _ = model.encode(state_batched, phase=PHASE_POST_SELECT,
+                               acting_unit_idx=selected_idx, h_prev=h_pre)
+    h_mt, _, _ = model.encode(state_batched, phase=PHASE_POST_MOVETYPE,
+                              acting_unit_idx=selected_idx, h_prev=h_sel)
+
+    # 3. Sample num_dests random legal destinations & evaluate pp_v_dest.
+    enemy_pos_set = _collect_enemy_positions(enemy_units)
+    cands, cmask, adv_reach = compute_destination_candidates(
+        selected_unit, board, enemy_pos_set, player)
+    valid = [i for i in range(len(cands)) if cmask[i]]
+    if not valid:
+        return decision
+    sampled = [random.choice(valid) for _ in range(num_dests)]
+
+    # Build batched post-move states for all sampled dests (one trunk encode each).
+    best_v = -float('inf')
+    best_idx = sampled[0]
+    for d_idx in sampled:
+        dc, dr = int(cands[d_idx, 0]), int(cands[d_idx, 1])
+        is_rush_d = not bool(adv_reach[d_idx])
+        post_unit = project_post_move_unit_state(selected_unit, (dc, dr), is_rush=is_rush_d)
+        friendly_post = list(friendly_units)
+        friendly_post[selected_idx] = post_unit
+        sv_post = encode_state_tactical(
+            friendly_post, enemy_units, round_num, board, player,
+            friendly_ranged_matchups=friendly_ranged_matchups,
+            friendly_melee_matchups=friendly_melee_matchups,
+            enemy_ranged_matchups=enemy_ranged_matchups,
+            enemy_melee_matchups=enemy_melee_matchups,
+            total_friendly_points=total_friendly_points,
+            total_enemy_points=total_enemy_points,
+        )
+        h_dest, _, _ = model.encode(sv_post.unsqueeze(0), phase=PHASE_POST_DEST,
+                                    acting_unit_idx=selected_idx, h_prev=h_mt)
+        v = float(model.per_phase_value(h_dest, PHASE_POST_DEST).item())
+        if v > best_v:
+            best_v = v
+            best_idx = d_idx
+
+    # 4. Commit to best dest & re-derive charge/shoot from the new post-move state.
+    dc, dr = int(cands[best_idx, 0]), int(cands[best_idx, 1])
+    is_rush = not bool(adv_reach[best_idx])
+    post_unit = project_post_move_unit_state(selected_unit, (dc, dr), is_rush=is_rush)
+    friendly_post = list(friendly_units)
+    friendly_post[selected_idx] = post_unit
+    sv_post = encode_state_tactical(
+        friendly_post, enemy_units, round_num, board, player,
+        friendly_ranged_matchups=friendly_ranged_matchups,
+        friendly_melee_matchups=friendly_melee_matchups,
+        enemy_ranged_matchups=enemy_ranged_matchups,
+        enemy_melee_matchups=enemy_melee_matchups,
+        total_friendly_points=total_friendly_points,
+        total_enemy_points=total_enemy_points,
+    )
+    h_dest, units_dest, _ = model.encode(
+        sv_post.unsqueeze(0), phase=PHASE_POST_DEST,
+        acting_unit_idx=selected_idx, h_prev=h_mt,
+    )
+
+    enemy_alive_mask = torch.tensor(
+        [(i < len(enemy_units) and enemy_units[i].models_alive > 0)
+         for i in range(MAX_UNITS_PER_SIDE)],
+        dtype=torch.bool,
+    )
+    can_charge_mask = extract_can_charge_mask(state_vec, selected_idx)
+    enemy_alive_batched = enemy_alive_mask.unsqueeze(0)
+
+    charge_logits = model.compute_charge_logits(
+        h_dest, units_dest, selected_idx,
+        enemy_alive_batched, can_charge_mask.unsqueeze(0),
+    ).squeeze(0)
+
+    enemy_positions = _get_model_space_positions(enemy_units, player)
+    px, py = float(dc), float(dr)
+    if player == "B":
+        px = _fx(px); py = _fy(py)
+    post_move_rel = compute_post_move_rel(px, py, enemy_positions)
+    max_wr = max((w.range_inches for w in selected_unit.unit.weapons if not w.melee),
+                 default=0.0)
+    shoot_range_mask = compute_in_range_mask(post_move_rel, float(max_wr), enemy_alive_mask)
+
+    shoot_logits = model.compute_shoot_logits(
+        h_dest, units_dest, selected_idx,
+        post_move_rel.unsqueeze(0), enemy_alive_batched,
+        shoot_range_mask=None,
+    ).squeeze(0)
+    masked_shoot = shoot_logits.masked_fill(~shoot_range_mask, float('-inf'))
+
+    charge_target_idx = int(charge_logits.argmax().item()) if enemy_alive_mask.any() else 0
+    shoot_target_idx = int(masked_shoot.argmax().item()) if shoot_range_mask.any() else 0
+    new_target_ranking = torch.argsort(masked_shoot, descending=True).tolist()
+
+    # 5. Build the new action via execute_decoded_decision.
+    new_action, new_goal, new_charge_target, new_reason = execute_decoded_decision(
+        selected_unit, enemy_units, MOVE_MOVE, (dc, dr),
+        charge_target_idx, shoot_target_idx,
+        is_advance_reachable=not is_rush,
+    )
+
+    # Patch assessment for downstream consumers (viewer etc.) — not strictly
+    # required for game progression but keeps it informative.
+    assessment = dict(assessment)
+    assessment['dest_selected'] = (dc, dr)
+    assessment['_dest_overridden_via'] = 'pp_v_dest'
+    assessment['_dest_override_n'] = num_dests
+    assessment['shoot_target_idx'] = shoot_target_idx
+    assessment['charge_target_idx'] = charge_target_idx
+
+    return (selected_unit, new_target_ranking, new_action, new_goal,
+            new_charge_target, new_reason, assessment)
+
+
+def _run_dest_value_calibration(
+    model, state_vec, friendly_units, enemy_units, round_num, board, player,
+    units_a, units_b, current_is_a, mode,
+    fr_a, fm_a, fr_b, fm_b, pts_a, pts_b,
+    friendly_ranged_matchups, friendly_melee_matchups,
+    enemy_ranged_matchups, enemy_melee_matchups,
+    total_friendly_points, total_enemy_points,
+    num_dests: int, M: int, N: int,
+    log_path: str, activation_id: int,
+) -> None:
+    """Calibration probe: for the policy-argmax unit, sample num_dests
+    random destinations and compute (pp_v_dest, rollout_v) for each.
+    Appends rows to log_path. Skips if move_type != MOVE_MOVE.
+    """
+    import numpy as np
+    import torch
+    state_batched = state_vec.unsqueeze(0)
+
+    # Phase chain — replicates the inference path so we can pluck h_mt.
+    h_pre, _units_pre, _ = model.encode(
+        state_batched, phase=PHASE_PRE_SELECT,
+        acting_unit_idx=None, h_prev=None,
+    )
+
+    # Argmax unit (with alive mask)
+    alive_mask = torch.tensor(
+        [(i < len(friendly_units) and friendly_units[i].models_alive > 0
+          and not friendly_units[i].activated)
+         for i in range(MAX_UNITS_PER_SIDE)],
+        dtype=torch.bool,
+    )
+    if not alive_mask.any():
+        return
+    enemy_alive_mask = torch.tensor(
+        [(i < len(enemy_units) and enemy_units[i].models_alive > 0)
+         for i in range(MAX_UNITS_PER_SIDE)],
+        dtype=torch.bool,
+    )
+    unit_logits = model.unit_selection_head(h_pre).squeeze(0)
+    unit_logits = unit_logits.masked_fill(~alive_mask, float('-inf'))
+    selected_idx = int(unit_logits.argmax().item())
+    selected_unit = friendly_units[selected_idx]
+
+    # Phase POST_SELECT
+    h_sel, units_sel, _ = model.encode(
+        state_batched, phase=PHASE_POST_SELECT,
+        acting_unit_idx=selected_idx, h_prev=h_pre,
+    )
+
+    # Argmax move_type
+    unit_features = model._extract_unit_features(units_sel.squeeze(0), selected_idx).detach()
+    h_uf = torch.cat([h_sel, unit_features.unsqueeze(0)], dim=-1)
+    move_logits = model.move_type_head(h_uf).squeeze(0)
+    can_charge_mask = extract_can_charge_mask(state_vec, selected_idx)
+    if not can_charge_mask.any():
+        move_logits = move_logits.clone()
+        move_logits[MOVE_CHARGE] = float('-inf')
+    move_type = int(move_logits.argmax().item())
+    if move_type != MOVE_MOVE:
+        return
+
+    # Phase POST_MOVETYPE — used as h_prev for the POST_DEST encode below
+    h_mt, _units_mt, _ = model.encode(
+        state_batched, phase=PHASE_POST_MOVETYPE,
+        acting_unit_idx=selected_idx, h_prev=h_sel,
+    )
+
+    # Destination candidates
+    enemy_pos_set = _collect_enemy_positions(enemy_units)
+    cands, cmask, adv_reach = compute_destination_candidates(
+        selected_unit, board, enemy_pos_set, player)
+    valid = [i for i in range(len(cands)) if cmask[i]]
+    if not valid:
+        return
+
+    sampled = [random.choice(valid) for _ in range(num_dests)]
+
+    # Per-candidate: build post-move state, encode at POST_DEST, get pp_v_dest
+    pp_v_dests: list[float] = []
+    candidate_actions: list[tuple] = []
+    enemy_positions = _get_model_space_positions(enemy_units, player)
+    max_wr = max((w.range_inches for w in selected_unit.unit.weapons if not w.melee), default=0.0)
+
+    for d_idx in sampled:
+        dest_col, dest_row = int(cands[d_idx, 0]), int(cands[d_idx, 1])
+        is_rush = not bool(adv_reach[d_idx])
+        post_unit = project_post_move_unit_state(selected_unit, (dest_col, dest_row), is_rush=is_rush)
+        friendly_post = list(friendly_units)
+        friendly_post[selected_idx] = post_unit
+        state_vec_post = encode_state_tactical(
+            friendly_post, enemy_units, round_num, board, player,
+            friendly_ranged_matchups=friendly_ranged_matchups,
+            friendly_melee_matchups=friendly_melee_matchups,
+            enemy_ranged_matchups=enemy_ranged_matchups,
+            enemy_melee_matchups=enemy_melee_matchups,
+            total_friendly_points=total_friendly_points,
+            total_enemy_points=total_enemy_points,
+        )
+        h_dest, _, _ = model.encode(
+            state_vec_post.unsqueeze(0), phase=PHASE_POST_DEST,
+            acting_unit_idx=selected_idx, h_prev=h_mt,
+        )
+        v_dest = float(model.per_phase_value(h_dest, PHASE_POST_DEST).item())
+        pp_v_dests.append(v_dest)
+
+        # Build candidate_action for rollout. Shoot target: uniform over
+        # legal at the new position; charge target: -1 (not charging).
+        post_x, post_y = float(dest_col), float(dest_row)
+        if player == "B":
+            post_x = _flip_x(post_x); post_y = _flip_y(post_y)
+        post_move_rel = compute_post_move_rel(post_x, post_y, enemy_positions)
+        shoot_range_mask = compute_in_range_mask(post_move_rel, float(max_wr), enemy_alive_mask)
+        no_shootable = (not enemy_alive_mask.any()) or (not shoot_range_mask.any())
+        if no_shootable:
+            shoot_target_idx = 0
+        else:
+            _legal = (enemy_alive_mask & shoot_range_mask).float()
+            _u = _legal / _legal.sum().clamp(min=1)
+            shoot_target_idx = int(torch.multinomial(_u, 1).item())
+
+        action_str, goal, _charge_target_unit, reason = execute_decoded_decision(
+            selected_unit, enemy_units, MOVE_MOVE, (dest_col, dest_row),
+            -1, shoot_target_idx, is_advance_reachable=not is_rush,
+        )
+        will_not_shoot = no_shootable
+        target_ranking = list(range(MAX_UNITS_PER_SIDE))
+        candidate_actions.append((
+            selected_idx, MOVE_MOVE, dest_col, dest_row, target_ranking,
+            -1, shoot_target_idx, action_str, goal, -1, reason, will_not_shoot,
+        ))
+
+    # Rollouts
+    state_bytes = pickle.dumps((
+        list(units_a), list(units_b), board,
+        fr_a, fm_a, fr_b, fm_b, pts_a, pts_b,
+    ))
+    friendly_is_a = (player == "A")
+    raw_values = _run_chunk_batched_raw((
+        state_bytes, candidate_actions, M, N, round_num, mode, player,
+        friendly_is_a, current_is_a,
+    ), model_override=model, live_state=None)
+    rollout_means = [(sum(vs) / len(vs)) if vs else 0.0 for vs in raw_values]
+
+    # Append to CSV
+    import os
+    write_header = not os.path.exists(log_path)
+    with open(log_path, "a") as f:
+        if write_header:
+            f.write("activation_id,player,unit_idx,dest_idx,dest_col,dest_row,"
+                    "pp_v_dest,rollout_v\n")
+        for d_idx, pp_v, rv, ca in zip(sampled, pp_v_dests, rollout_means,
+                                       candidate_actions):
+            f.write(f"{activation_id},{player},{selected_idx},{d_idx},"
+                    f"{ca[2]},{ca[3]},{pp_v:.6f},{rv:.6f}\n")
+
+
 def plan_activation(
     model: TacticalModel,
     friendly_units: list[UnitState],
@@ -1021,6 +1406,91 @@ def plan_activation(
     _t0 = _time.perf_counter()
 
     params = planning_params or {}
+    # Per-side params: when comparing two configurations head-to-head we
+    # pass {"_per_side_params": {"A": <dict>, "B": <dict>}} so that the
+    # planner picks the right config based on `player`. Falls through to
+    # normal behaviour when the wrapper key isn't present.
+    if "_per_side_params" in params:
+        params = params["_per_side_params"].get(player, params)
+
+    # Dest-override mode: standard inference but for MOVE_MOVE the
+    # destination is replaced by the pp_v_dest top-1 of N random legal
+    # samples. Charge & shoot are re-derived from the new post-move state.
+    _dest_override_n = int(params.get("DEST_OVERRIDE_PP_V_N", 0))
+    if _dest_override_n > 0:
+        return _apply_with_dest_override_pp_v(
+            model, friendly_units, enemy_units, round_num, board, player,
+            num_dests=_dest_override_n,
+            friendly_ranged_matchups=friendly_ranged_matchups,
+            friendly_melee_matchups=friendly_melee_matchups,
+            enemy_ranged_matchups=enemy_ranged_matchups,
+            enemy_melee_matchups=enemy_melee_matchups,
+            total_friendly_points=total_friendly_points,
+            total_enemy_points=total_enemy_points,
+        )
+
+    # Calibration mode: run the dest-value calibration probe as a
+    # side-effect, then delegate the actual decision to the policy via
+    # apply_tactical_model so the game proceeds with the policy's argmax.
+    _cal_n = int(params.get("CALIBRATION_DEST_PROBE", 0))
+    if _cal_n > 0:
+        # Encode state once for the probe (re-encoded inside, but we need it).
+        _state_vec = encode_state_tactical(
+            friendly_units, enemy_units, round_num, board, player,
+            friendly_ranged_matchups=friendly_ranged_matchups,
+            friendly_melee_matchups=friendly_melee_matchups,
+            enemy_ranged_matchups=enemy_ranged_matchups,
+            enemy_melee_matchups=enemy_melee_matchups,
+            total_friendly_points=total_friendly_points,
+            total_enemy_points=total_enemy_points,
+        )
+        _fr_a_use = fr_a if fr_a is not None else (friendly_ranged_matchups if player == "A" else enemy_ranged_matchups)
+        _fm_a_use = fm_a if fm_a is not None else (friendly_melee_matchups if player == "A" else enemy_melee_matchups)
+        _fr_b_use = fr_b if fr_b is not None else (enemy_ranged_matchups if player == "A" else friendly_ranged_matchups)
+        _fm_b_use = fm_b if fm_b is not None else (enemy_melee_matchups if player == "A" else friendly_melee_matchups)
+        _pts_a_use = pts_a if pts_a else (total_friendly_points if player == "A" else total_enemy_points) or 0
+        _pts_b_use = pts_b if pts_b else (total_enemy_points if player == "A" else total_friendly_points) or 0
+
+        # Per-call activation id is taken from a counter file so callers
+        # don't need to thread it; cheap and self-contained.
+        _log = params.get("CALIBRATION_LOG_PATH", "/tmp/dest_calibration.csv")
+        _ctr_path = _log + ".ctr"
+        _aid = 0
+        try:
+            with open(_ctr_path, "r") as _f:
+                _aid = int(_f.read().strip() or "0")
+        except FileNotFoundError:
+            _aid = 0
+        with open(_ctr_path, "w") as _f:
+            _f.write(str(_aid + 1))
+
+        _run_dest_value_calibration(
+            model, _state_vec, friendly_units, enemy_units, round_num, board, player,
+            units_a, units_b, current_is_a, mode,
+            _fr_a_use, _fm_a_use, _fr_b_use, _fm_b_use, _pts_a_use, _pts_b_use,
+            friendly_ranged_matchups, friendly_melee_matchups,
+            enemy_ranged_matchups, enemy_melee_matchups,
+            total_friendly_points, total_enemy_points,
+            num_dests=_cal_n,
+            M=int(params.get("M_ROLLOUTS", DEFAULT_M_ROLLOUTS)),
+            N=int(params.get("N_LOOKAHEAD", DEFAULT_N_LOOKAHEAD)),
+            log_path=_log, activation_id=_aid,
+        )
+
+        # Now return the policy's argmax decision so the game proceeds normally.
+        from ml_integration_tactical import apply_tactical_model as _atm
+        _decision = _atm(
+            model, friendly_units, enemy_units, round_num, board, player,
+            friendly_ranged_matchups=friendly_ranged_matchups,
+            friendly_melee_matchups=friendly_melee_matchups,
+            enemy_ranged_matchups=enemy_ranged_matchups,
+            enemy_melee_matchups=enemy_melee_matchups,
+            total_friendly_points=total_friendly_points,
+            total_enemy_points=total_enemy_points,
+        )
+        # apply_tactical_model returns 7-tuple matching plan_activation's shape.
+        _sel, _rank, _act, _goal, _ct, _reason, _ = _decision
+        return _sel, _rank, _act, _goal, _ct, _reason, []
     K = params.get("K_UNITS", DEFAULT_K_UNITS)
     C = params.get("C_SAMPLES_PER_UNIT", DEFAULT_C_SAMPLES_PER_UNIT)
     M = params.get("M_ROLLOUTS", DEFAULT_M_ROLLOUTS)
@@ -1028,6 +1498,28 @@ def plan_activation(
     num_workers = params.get("NUM_WORKERS", DEFAULT_NUM_WORKERS)
     verbose = params.get("VERBOSE", False)
     parallel = (num_workers != 1)
+    # Diagnostic flags for the policy-vs-planner-with-random-candidates
+    # probe. K_INDEPENDENT_UNIFORM=K bypasses the K_UNITS×C structure
+    # entirely: generates exactly K candidates, each picking a unit
+    # uniformly with replacement from alive units. UNIFORM_ALT_SAMPLING
+    # makes all sub-action sampling (move/dest/charge/shoot) uniform-
+    # over-legal instead of policy's softmax. Defaults preserve normal
+    # eval-time behaviour. See probe_planner_vs_policy.py.
+    k_indep = int(params.get("K_INDEPENDENT_UNIFORM", 0))
+    uniform_alt = bool(params.get("UNIFORM_ALT_SAMPLING", False))
+    # When set with k_indep, the first candidate is forced to be the
+    # policy's joint argmax (argmax unit + argmax sub-actions); the
+    # remaining K-1 are uniform-random as before. K=1 then becomes a
+    # pure-policy mirror baseline.
+    argmax_first = bool(params.get("INCLUDE_ARGMAX_FIRST", False))
+    # When >= 0, splits the non-argmax slots: the first N use policy
+    # multinomial sampling, the remaining use uniform-over-legal. -1
+    # (default) keeps the existing single-mode behaviour driven by
+    # uniform_alt. Use this to construct mixed candidate pools, e.g.
+    # 1 argmax + 9 policy + 30 uniform.
+    n_policy_samples = int(params.get("N_POLICY_SAMPLES", -1))
+    if k_indep > 0 and n_policy_samples < 0:
+        uniform_alt = True  # k_indep without explicit split → all uniform
 
     # Build masks
     alive_mask = torch.tensor(
@@ -1065,12 +1557,27 @@ def plan_activation(
     unit_logits = model.unit_selection_head(h.unsqueeze(0)).squeeze(0)  # (10,)
     unit_logits = unit_logits.masked_fill(~alive_mask, float('-inf'))
 
-    # 2. Select top-K candidate units by probability
+    # 2. Select candidate units. Default: top-K by policy probability.
+    # K_INDEPENDENT_UNIFORM mode: K candidates, each unit picked
+    # uniformly with replacement from alive units.
     unit_probs = torch.softmax(unit_logits, dim=-1)
     num_alive = int(alive_mask.sum().item())
-    k = min(K, num_alive)
-    _, top_indices = torch.topk(unit_probs, k)
-    candidate_units = top_indices.tolist()
+    if k_indep > 0:
+        import random as _random
+        _alive_ids = [i for i in range(alive_mask.shape[-1]) if bool(alive_mask[i])]
+        if argmax_first:
+            argmax_unit_id = int(unit_probs.argmax().item())
+            # First slot = argmax_unit; remaining K-1 slots = uniform random
+            # (with replacement). K=1 collapses to the argmax candidate alone.
+            candidate_units = [argmax_unit_id] + [
+                _random.choice(_alive_ids) for _ in range(k_indep - 1)
+            ]
+        else:
+            candidate_units = [_random.choice(_alive_ids) for _ in range(k_indep)]
+    else:
+        k = min(K, num_alive)
+        _, top_indices = torch.topk(unit_probs, k)
+        candidate_units = top_indices.tolist()
 
     # 3. Precompute per-unit features (trunk pass already done)
     # We'll run conditioned heads manually per sample to respect the chain.
@@ -1108,7 +1615,18 @@ def plan_activation(
         [(i < len(enemy_units) and enemy_units[i].models_alive > 0)
          for i in range(MAX_UNITS_PER_SIDE)], dtype=np.bool_)
 
-    for uid in candidate_units:
+    for _cand_i, uid in enumerate(candidate_units):
+        # Tracks whether THIS slot must use the policy's joint argmax
+        # (only the first slot when k_indep+argmax_first).
+        is_argmax_slot = (k_indep > 0 and argmax_first and _cand_i == 0)
+        # Per-slot routing for mixed pools: when N_POLICY_SAMPLES is set,
+        # the first N non-argmax slots use policy sampling, the rest
+        # uniform. Without it we fall back to the global uniform_alt.
+        if k_indep > 0 and n_policy_samples >= 0 and not is_argmax_slot:
+            _non_argmax_idx = _cand_i - (1 if argmax_first else 0)
+            slot_uniform = (_non_argmax_idx >= n_policy_samples)
+        else:
+            slot_uniform = uniform_alt
         unit = friendly_units[uid]
         max_wr = max(
             (w.range_inches for w in unit.unit.weapons if not w.melee),
@@ -1161,9 +1679,19 @@ def plan_activation(
                 h_uf_m_cand, dest_features_t, dest_mask_t).squeeze(0)
             _dest_cache_move = (cands, cmask, adv_reach, dest_feats_np, dest_logits)
 
-        for sample_i in range(C):
+        # In k_indep mode each candidate_units entry is a fresh independent
+        # candidate, so we draw exactly one sub-action sample per entry.
+        n_samples = 1 if k_indep > 0 else C
+        for sample_i in range(n_samples):
             # 1. Sample move type
-            move_type = int(torch.multinomial(move_probs, 1).item())
+            if is_argmax_slot:
+                move_type = int(move_probs.argmax().item())
+            elif slot_uniform:
+                _legal = torch.isfinite(move_logits).float()
+                _u = _legal / _legal.sum().clamp(min=1)
+                move_type = int(torch.multinomial(_u, 1).item())
+            else:
+                move_type = int(torch.multinomial(move_probs, 1).item())
             move_onehot = F.one_hot(
                 torch.tensor(move_type), NUM_MOVE_TYPES
             ).float().unsqueeze(0)
@@ -1179,9 +1707,16 @@ def plan_activation(
                 cands, cmask, adv_reach, _, dest_logits = _dest_cache_move
                 n_valid = int(cmask.sum())
                 if n_valid > 0:
-                    dest_probs = torch.softmax(dest_logits, dim=-1)
-                    _, top_dest = torch.topk(dest_probs, min(C, n_valid))
-                    pick_idx = top_dest[sample_i % len(top_dest)].item()
+                    if is_argmax_slot:
+                        pick_idx = int(dest_logits.argmax().item())
+                    elif slot_uniform:
+                        _legal = torch.isfinite(dest_logits).float()
+                        _u = _legal / _legal.sum().clamp(min=1)
+                        pick_idx = int(torch.multinomial(_u, 1).item())
+                    else:
+                        dest_probs = torch.softmax(dest_logits, dim=-1)
+                        _, top_dest = torch.topk(dest_probs, min(C, n_valid))
+                        pick_idx = top_dest[sample_i % len(top_dest)].item()
                     dest_col = int(cands[pick_idx, 0])
                     dest_row = int(cands[pick_idx, 1])
                     _pick_ar = bool(adv_reach[pick_idx])
@@ -1201,6 +1736,12 @@ def plan_activation(
             no_chargeable = no_enemies or not (enemy_alive_mask & can_charge_mask).any()
             if no_chargeable:
                 charge_target_idx = 0
+            elif is_argmax_slot:
+                charge_target_idx = int(charge_logits.argmax().item())
+            elif slot_uniform:
+                _legal = (enemy_alive_mask & can_charge_mask).float()
+                _u = _legal / _legal.sum().clamp(min=1)
+                charge_target_idx = int(torch.multinomial(_u, 1).item())
             else:
                 charge_probs = torch.softmax(charge_logits, dim=-1)
                 charge_target_idx = int(torch.multinomial(charge_probs, 1).item())
@@ -1217,6 +1758,12 @@ def plan_activation(
             no_shootable = no_enemies or not shoot_range_mask.any()
             if no_shootable:
                 shoot_target_idx = 0
+            elif is_argmax_slot:
+                shoot_target_idx = int(shoot_logits.argmax().item())
+            elif slot_uniform:
+                _legal = (enemy_alive_mask & shoot_range_mask).float()
+                _u = _legal / _legal.sum().clamp(min=1)
+                shoot_target_idx = int(torch.multinomial(_u, 1).item())
             else:
                 shoot_probs = torch.softmax(shoot_logits, dim=-1)
                 shoot_target_idx = int(torch.multinomial(shoot_probs, 1).item())
@@ -1413,6 +1960,32 @@ def plan_training_activation(
     C = params.get("C_SAMPLES_PER_UNIT", 3)
     M = params.get("M_ROLLOUTS", 4)
     N = params.get("N_LOOKAHEAD", 3)
+    sh_enabled = params.get("SEQUENTIAL_HALVING", False)
+    sh_schedule = tuple(params.get("SH_SCHEDULE", ()))
+    # Diagnostic flag for the uniform-baseline probe. When True, the K-1
+    # non-argmax candidate units are picked uniformly from alive units
+    # (rather than top-K by policy), and all sub-action sampling
+    # (move type / dest / charge / shoot) for non-argmax candidates uses
+    # uniform-over-legal-mask in place of the policy's softmax. The
+    # argmax candidate (ui=0, si=0) is unchanged. Default False — no
+    # behavioural change for normal training/eval.
+    uniform_alt = params.get("UNIFORM_ALT_SAMPLING", False)
+
+    # MPO/distillation extension. Per-slot temperature warming and an
+    # explicit (argmax, policy, temp, uniform) candidate mix. Defaults
+    # preserve legacy behaviour bit-exactly:
+    #   N_POLICY_SAMPLES = -1 → all non-argmax slots are routed by the
+    #     legacy uniform_alt flag (uniform if True, else policy/topk).
+    #   N_POLICY_SAMPLES >= 0 → opt into the explicit mix. Slots are
+    #     filled in order: argmax(1) → policy_τ=1 (N_POLICY_SAMPLES) →
+    #     policy_τ=TAU (N_TEMP_SAMPLES) → remainder uniform-over-legal.
+    # When the explicit mix is active, dest sampling switches from the
+    # legacy topk-cycle to true multinomial (consistent with move/
+    # charge/shoot). TAU only affects "temp" slots; "policy" slots are
+    # always τ=1 regardless of TAU.
+    tau = float(params.get("TAU", 1.0))
+    n_policy_samples = int(params.get("N_POLICY_SAMPLES", -1))
+    n_temp_samples = int(params.get("N_TEMP_SAMPLES", 0))
 
     eps = 1e-8
     no_enemies = not enemy_alive_mask.any()
@@ -1427,6 +2000,15 @@ def plan_training_activation(
         friendly_melee_matchups = fm_b
         enemy_ranged_matchups = fr_a
 
+    # Guard: alive_mask is MAX_UNITS_PER_SIDE wide; `friendly_units` may be
+    # shorter (unit list mutated between request build and planning call).
+    # Clamp any "alive" slots beyond the actual list to False so topk/argmax
+    # cannot select a non-existent unit.
+    n_friendly = len(friendly_units)
+    if n_friendly < alive_mask.shape[-1]:
+        alive_mask = alive_mask.clone()
+        alive_mask[n_friendly:] = False
+
     # --- Single trunk pass ---
     x = state_vec.unsqueeze(0)
     am = alive_mask.unsqueeze(0)
@@ -1439,11 +2021,35 @@ def plan_training_activation(
     # --- Argmax unit (candidate 0) ---
     argmax_unit = int(unit_probs.argmax().item())
 
-    # Select top-K candidate units
+    # Select K candidate units. Default: top-K by policy probability.
+    # Uniform-baseline probe: argmax_unit is forced first, the remaining
+    # K-1 are drawn uniformly from the other alive units.
     num_alive = int(alive_mask.sum().item())
+    if num_alive == 0:
+        # Nothing to plan for — signal "no planning" and let the caller fall
+        # back to the normal inference path on the next inference request.
+        return None
     k = min(K, num_alive)
-    _, top_indices = torch.topk(unit_probs, k)
-    candidate_units = top_indices.tolist()
+    if uniform_alt:
+        import random as _random
+        _alive_ids = [i for i in range(alive_mask.shape[-1])
+                      if bool(alive_mask[i]) and i != argmax_unit]
+        _random.shuffle(_alive_ids)
+        candidate_units = [argmax_unit] + _alive_ids[:k - 1]
+    else:
+        _, top_indices = torch.topk(unit_probs, k)
+        candidate_units = top_indices.tolist()
+
+    # Defense-in-depth: the alive_mask clamp above should guarantee every uid
+    # is < len(friendly_units), but if the unit list was mutated further
+    # between the clamp and here, drop any stragglers. If nothing survives,
+    # bail to the non-planned inference path.
+    n_friendly_now = len(friendly_units)
+    candidate_units = [uid for uid in candidate_units if uid < n_friendly_now]
+    if not candidate_units:
+        return None
+    if argmax_unit >= n_friendly_now:
+        argmax_unit = candidate_units[0]
 
     # Ensure argmax_unit is first; remaining K-1 units are sampled from top-K
     if argmax_unit in candidate_units:
@@ -1524,10 +2130,45 @@ def plan_training_activation(
         for si in range(n_samples):
             # First sample of argmax unit is deterministic; all others are sampled
             is_argmax_action = (ui == 0 and si == 0)
+
+            # Resolve per-slot sampling mode and temperature.
+            #   "argmax"  — joint argmax (ui=0, si=0).
+            #   "policy"  — multinomial over softmax(logits)        (τ=1).
+            #   "temp"    — multinomial over softmax(logits / tau)  (τ=tau).
+            #   "uniform" — multinomial over uniform-over-legal.
+            # Legacy path: n_policy_samples < 0 keeps every non-argmax slot
+            # driven by the uniform_alt flag, identical to pre-MPO behaviour.
+            # Mix path: n_policy_samples >= 0 routes slots in order
+            #   argmax(1) → policy(N_POLICY) → temp(N_TEMP) → uniform(rest).
             if is_argmax_action:
-                move_type = int(move_probs.argmax().item())
+                sample_mode = "argmax"
+                tau_slot = 1.0
+            elif n_policy_samples < 0:
+                sample_mode = "uniform" if uniform_alt else "policy"
+                tau_slot = 1.0
             else:
-                move_type = int(torch.multinomial(move_probs, 1).item())
+                _na_idx = ui * C + si - 1  # 0-indexed slot among non-argmax
+                if _na_idx < n_policy_samples:
+                    sample_mode = "policy"
+                    tau_slot = 1.0
+                elif _na_idx < n_policy_samples + n_temp_samples:
+                    sample_mode = "temp"
+                    tau_slot = tau
+                else:
+                    sample_mode = "uniform"
+                    tau_slot = 1.0
+
+            if sample_mode == "argmax":
+                move_type = int(move_probs.argmax().item())
+            elif sample_mode == "uniform":
+                _legal = torch.isfinite(move_logits).float()
+                _u = _legal / _legal.sum().clamp(min=1)
+                move_type = int(torch.multinomial(_u, 1).item())
+            else:  # "policy" (τ=1) or "temp" (τ=tau)
+                move_probs_slot = (
+                    move_probs if tau_slot == 1.0
+                    else torch.softmax(move_logits / tau_slot, dim=-1))
+                move_type = int(torch.multinomial(move_probs_slot, 1).item())
 
             move_onehot = F.one_hot(
                 torch.tensor(move_type), NUM_MOVE_TYPES
@@ -1538,17 +2179,29 @@ def plan_training_activation(
             unit_cx, unit_cy = friendly_positions[uid]
             dest_col, dest_row = int(round(unit_cx)), int(round(unit_cy))
             _pick_ar = True  # advance-reachable for selected dest
+            pick_idx = -1    # dest candidate index (MOVE_MOVE only)
 
             if move_type == MOVE_MOVE and _dest_cache_move is not None:
                 cands, cmask, adv_reach, dest_logits = _dest_cache_move
                 n_valid = int(cmask.sum())
                 if n_valid > 0:
-                    if is_argmax_action:
+                    if sample_mode == "argmax":
                         pick_idx = int(dest_logits.argmax().item())
-                    else:
+                    elif sample_mode == "uniform":
+                        _legal = torch.isfinite(dest_logits).float()
+                        _u = _legal / _legal.sum().clamp(min=1)
+                        pick_idx = int(torch.multinomial(_u, 1).item())
+                    elif n_policy_samples < 0:
+                        # Legacy policy branch: deterministic topk cycle.
+                        # Preserved bit-exactly when not in mix mode.
                         dest_probs = torch.softmax(dest_logits, dim=-1)
                         _, top_dest = torch.topk(dest_probs, min(C, n_valid))
                         pick_idx = top_dest[si % len(top_dest)].item()
+                    else:
+                        # Mix mode: true multinomial with per-slot τ.
+                        dest_probs_slot = torch.softmax(
+                            dest_logits / tau_slot, dim=-1)
+                        pick_idx = int(torch.multinomial(dest_probs_slot, 1).item())
                     dest_col = int(cands[pick_idx, 0])
                     dest_row = int(cands[pick_idx, 1])
                     _pick_ar = bool(adv_reach[pick_idx])
@@ -1568,12 +2221,17 @@ def plan_training_activation(
             no_chargeable = no_enemies or not (enemy_alive_mask & can_charge_mask).any()
             if no_chargeable:
                 charge_target_idx = 0
-            elif is_argmax_action:
+            elif sample_mode == "argmax":
                 charge_target_idx = int(charge_logits.argmax().item())
-            else:
-                charge_probs = torch.softmax(charge_logits, dim=-1)
+            elif sample_mode == "uniform":
+                _legal = (enemy_alive_mask & can_charge_mask).float()
+                _u = _legal / _legal.sum().clamp(min=1)
+                charge_target_idx = int(torch.multinomial(_u, 1).item())
+            else:  # "policy" (τ=1) or "temp" (τ=tau)
+                charge_probs_slot = torch.softmax(
+                    charge_logits / tau_slot, dim=-1)
                 charge_target_idx = int(
-                    torch.multinomial(charge_probs, 1).item())
+                    torch.multinomial(charge_probs_slot, 1).item())
 
             # Shoot target (pointer head)
             post_move_rel = compute_post_move_rel(
@@ -1588,12 +2246,17 @@ def plan_training_activation(
             no_shootable = no_enemies or not shoot_range_mask.any()
             if no_shootable:
                 shoot_target_idx = 0
-            elif is_argmax_action:
+            elif sample_mode == "argmax":
                 shoot_target_idx = int(shoot_logits.argmax().item())
-            else:
-                shoot_probs = torch.softmax(shoot_logits, dim=-1)
+            elif sample_mode == "uniform":
+                _legal = (enemy_alive_mask & shoot_range_mask).float()
+                _u = _legal / _legal.sum().clamp(min=1)
+                shoot_target_idx = int(torch.multinomial(_u, 1).item())
+            else:  # "policy" (τ=1) or "temp" (τ=tau)
+                shoot_probs_slot = torch.softmax(
+                    shoot_logits / tau_slot, dim=-1)
                 shoot_target_idx = int(
-                    torch.multinomial(shoot_probs, 1).item())
+                    torch.multinomial(shoot_probs_slot, 1).item())
 
             target_ranking = torch.argsort(
                 shoot_logits, descending=True).tolist()
@@ -1631,19 +2294,15 @@ def plan_training_activation(
                 uid, move_type, dest_col, dest_row, target_ranking,
                 charge_target_idx, shoot_target_idx,
                 action_str, goal, ct_idx, reason, will_not_shoot,
+                pick_idx,
             ))
             candidate_to_unit.append(uid)
             candidate_shoot_masks.append(shoot_range_mask)
 
     if not candidate_actions:
-        # Fallback: impossible edge case, return policy argmax with no planning
-        from ml_training import sample_tactical_actions_no_grad
-        result = sample_tactical_actions_no_grad(
-            model, state_vec, alive_mask, enemy_alive_mask,
-            friendly_positions, enemy_positions,
-            advance_distances, rush_distances, max_weapon_ranges,
-        )
-        return result + (False, False, 0.0, None, None)
+        # Fallback: impossible edge case — signal "no planning" so the caller
+        # falls back to the normal inference path on the next request.
+        return None
 
     # --- Evaluate candidates via rollouts (single-threaded) ---
     friendly_is_a = (player == "A")
@@ -1656,15 +2315,75 @@ def plan_training_activation(
         units_a_list = list(enemy_units)
         units_b_list = list(friendly_units)
 
-    state_bytes = pickle.dumps((
+    # Training-time planning is always in-process (shared-memory worker pool),
+    # so we keep live references and clone per rollout instead of pickling the
+    # entire state tree. state_bytes remains empty — the live_state kwarg gates
+    # the fast path inside _run_chunk_batched_raw.
+    live_state = (
         units_a_list, units_b_list, board,
         fr_a, fm_a, fr_b, fm_b, pts_a, pts_b,
-    ))
+    )
+    state_bytes = b""
 
-    avg_values = _run_chunk_batched((
-        state_bytes, candidate_actions, M, N, round_num, mode, player,
-        friendly_is_a, current_is_a,
-    ), model_override=model)
+    use_sh = (sh_enabled
+              and len(sh_schedule) >= 1
+              and sum(sh_schedule) == M
+              and len(candidate_actions) > 1)
+
+    if use_sh:
+        # Sequential halving with dummy-candidate padding to a fixed pool size.
+        # Dummies have -inf value and sort to the bottom, absorbing early cuts
+        # when the real candidate count is small. Argmax (candidate 0) is
+        # protected from elimination so the planning_improved comparison always
+        # has a full-M estimate on both sides.
+        PAD = 9
+        n_real = len(candidate_actions)
+        is_real = [ci < n_real for ci in range(PAD)]
+        per_cand_values: list[list[float]] = [[] for _ in range(PAD)]
+        alive: list[int] = list(range(PAD))
+        argmax_ci = 0
+
+        def _mean_for(ci: int) -> float:
+            if not is_real[ci]:
+                return float('-inf')
+            vs = per_cand_values[ci]
+            return (sum(vs) / len(vs)) if vs else float('-inf')
+
+        for phase_i, phase_m in enumerate(sh_schedule):
+            real_alive = [ci for ci in alive if is_real[ci]]
+            if real_alive and phase_m > 0:
+                real_actions = [candidate_actions[ci] for ci in real_alive]
+                raw = _run_chunk_batched_raw((
+                    state_bytes, real_actions, phase_m, N, round_num, mode, player,
+                    friendly_is_a, current_is_a,
+                ), model_override=model, live_state=live_state)
+                for local_i, ci in enumerate(real_alive):
+                    per_cand_values[ci].extend(raw[local_i])
+
+            is_last_phase = (phase_i == len(sh_schedule) - 1)
+            if not is_last_phase:
+                n_alive = len(alive)
+                n_drop = (n_alive + 1) // 2  # ceil(n_alive / 2)
+                ranked = sorted(alive, key=_mean_for, reverse=True)
+                survivors = ranked[:n_alive - n_drop]
+                # Argmax immunity: swap it in for the worst survivor if excluded
+                if argmax_ci in alive and argmax_ci not in survivors:
+                    survivors = survivors[:-1] + [argmax_ci]
+                alive = survivors
+
+        avg_values = [
+            (sum(per_cand_values[ci]) / len(per_cand_values[ci]))
+            if per_cand_values[ci] else 0.0
+            for ci in range(n_real)
+        ]
+    else:
+        raw_values = _run_chunk_batched_raw((
+            state_bytes, candidate_actions, M, N, round_num, mode, player,
+            friendly_is_a, current_is_a,
+        ), model_override=model, live_state=live_state)
+        avg_values = [
+            (sum(vs) / len(vs)) if vs else 0.0 for vs in raw_values
+        ]
 
     # --- Identify argmax candidate(s) and compute per-unit average values ---
     # The first candidate(s) belong to the argmax unit (could be just 1)
@@ -1692,6 +2411,8 @@ def plan_training_activation(
     charge_value_counts: dict[tuple[int, int], int] = {}
     shoot_value_sums: dict[tuple[int, int], float] = {}
     shoot_value_counts: dict[tuple[int, int], int] = {}
+    dest_value_sums: dict[tuple[int, int], float] = {}
+    dest_value_counts: dict[tuple[int, int], int] = {}
     for ci, (uid_ci, val_ci) in enumerate(
             zip(candidate_to_unit, avg_values)):
         ca = candidate_actions[ci]
@@ -1711,6 +2432,12 @@ def plan_training_activation(
                 key_st = (uid_ci, st)
                 shoot_value_sums[key_st] = shoot_value_sums.get(key_st, 0.0) + val_ci
                 shoot_value_counts[key_st] = shoot_value_counts.get(key_st, 0) + 1
+        if mt == MOVE_MOVE:
+            dci = ca[12]  # dest candidate idx
+            if dci >= 0:
+                key_dc = (uid_ci, dci)
+                dest_value_sums[key_dc] = dest_value_sums.get(key_dc, 0.0) + val_ci
+                dest_value_counts[key_dc] = dest_value_counts.get(key_dc, 0) + 1
 
     # --- Selection: compare argmax vs best non-argmax ---
     best_search_idx = argmax_cand_idx
@@ -1780,6 +2507,18 @@ def plan_training_activation(
                     planning_shoot_values.append(
                         shoot_value_sums[key] / cnt)
 
+    # Dest distillation: per-candidate average values for the chosen unit.
+    # Only meaningful when the chosen move type is MOVE_MOVE (the dest head
+    # is the destination pointer conditioned on move_type=move).
+    planning_dest_indices: list[int] = []
+    planning_dest_values: list[float] = []
+    if chosen_move_type == MOVE_MOVE:
+        for key, cnt in dest_value_counts.items():
+            if key[0] == chosen_uid:
+                planning_dest_indices.append(key[1])
+                planning_dest_values.append(
+                    dest_value_sums[key] / cnt)
+
     # --- Compute old_log_prob: π_policy(a_chosen | s) ---
     # Re-use trunk output already computed; run conditioned heads for the
     # chosen action to get the policy's sampling log-prob.
@@ -1809,6 +2548,9 @@ def plan_training_activation(
     # Destination pointer log-prob (categorical over candidate hexes)
     dest_lp = 0.0
     _chosen_ar = True  # advance-reachable for chosen dest
+    cands_ch = None
+    adv_reach_ch = None
+    chosen_cand_idx = -1
     if chosen_move_type == MOVE_MOVE:
         # Recompute candidates for the chosen unit
         chosen_unit = friendly_units[chosen_uid]
@@ -1905,9 +2647,20 @@ def plan_training_activation(
     shoot_mask_list = ch_shoot_mask.tolist()
     pmr_list = ch_pmr.tolist()
 
+    # Dest candidate data for replay (only populated when MOVE_MOVE).
+    # Unpadded: compute_destination_candidates returns tight (n_valid, *) arrays.
+    if chosen_move_type == MOVE_MOVE and cands_ch is not None:
+        dest_candidates_out = cands_ch
+        dest_advance_reachable_out = adv_reach_ch.tolist()
+        dest_selected_idx_out = chosen_cand_idx
+    else:
+        dest_candidates_out = None
+        dest_advance_reachable_out = None
+        dest_selected_idx_out = -1
+
     return (
         chosen_uid, chosen_move_type, chosen_dest_col, chosen_dest_row,
-        0,  # dest_cand_idx (planning picks best candidate, default 0)
+        dest_selected_idx_out,  # dest_cand_idx (real index into candidates)
         chosen_charge_tgt, chosen_shoot_tgt, chosen_ranking,
         pmr_list, old_log_prob, value_est, shoot_mask_list,
         True,  # was_planned
@@ -1921,4 +2674,8 @@ def plan_training_activation(
         planning_charge_indices or None,
         planning_shoot_values or None,
         planning_shoot_indices or None,
+        planning_dest_values or None,
+        planning_dest_indices or None,
+        dest_candidates_out,
+        dest_advance_reachable_out,
     )

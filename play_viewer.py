@@ -658,7 +658,7 @@ class PlayViewer:
         elif self.phase == PHASE_CHARGE_TARGET:
             # Highlight chargeable enemies
             if owner == "B" and unit.models_alive > 0 and self._active_unit is not None:
-                if _can_charge(self._active_unit, unit):
+                if _can_charge(self._active_unit, unit, self.board):
                     return _HIGHLIGHT_CHARGE
 
         elif self.phase == PHASE_SHOOT_TARGET:
@@ -909,7 +909,7 @@ class PlayViewer:
             can_charge = False
             if self._active_unit is not None and not is_shaken:
                 for enemy in self.units_b:
-                    if enemy.models_alive > 0 and _can_charge(self._active_unit, enemy):
+                    if enemy.models_alive > 0 and _can_charge(self._active_unit, enemy, self.board):
                         can_charge = True
                         break
             ttk.Button(self.btn_frame, text="Hold", command=lambda: self._choose_action("hold")).pack(side=tk.LEFT, padx=3)
@@ -1158,7 +1158,7 @@ class PlayViewer:
             if clicked_unit is not None and self.owners[clicked_unit] == "B":
                 target = self.all_units[clicked_unit]
                 if target.models_alive > 0 and self._active_unit is not None:
-                    if _can_charge(self._active_unit, target):
+                    if _can_charge(self._active_unit, target, self.board):
                         self._charge_target = target
                         self._info_click_unit = clicked_unit
                         # Preview charge position
@@ -1704,12 +1704,20 @@ class PlayViewer:
 
         # Diagnostic: log AI activation with value delta
         ai_value_after = self._get_value_estimate("B")
+        ai_shoot_name = None
+        if result.shoot_target is not None:
+            ai_shoot_name = self.labels[self.unit_to_idx[id(result.shoot_target)]]
+        ai_charge_name = None
+        if result.charge_target is not None:
+            ai_charge_name = self.labels[self.unit_to_idx[id(result.charge_target)]]
         self._diag_log.append(_ActivationDiag(
             frame_idx=len(self.frames),
             round_num=self.round_num + 1,
             player="B",
             unit_name=self.labels[active_idx],
             action=ml_action,
+            shoot_target_name=ai_shoot_name,
+            charge_target_name=ai_charge_name,
             value_before=ai_value_before,
             value_after=ai_value_after,
         ))

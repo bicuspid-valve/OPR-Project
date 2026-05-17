@@ -101,7 +101,7 @@ def timed_game_with_breakdown():
                 my_units, opp_units = units_b, units_a
 
             t0 = time.perf_counter()
-            ordered = activation_order(my_units, enemies=opp_units, mode="objectives")
+            ordered = activation_order(my_units, enemies=opp_units, mode="objectives", board=board)
             timers["activation_order"] += time.perf_counter() - t0
             counts["activation_order"] += 1
             active = ordered[0] if ordered else None
@@ -228,7 +228,7 @@ def timed_game_with_breakdown():
                         active.shaken = False
                     else:
                         t0 = time.perf_counter()
-                        target = pick_target(active, opp_units)
+                        target = pick_target(active, opp_units, board=board)
                         timers["pick_target"] += time.perf_counter() - t0
                         counts["pick_target"] += 1
                         if target is not None:
@@ -250,7 +250,7 @@ def timed_game_with_breakdown():
                     active.shaken = False
                 else:
                     t0 = time.perf_counter()
-                    target = pick_target(active, opp_units)
+                    target = pick_target(active, opp_units, board=board)
                     timers["pick_target"] += time.perf_counter() - t0
                     counts["pick_target"] += 1
                     if target is not None:

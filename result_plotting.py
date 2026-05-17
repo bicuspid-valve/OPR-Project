@@ -13,6 +13,7 @@ Defaults:
 import csv
 import sys
 import pathlib
+from datetime import datetime
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -27,23 +28,55 @@ def load_csv(path: str) -> dict[str, np.ndarray]:
         reader = csv.DictReader(f)
         headers = reader.fieldnames
         columns = {h: [] for h in headers}
+        timestamps: list = []
+        session_start: list = []
+        next_is_session_start = True  # first data row starts a session
         for row in reader:
-            # Skip non-data rows (e.g. "Training started" marker)
+            # Skip non-data rows (e.g. "Training started"/"Training finished").
+            # Any non-data row marks a session boundary — the next real batch
+            # is the first of a new session and its wall-time delta to the
+            # previous batch spans a shutdown/restart gap.
             try:
                 float(row["batch"])
             except (ValueError, TypeError):
+                next_is_session_start = True
                 continue
             for h in headers:
                 try:
                     columns[h].append(float(row[h]))
                 except (ValueError, TypeError):
                     columns[h].append(float("nan"))
+            try:
+                ts = datetime.fromisoformat(row["timestamp"])
+            except (ValueError, KeyError, TypeError):
+                ts = None
+            timestamps.append(ts)
+            session_start.append(next_is_session_start)
+            next_is_session_start = False
     # Convert to arrays and sort by batch
     for h in headers:
         columns[h] = np.array(columns[h])
     order = np.argsort(columns["batch"])
     for h in headers:
         columns[h] = columns[h][order]
+    ts_sorted = [timestamps[i] for i in order]
+    ss_sorted = [session_start[i] for i in order]
+
+    # Derive per-batch wall time (seconds) from consecutive timestamps.
+    # NaN for the first batch overall and for the first batch of each
+    # resumed session, since that delta spans the inter-session gap.
+    n = len(ts_sorted)
+    bt = np.full(n, np.nan)
+    for i in range(1, n):
+        if ss_sorted[i]:
+            continue
+        t_prev, t_cur = ts_sorted[i - 1], ts_sorted[i]
+        if t_prev is None or t_cur is None:
+            continue
+        dt = (t_cur - t_prev).total_seconds()
+        if dt >= 0:
+            bt[i] = dt
+    columns["batch_time_derived"] = bt
     return columns
 
 
@@ -75,13 +108,13 @@ def main():
     n = len(data["batch"])
     print(f"Loaded {n} batches from {path.name}")
 
-    fig = plt.figure(figsize=(16, 34))
+    fig = plt.figure(figsize=(16, 50))
     fig.suptitle(
         f"Tactical Training Dashboard  (block avg = {block_size} batches)",
         fontsize=14,
         fontweight="bold",
     )
-    gs = GridSpec(8, 2, figure=fig, hspace=0.45, wspace=0.28)
+    gs = GridSpec(12, 2, figure=fig, hspace=0.45, wspace=0.28)
 
     # --- Panel 1: Win rates vs heuristic ---
     ax1 = fig.add_subplot(gs[0, 0])
@@ -147,37 +180,59 @@ def main():
     ax5.set_ylim(bottom=0)
     ax5.grid(alpha=0.3)
 
-    # --- Panel 6: Entropy (aggregate + per-head) ---
+    # --- Panel 6: Overall Policy Entropy ---
     ax6 = fig.add_subplot(gs[2, 1])
     bx, by = block_average(data, "mean_entropy", block_size)
-    ax6.plot(bx, by, marker="o", markersize=3, linewidth=2.0, color="#8E44AD", label="Total")
-    ent_cols = [c for c in data if c.startswith("ent_")]
-    if ent_cols:
-        bold_palette = [
-            "#E6194B",  # red
-            "#3CB44B",  # green
-            "#0082C8",  # blue
-            "#F58231",  # orange
-            "#911EB4",  # purple
-            "#00CED1",  # dark turquoise
-            "#F032E6",  # magenta
-            "#BFEF45",  # lime
-            "#000075",  # navy
-            "#9A6324",  # brown
-        ]
-        for i, col in enumerate(ent_cols):
-            head_name = col.replace("ent_", "")
-            bx, by = block_average(data, col, block_size)
-            ax6.plot(bx, by, linewidth=1.6,
-                     color=bold_palette[i % len(bold_palette)],
-                     label=head_name)
-        ax6.legend(fontsize=7, ncol=3)
+    ax6.plot(bx, by, marker="o", markersize=3, linewidth=2.0, color="#8E44AD")
     ax6.set_ylabel("Entropy")
-    ax6.set_title("Policy Entropy (per head)")
+    ax6.set_title("Overall Policy Entropy")
+    ax6.set_ylim(bottom=0)
     ax6.grid(alpha=0.3)
 
+    # --- Panel 6b: Per-head Entropy with target reference lines ---
+    # Targets mirror config.py / entropy.py:
+    #   entropy_target_fraction = 0.25      (masked categoricals: unit, charge, shoot)
+    #   entropy_target_move     = 0.25·ln 2 (fixed, ~0.173)
+    #   entropy_target_dest_fraction = 0.25 of ln(N_valid) — raw target varies.
+    # For unit/charge/shoot the per-sample target = 0.25·ln(N_legal); the dashed
+    # line is the upper bound at N_legal = 10 (all units alive / all enemies
+    # alive / all targets in range), so actual targets are usually lower.
+    _frac = 0.25
+    _ln10 = float(np.log(10))
+    _ln2 = float(np.log(2))
+    _per_head = [
+        ("unit",   _frac * _ln10, "#E6194B", "target (N=10 upper bound)"),
+        ("move",   _frac * _ln2,  "#3CB44B", "target (0.25·ln 2)"),
+        ("dest",   None,          "#0082C8", None),
+        ("charge", _frac * _ln10, "#F58231", "target (N=10 upper bound)"),
+        ("shoot",  _frac * _ln10, "#911EB4", "target (N=10 upper bound)"),
+    ]
+    sub6b = gs[3:5, :].subgridspec(3, 2, hspace=0.5, wspace=0.2)
+    for _i, (_head, _tgt, _color, _tgt_label) in enumerate(_per_head):
+        _row, _col_i = divmod(_i, 2)
+        _ax = fig.add_subplot(sub6b[_row, _col_i])
+        _col = f"ent_{_head}"
+        if _col in data:
+            _bx, _by = block_average(data, _col, block_size)
+            _ax.plot(_bx, _by, linewidth=1.5, color=_color, label=_head)
+        if _tgt is not None:
+            _ax.axhline(_tgt, color="black", linestyle="--",
+                        linewidth=0.9, alpha=0.6, label=_tgt_label)
+        if _head == "dest":
+            _ax.text(0.5, 0.97,
+                     "target = 0.25·ln(N_valid)\n(N_valid not logged)",
+                     transform=_ax.transAxes, ha="center", va="top",
+                     fontsize=7, color="gray")
+        _ax.set_title(f"ent_{_head}", fontsize=10)
+        _ax.set_xlabel("Batch", fontsize=8)
+        if _col_i == 0:
+            _ax.set_ylabel("Entropy")
+        _ax.set_ylim(bottom=0)
+        _ax.grid(alpha=0.3)
+        _ax.legend(fontsize=7, loc="best")
+
     # --- Panel 7: Per-opponent-type value estimates ---
-    ax7 = fig.add_subplot(gs[3, 0])
+    ax7 = fig.add_subplot(gs[5, 0])
     _val_series = [
         ("val_heuristic",  "vs Heuristic",          "#534AB7"),
         ("val_sp_mirror",  "vs Self (mirror)",       "#1D9E75"),
@@ -201,42 +256,67 @@ def main():
     ax7.set_title("Opponent-Conditioned Value Estimates")
     ax7.grid(alpha=0.3)
 
-    # --- Panel 8: Planning metrics ---
-    ax8 = fig.add_subplot(gs[3, 1])
-    _has_plan = "plan_improve_rate" in data
+    # --- Panel 8: Planning distill losses ---
+    ax8 = fig.add_subplot(gs[5, 1])
+    _has_plan = "plan_distill_loss" in data
     if _has_plan:
-        bx, by = block_average(data, "plan_improve_rate", block_size)
-        ax8.plot(bx, by, marker="o", markersize=2, linewidth=1.5,
-                 color="#2E86C1", label="Improvement rate")
-        ax8.set_ylabel("Improvement Rate", color="#2E86C1")
-        ax8.set_ylim(-0.05, 1.05)
-        ax8.legend(fontsize=8, loc="upper left")
-
-        if "plan_distill_loss" in data:
-            ax8b = ax8.twinx()
-            bx2, by2 = block_average(data, "plan_distill_loss", block_size)
-            ax8b.plot(bx2, by2, marker="s", markersize=2, linewidth=1.3,
-                      color="#C0392B", alpha=0.8, label="Distill loss (total)")
-            # Sub-head breakdown (if available)
-            _dl_colors = {"unit": "#E74C3C", "move": "#F39C12",
-                          "charge": "#8E44AD", "shoot": "#27AE60"}
-            for _dlk, _dlc in _dl_colors.items():
-                _col = f"plan_dl_{_dlk}"
-                if _col in data:
-                    _bx, _by = block_average(data, _col, block_size)
-                    ax8b.plot(_bx, _by, linewidth=1.0, alpha=0.6,
-                              color=_dlc, label=f"DL {_dlk}")
-            ax8b.set_ylabel("Distill Loss", color="#C0392B")
-            ax8b.legend(fontsize=7, loc="upper right")
+        bx, by = block_average(data, "plan_distill_loss", block_size)
+        ax8.plot(bx, by, marker="s", markersize=2, linewidth=1.3,
+                 color="#C0392B", alpha=0.8, label="Distill loss (total)")
+        # Sub-head breakdown (if available)
+        _dl_colors = {"unit": "#E74C3C", "move": "#F39C12",
+                      "charge": "#8E44AD", "shoot": "#27AE60",
+                      "dest": "#1ABC9C"}
+        for _dlk, _dlc in _dl_colors.items():
+            _col = f"plan_dl_{_dlk}"
+            if _col in data:
+                _bx, _by = block_average(data, _col, block_size)
+                ax8.plot(_bx, _by, linewidth=1.0, alpha=0.6,
+                         color=_dlc, label=f"DL {_dlk}")
+        ax8.set_ylabel("Distill Loss")
+        ax8.legend(fontsize=7, ncol=2)
     else:
         ax8.text(0.5, 0.5, "plan_* columns not in CSV\n(older log format)",
                  transform=ax8.transAxes, ha="center", va="center",
                  fontsize=10, color="gray")
-    ax8.set_title("Planning Metrics")
+    ax8.set_title("Planning Distill Losses")
     ax8.grid(alpha=0.3)
 
+    # --- Panel 8b: Plan improvement rate & mean V-delta ---
+    # Twin-axis because the two series live on different scales:
+    # improve_rate is a fraction in [0, 1]; mean_vdelta is a value-scale
+    # quantity typically ~0.05–0.10. Plotted together because they jointly
+    # characterize planner quality: rate = how often planning helps,
+    # v-delta = by how much when it does.
+    ax8c = fig.add_subplot(gs[6, :])
+    _has_improve = "plan_improve_rate" in data
+    if _has_improve:
+        bx, by = block_average(data, "plan_improve_rate", block_size)
+        ax8c.plot(bx, by, marker="o", markersize=2, linewidth=1.5,
+                  color="#2E86C1", label="Improvement rate")
+        ax8c.set_ylabel("Improvement Rate", color="#2E86C1")
+        ax8c.set_ylim(-0.05, 1.05)
+        ax8c.tick_params(axis="y", labelcolor="#2E86C1")
+        ax8c.legend(fontsize=8, loc="upper left")
+        if "plan_mean_vdelta" in data:
+            ax8d = ax8c.twinx()
+            bx2, by2 = block_average(data, "plan_mean_vdelta", block_size)
+            ax8d.plot(bx2, by2, marker="s", markersize=2, linewidth=1.3,
+                      color="#E67E22", alpha=0.85, label="Mean V-delta")
+            ax8d.set_ylabel("Mean V-delta", color="#E67E22")
+            ax8d.tick_params(axis="y", labelcolor="#E67E22")
+            ax8d.legend(fontsize=8, loc="upper right")
+    else:
+        ax8c.text(0.5, 0.5,
+                  "plan_improve_rate not in CSV\n(older log format)",
+                  transform=ax8c.transAxes, ha="center", va="center",
+                  fontsize=10, color="gray")
+    ax8c.set_title("Plan Improvement Rate & Mean V-Delta")
+    ax8c.set_xlabel("Batch")
+    ax8c.grid(alpha=0.3)
+
     # --- Panel 9: A/B Side Symmetry ---
-    ax9a = fig.add_subplot(gs[4, 0])
+    ax9a = fig.add_subplot(gs[7, 0])
     _has_side_wr = "wr_side_a" in data and "wr_side_b" in data
     if _has_side_wr:
         bx, by = block_average(data, "wr_side_a", block_size)
@@ -256,7 +336,7 @@ def main():
     ax9a.set_ylim(0.2, 0.8)
     ax9a.grid(alpha=0.3)
 
-    ax9b = fig.add_subplot(gs[4, 1])
+    ax9b = fig.add_subplot(gs[7, 1])
     _has_side_val = "val_side_a" in data and "val_side_b" in data
     if _has_side_val:
         bx_a, by_a = block_average(data, "val_side_a", block_size)
@@ -286,7 +366,7 @@ def main():
     # Primary comparison: ML vs heuristic from the SAME heuristic-opponent games
     # (ml_h_* columns). All-games ML metric (shoot/charge_eff_reward) shown
     # as faint dotted lines for reference.
-    ax10_dest = fig.add_subplot(gs[5, :])
+    ax10_dest = fig.add_subplot(gs[8, :])
     _has_eff = False
     if "ml_h_shoot_eff" in data:
         bx, by = block_average(data, "ml_h_shoot_eff", block_size)
@@ -324,7 +404,7 @@ def main():
     ax10_dest.grid(alpha=0.3)
 
     # --- Panel 11: Per-head alpha coefficients (full width) ---
-    ax10 = fig.add_subplot(gs[6, :])
+    ax10 = fig.add_subplot(gs[9, :])
     alpha_cols = [c for c in data if c.startswith("alpha_")]
     colors10 = plt.cm.Set2(np.linspace(0, 1, len(alpha_cols)))
     for col, color in zip(alpha_cols, colors10):
@@ -354,7 +434,7 @@ def main():
     ]
     _has_pp = any(lcol in data for lcol, _, _, _ in pp_phase_cols)
 
-    ax_pp_loss = fig.add_subplot(gs[7, 0])
+    ax_pp_loss = fig.add_subplot(gs[10, 0])
     if _has_pp:
         # Main value loss as a reference — per-phase V heads are trained
         # against the same target and *should* converge toward this curve.
@@ -382,7 +462,7 @@ def main():
     ax_pp_loss.set_ylim(bottom=0)
     ax_pp_loss.grid(alpha=0.3)
 
-    ax_pp_mean = fig.add_subplot(gs[7, 1])
+    ax_pp_mean = fig.add_subplot(gs[10, 1])
     if _has_pp:
         # mean_reward as a reference — the target the heads should approach.
         if "mean_reward" in data:
@@ -408,6 +488,31 @@ def main():
     ax_pp_mean.set_title("Per-Phase Value Head Mean Output")
     ax_pp_mean.set_xlabel("Batch")
     ax_pp_mean.grid(alpha=0.3)
+
+    # --- Panel 13: Batch wall time (full width) ---
+    # Derived from consecutive row timestamps; first batch of each session
+    # is NaN so inter-session shutdown/restart gaps don't show up as spikes.
+    ax_bt = fig.add_subplot(gs[11, :])
+    bt = data.get("batch_time_derived")
+    if bt is not None and np.isfinite(bt).any():
+        bx, by = block_average(data, "batch_time_derived", block_size)
+        ax_bt.plot(bx, by, marker="o", markersize=2, linewidth=1.5,
+                   color="#16A085", label=f"Block mean ({block_size} batches)")
+        finite = bt[np.isfinite(bt)]
+        if finite.size:
+            med = float(np.median(finite))
+            ax_bt.axhline(med, color="black", linestyle="--", linewidth=0.8,
+                          alpha=0.5, label=f"Overall median ({med:.1f}s)")
+        ax_bt.legend(fontsize=8)
+    else:
+        ax_bt.text(0.5, 0.5, "no parseable timestamps",
+                   transform=ax_bt.transAxes, ha="center", va="center",
+                   fontsize=10, color="gray")
+    ax_bt.set_ylabel("Seconds / batch")
+    ax_bt.set_xlabel("Batch")
+    ax_bt.set_title("Batch Wall Time (derived from timestamps, session gaps masked)")
+    ax_bt.set_ylim(bottom=0)
+    ax_bt.grid(alpha=0.3)
 
     # Enable minor gridlines on all panels for readability
     for ax in fig.get_axes():

@@ -10,6 +10,10 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Reduce CUDA allocator fragmentation — keep before torch's first CUDA init.
+# setdefault so a user-provided value still wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from models import ArmyList, resolve_entry
 from templates import get_templates_dict
 from concurrent.futures import ProcessPoolExecutor
@@ -90,8 +94,12 @@ def format_army(army: ArmyList, mode: str = "objectives",
 
 
 def unit_frequency_analysis(population: list[ArmyList], top_n: int = 30,
-                            mode: str = "objectives"):
+                            mode: str = "objectives",
+                            faction_filter: str = ""):
     ranked = sorted(population, key=lambda a: a.fitness, reverse=True)[:top_n]
+    td_all = get_templates_dict()
+    template_ids = ([tid for tid, t in td_all.items() if t.faction == faction_filter]
+                    if faction_filter else list(td_all.keys()))
 
     # Unit type frequency
     unit_counts: dict[str, list[int]] = {}  # template_id -> [count per list]
@@ -128,7 +136,7 @@ def unit_frequency_analysis(population: list[ArmyList], top_n: int = 30,
             urc = unit_role_counts[entry.template_id]
             urc[entry.ai_role] = urc.get(entry.ai_role, 0) + 1
 
-        for tid in get_templates_dict():
+        for tid in template_ids:
             if tid not in unit_counts:
                 unit_counts[tid] = []
             unit_counts[tid].append(seen.get(tid, 0))
@@ -314,8 +322,22 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
          enforce_forceorg: bool = False, use_ml: bool = False,
          ml_batch_tactical: bool = True,
          restart_evolution: bool = True,
-         use_c_ext: bool = True):
+         use_c_ext: bool = True,
+         version: int = 1):
     start_time = time.time()
+
+    # Versioned templates: swap the cached templates data so every module
+    # that imported get_templates_dict from `templates` sees the version-X
+    # roster. File outputs get an _X suffix.
+    suffix = "" if version == 1 else f"_{version}"
+    if version > 1:
+        import importlib
+        import templates as _templates_mod
+        versioned = importlib.import_module(f"templates_{version}")
+        _templates_mod._TEMPLATES = versioned.get_templates()
+        _templates_mod._TEMPLATES_DICT = {t.id: t for t in _templates_mod._TEMPLATES}
+        print(f"Templates: templates_{version}.py "
+              f"({len(_templates_mod._TEMPLATES)} entries)")
 
     # --- C extension setup ---
     import fast_core
@@ -331,14 +353,14 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
         model_path = Path(__file__).resolve().parent / "ml_checkpoints" / "final_model.pt"
         if not model_path.exists():
             raise FileNotFoundError(f"ML model not found: {model_path}")
-        from ml_model_tactical import TacticalModel
-        sd = load_model_state_dict(model_path)
-        test_model = TacticalModel()
-        test_model.load_state_dict(sd, strict=False)
+        # Don't instantiate the model in the parent — that initializes torch's
+        # BLAS/OpenMP threading, and the subsequent fork() into the worker pool
+        # leaves child processes with dead thread handles that deadlock the
+        # first inference call. Workers load the model themselves in
+        # _init_evo_ml_worker, post-fork.
         ml_model_type = "tactical"
-        del test_model
         ml_model_path = str(model_path)
-        print(f"ML model loaded: {ml_model_type} ({model_path.name})")
+        print(f"ML model: {ml_model_type} ({model_path.name})")
 
     mode_label = "Kill Points" if mode == "kill_points" else "Objectives"
     forceorg_label = " | Force Org: ON" if enforce_forceorg else ""
@@ -354,9 +376,26 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
         print(f"Time limit: {TIME_LIMIT} minutes")
     print("=" * 70)
 
-    # Initialize
-    population = [generate_random_army(mode=mode, enforce_forceorg=enforce_forceorg)
-                  for _ in range(POPULATION_SIZE)]
+    # Initialize the multi-faction population:
+    #   - 25 meta-chasers per faction (75 total) seeded with that faction's
+    #     roster; meta-chasers may switch factions later via inheritance.
+    #   - 25 hardcore fans per faction (75 total) locked to that faction
+    #     for the whole run.
+    from evolution import (META_CHASERS, HARDCORE_FANS_PER_FACTION,
+                           FACTIONS, faction_share)
+    population: list[ArmyList] = []
+    meta_per_faction = META_CHASERS // len(FACTIONS)
+    for f in FACTIONS:
+        for _ in range(meta_per_faction):
+            a = generate_random_army(mode=mode, enforce_forceorg=enforce_forceorg,
+                                     faction=f)
+            a.breeder_type = "meta"
+            population.append(a)
+        for _ in range(HARDCORE_FANS_PER_FACTION):
+            a = generate_random_army(mode=mode, enforce_forceorg=enforce_forceorg,
+                                     faction=f)
+            a.breeder_type = f"fan_{f}"
+            population.append(a)
     if use_ml:
         for army in population:
             _restrict_ml_roles(army)
@@ -368,17 +407,41 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
     log_rows: list[dict] = []
     gen_times: list[float] = []
     gen_snapshots: list[list[ArmyList]] = []  # snapshots of populations for baseline mixing
+    from evolution import HOF_PER_FACTION_MAX_SIZE
+    results_dir = Path(__file__).parent / "results"
+
+    def _hof_path(name: str) -> Path:
+        ml_tag = "_ml" if use_ml else ""
+        return results_dir / f"{name}{ml_tag}{suffix}.json"
+
     if restart_evolution:
         hall_of_fame = HallOfFame()
+        per_faction_hofs: dict[str, HallOfFame] = {
+            f: HallOfFame(max_size=HOF_PER_FACTION_MAX_SIZE, faction_filter=f)
+            for f in FACTIONS
+        }
     else:
-        hof_file = "hall_of_fame_ml.json" if use_ml else "hall_of_fame.json"
-        hof_path = Path(__file__).parent / "results" / hof_file
-        hall_of_fame = HallOfFame.load_from_json(hof_path)
+        hof_path = _hof_path("hall_of_fame")
+        hall_of_fame = HallOfFame.load_from_json(hof_path,
+                                                  enforce_forceorg=enforce_forceorg)
         if hall_of_fame.entries:
-            print(f"Loaded Hall of Fame: {len(hall_of_fame.entries)} entries from {hof_file} "
+            print(f"Loaded Hall of Fame: {len(hall_of_fame.entries)} entries "
                   f"(top fitness {hall_of_fame.entries[0].fitness:.3f})")
         else:
             print(f"No existing Hall of Fame found at {hof_path}, starting fresh.")
+        per_faction_hofs = {}
+        for f in FACTIONS:
+            pf_path = _hof_path(f"hall_of_fame_{f}")
+            pf = HallOfFame.load_from_json(pf_path,
+                                            enforce_forceorg=enforce_forceorg)
+            pf.max_size = HOF_PER_FACTION_MAX_SIZE
+            pf.faction_filter = f
+            per_faction_hofs[f] = pf
+            if pf.entries:
+                print(f"Loaded {f.upper()} HoF: {len(pf.entries)} entries "
+                      f"(top fitness {pf.entries[0].fitness:.3f})")
+            else:
+                print(f"No existing {f.upper()} HoF at {pf_path}, starting fresh.")
 
     pool_kwargs: dict = {'max_workers': _WORKER_COUNT}
     if use_ml:
@@ -436,15 +499,31 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
             pool=pool, sample_size=20, use_ml=use_ml,
             ml_batch_tactical=ml_batch_tactical)
 
-        # Hall of Fame evaluation
+        # Hall of Fame evaluation (global + per-faction on the same interval)
         hof_info = None
         if gen % HOF_EVAL_INTERVAL == 0:
             hof_info = hall_of_fame.try_promote(population, mode=mode,
                                                 pool=pool, generation=gen,
                                                 ml_coroutine_batch=(use_ml and not ml_batch_tactical))
+            hof_share = {f: 0 for f in FACTIONS}
+            for entry in hall_of_fame.entries:
+                if entry.army.faction in hof_share:
+                    hof_share[entry.army.faction] += 1
+            hof_share_str = " / ".join(f"{f.upper()} {hof_share[f]}" for f in FACTIONS)
             print(f"--- Hall of Fame: {hof_info['candidates']} evaluated, "
                   f"{hof_info['promoted']} promoted, {hof_info['demoted']} demoted | "
-                  f"{hof_info['size']} members | top {hof_info['top_fitness']:.3f} ---")
+                  f"{hof_info['size']} members | top {hof_info['top_fitness']:.3f} | "
+                  f"Meta: {hof_share_str} ---")
+            # Per-faction HoFs — top 3 of each faction from the whole
+            # population (faction-filtered candidates, faction-internal
+            # round-robin against the existing 15 entries).
+            for f, pf in per_faction_hofs.items():
+                pinfo = pf.try_promote(population, mode=mode, pool=pool,
+                                        generation=gen,
+                                        ml_coroutine_batch=(use_ml and not ml_batch_tactical))
+                print(f"    {f.upper():>3} HoF: {pinfo['candidates']} eval, "
+                      f"{pinfo['promoted']} promoted, {pinfo['demoted']} demoted | "
+                      f"{pinfo['size']} members | top {pinfo['top_fitness']:.3f}")
 
         log_rows.append({
             'generation': gen,
@@ -467,8 +546,11 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
         eft = datetime.now() + timedelta(seconds=est_remaining)
         eft_str = eft.strftime("%H:%M")
 
+        meta_share = faction_share(population, "meta")
+        meta_str = " / ".join(f"{f.upper()} {meta_share[f]}" for f in FACTIONS)
         print(f"Gen {gen:03d} | Best: {best_vs_baseline:.3f} | "
               f"Mean: {mean_vs_baseline:.3f} | "
+              f"Meta: {meta_str} | "
               f"{gen_time:.1f}s | EFT {eft_str}")
 
         if gen % 25 == 0:
@@ -523,12 +605,46 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
                                    mode=mode)
     print(freq)
 
+    # --- Per-faction HoF breakdown ---
+    # Each per-faction HoF gets: top 3 distinct lists + per-faction frequency.
+    # We keep the text per-faction so later sections can write it to disk.
+    per_faction_summary: dict[str, str] = {}
+    per_faction_freq: dict[str, str] = {}
+    for f in FACTIONS:
+        pf = per_faction_hofs.get(f)
+        if pf is None or not pf.entries:
+            continue
+        pf_armies = [e.army for e in pf.entries]
+        top_fit = pf.entries[0].fitness
+        header = (f"\n--- {f.upper()} HALL OF FAME "
+                  f"({len(pf.entries)} members, top {top_fit:.3f}) ---")
+        print(header)
+        seen_pf: set[tuple] = set()
+        shown_pf = 0
+        for army in pf_armies:
+            sig = (army.total_cost, len(army.entries),
+                   tuple(sorted(e.template_id for e in army.entries)))
+            if sig in seen_pf:
+                continue
+            seen_pf.add(sig)
+            print(format_army(army, mode=mode, enforce_forceorg=enforce_forceorg))
+            print()
+            shown_pf += 1
+            if shown_pf >= 3:
+                break
+        pf_freq = unit_frequency_analysis(
+            pf_armies, top_n=min(15, len(pf_armies)), mode=mode,
+            faction_filter=f)
+        print(pf_freq)
+        per_faction_summary[f] = header
+        per_faction_freq[f] = pf_freq
+
     # --- Write results to files ---
     out_dir = Path(__file__).parent / "results"
     out_dir.mkdir(exist_ok=True)
 
     # Generation log CSV
-    log_path = out_dir / "evo_generations.csv"
+    log_path = out_dir / f"evo_generations{suffix}.csv"
     with open(log_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=log_rows[0].keys())
         w.writeheader()
@@ -536,7 +652,7 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
 
     # Best army JSON (top army from stats source)
     top_army = stats_source[0]
-    best_path = out_dir / "evo_best_army.json"
+    best_path = out_dir / f"evo_best_army{suffix}.json"
     best_data = {
         'total_cost': top_army.total_cost,
         'fitness': top_army.fitness,
@@ -555,20 +671,27 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
     with open(best_path, "w") as f:
         json.dump(best_data, f, indent=2)
 
-    # Frequency analysis text
-    freq_path = out_dir / "evo_frequency.txt"
+    # Frequency analysis text (global + per-faction)
+    freq_path = out_dir / f"evo_frequency{suffix}.txt"
     with open(freq_path, "w") as f:
         f.write(freq)
 
-    # Hall of Fame JSON
-    if hall_of_fame.entries:
-        hof_path = out_dir / ("hall_of_fame_ml.json" if use_ml else "hall_of_fame.json")
-        hof_data = [
+    saved_freq_paths: list[Path] = []
+    for fac, pf_text in per_faction_freq.items():
+        fp = out_dir / f"evo_frequency_{fac}{suffix}.txt"
+        with open(fp, "w") as fh:
+            fh.write(per_faction_summary.get(fac, "").lstrip("\n") + "\n\n")
+            fh.write(pf_text)
+        saved_freq_paths.append(fp)
+
+    def _hof_to_data(hof: HallOfFame) -> list[dict]:
+        return [
             {
                 'rank': i + 1,
                 'fitness': entry.fitness,
                 'generation_added': entry.generation_added,
                 'total_cost': entry.army.total_cost,
+                'faction': entry.army.faction,
                 'entries': [
                     {
                         'template_id': e.template_id,
@@ -581,16 +704,31 @@ def run_list_evolution(graphic: bool = False, mode: str = "objectives",
                     for e in entry.army.entries
                 ],
             }
-            for i, entry in enumerate(hall_of_fame.entries)
+            for i, entry in enumerate(hof.entries)
         ]
+
+    # Global Hall of Fame JSON
+    saved_hof_paths: list[Path] = []
+    if hall_of_fame.entries:
+        hof_path = _hof_path("hall_of_fame")
         with open(hof_path, "w") as f:
-            json.dump(hof_data, f, indent=2)
-    else:
-        hof_path = None
+            json.dump(_hof_to_data(hall_of_fame), f, indent=2)
+        saved_hof_paths.append(hof_path)
+
+    # Per-faction Hall of Fame JSONs
+    for f, pf in per_faction_hofs.items():
+        if not pf.entries:
+            continue
+        pf_path = _hof_path(f"hall_of_fame_{f}")
+        with open(pf_path, "w") as fp:
+            json.dump(_hof_to_data(pf), fp, indent=2)
+        saved_hof_paths.append(pf_path)
 
     result_paths = f"\nResults written to:\n  {log_path}\n  {best_path}\n  {freq_path}"
-    if hof_path:
-        result_paths += f"\n  {hof_path}"
+    for p in saved_freq_paths:
+        result_paths += f"\n  {p}"
+    for p in saved_hof_paths:
+        result_paths += f"\n  {p}"
     print(result_paths)
 
     if graphic:
@@ -659,9 +797,23 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
              device: str = "auto",
              planning_rate: float = 0.0,
              planning_rate_end: float | None = None,
+             planning_warmup_batches: int | None = None,
+             planning_distill_ramp_batches: int | None = None,
              minibatch_size: int = 64,
              blend_ratio: float = 0.0,
-             phase_reencode: bool = True):
+             phase_reencode: bool = True,
+             use_mpo: bool = False,
+             mpo_switch_batch: int | None = None,
+             kl_trust_region_beta: float | None = None,
+             mpo_eta: float = 1.0,
+             planning_distill_mode: str = "ce_chosen",
+             mpo_kl_beta_end: float | None = None,
+             mpo_kl_beta_ramp_batches: int = 0,
+             shaping_old_value: bool = False,
+             map_path: str | None = None,
+             train_deployment: bool = False,
+             deploy_loss_coeff: float = 1.0,
+             deploy_post_value_bonus: float = 0.5):
     """Run a short ML training run and print summary stats.
 
     use_c_ext: if True (default), use the compiled C extension for hot loops
@@ -673,7 +825,39 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
     worker_count: number of multiprocessing pool workers (default: cpu_count // 2).
     planning_rate: probability of planning per activation (0 = disabled, 0.05 typical).
     planning_rate_end: if set, anneal planning_rate linearly to this value over training.
+    use_mpo: top-level MPO toggle. When True, on a fresh run (restart_training=
+             True) the loss flips from `planning_distill_mode` (typically
+             ce_chosen) to mpo_marginal at mpo_switch_batch (default 50), with
+             KL trust region β activating at the switch. On a resumed run
+             (restart_training=False) MPO is active from batch 1 — assumes the
+             prior run already paid the PPO warmup. When False, no switch.
+    mpo_switch_batch: explicit override of the auto-default. Absolute batch
+             number — stable across resume.
+    kl_trust_region_beta: explicit β override. None → auto-default 1.0 if
+             use_mpo else 0.0.
+    mpo_eta / planning_distill_mode / mpo_kl_beta_end / mpo_kl_beta_ramp_batches:
+             direct passthroughs to TrainingConfig.
+    shaping_old_value: if True (requires restart_training=True), replace the
+             heuristic shapers with potential-based shaping driven by the
+             pre-restart final_model.pt value head — r_t += scale ·
+             (V_old(s_{t+1}) − V_old(s_t)). Annealed under shaping_anneal_end
+             on the same schedule as the heuristic shapers.
+    map_path: optional path to a map JSON (e.g. "maps/map2.json"). When set,
+             every rollout installs the map (terrain + objectives + DZ cells)
+             before deployment. None ⇒ legacy empty-board layout.
+    train_deployment: when True, deployment is model-driven and each
+             placement's DeploymentRecord is collected for a PPO update on
+             the deploy heads. Requires map_path on non-empty maps.
+    deploy_loss_coeff: scale on the deploy-policy loss summed into the total
+             gradient step. 0.0 freezes the deploy heads.
+    deploy_post_value_bonus: auxiliary signal added to each deploy record's
+             return at the deploy→turn-1 boundary —
+             return = terminal + bonus * V(s_first_tactical). 0.0 ⇒ off.
     """
+    if shaping_old_value and not restart_training:
+        raise ValueError(
+            "shaping_old_value=True requires restart_training=True"
+        )
     # --- Re-exec under cgroup memory limit if requested ---
     if memory_max is not None and os.environ.get("_ML_TRAIN_CGROUP") != "1":
         import subprocess, sys
@@ -708,7 +892,35 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
     if time_limit is not None:
         print(f"Time limit: {time_limit} minutes")
     print(f"Phase re-encode: {'ON' if phase_reencode else 'OFF (legacy)'}")
+    if map_path is not None:
+        print(f"Map: {map_path}")
+    if train_deployment:
+        print(f"Deploy training: ON | coeff={deploy_loss_coeff} | post_value_bonus={deploy_post_value_bonus}")
     print("=" * 70)
+
+    # Warmup/ramp exists to protect distillation from an uncalibrated value
+    # head at the start of fresh training. When resuming from a checkpoint the
+    # value head is already calibrated, so default both to 0 and let planning
+    # fire immediately. Explicit caller values win.
+    if planning_warmup_batches is None:
+        planning_warmup_batches = 50 if restart_training else 0
+    if planning_distill_ramp_batches is None:
+        planning_distill_ramp_batches = 50 if restart_training else 0
+
+    # MPO auto-defaults — same restart-aware logic as the warmup window.
+    # On a fresh run we burn 50 batches of PPO so V can become a competent
+    # ranker before MPO starts shaping π against V's preferences. On a
+    # resumed run V is already calibrated by the prior run, so MPO fires
+    # from batch 1. When use_mpo is False, no switch is configured and β
+    # stays at 0 — pure PPO, untouched.
+    if use_mpo:
+        if mpo_switch_batch is None:
+            mpo_switch_batch = 50 if restart_training else 0
+        if kl_trust_region_beta is None:
+            kl_trust_region_beta = 1.0
+    else:
+        if kl_trust_region_beta is None:
+            kl_trust_region_beta = 0.0
 
     start = time.time()
     config = TrainingConfig(
@@ -724,9 +936,22 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
         device=device,
         planning_rate=planning_rate,
         planning_rate_end=planning_rate_end,
+        planning_warmup_batches=planning_warmup_batches,
+        planning_distill_ramp_batches=planning_distill_ramp_batches,
         ppo_minibatch_games=minibatch_size,
         unit_local_advantage_blend=blend_ratio,
         phase_reencode_enabled=phase_reencode,
+        planning_distill_mode=planning_distill_mode,
+        kl_trust_region_beta=kl_trust_region_beta,
+        mpo_eta=mpo_eta,
+        mpo_switch_batch=mpo_switch_batch,
+        mpo_kl_beta_end=mpo_kl_beta_end,
+        mpo_kl_beta_ramp_batches=mpo_kl_beta_ramp_batches,
+        shaping_old_value=shaping_old_value,
+        map_path=map_path,
+        train_deployment=train_deployment,
+        deploy_loss_coeff=deploy_loss_coeff,
+        deploy_post_value_bonus=deploy_post_value_bonus,
     )
     model, metrics = run_training(config=config, verbose=verbose,
                                    restart=restart_training)
@@ -742,10 +967,237 @@ def ml_train(num_batches: int = 20, batch_size: int = 128, verbose: bool = True,
     print("=" * 70)
 
 
+def run_identifier_data(
+    n_states: int = 1000,
+    candidates_per_state: int = 500,
+    rollouts: int = 8,
+    output_dir: str = "ml_training/identifier_data",
+    chunk_size: int = 50,
+    games_per_batch: int = 20,
+    workers: int = 6,
+    seed: int = 42,
+    checkpoint: str = "ml_checkpoints/final_model.pt",
+    memory_max: str | None = None,
+    memory_swap_max: str | None = None,
+):
+    """Generate the labeled (state, action) → (Q, log π) dataset for the
+    gap-identifier project.
+
+    Self-plays games with the frozen policy at `checkpoint`, draws K
+    stratified candidate actions per decision state, and labels each with a
+    rollout-based Q estimate (M dice rollouts of player-action + opponent-
+    activation + V at the resulting state) and the log-probability under
+    the frozen policy. Output is sharded npz files in `output_dir` plus a
+    manifest.json.
+
+    Resumable: re-running with the same args and an existing manifest
+    continues from where the prior run stopped.
+
+    workers: parallel labelling workers. Each worker plays its own self-play
+             games independently; outputs are merged at the manifest level.
+             1 = single-process serial path. 6 ≈ 3× speedup on a 6-core
+             laptop.
+    memory_max / memory_swap_max: optional cgroup limits — same protocol as
+             ml_train.
+    """
+    if memory_max is not None and os.environ.get("_ID_DATA_CGROUP") != "1":
+        import subprocess, sys
+        cmd = ["systemd-run", "--user", "--scope",
+               "-p", f"MemoryMax={memory_max}"]
+        if memory_swap_max is not None:
+            cmd += ["-p", f"MemorySwapMax={memory_swap_max}"]
+        env = os.environ.copy()
+        env["_ID_DATA_CGROUP"] = "1"
+        cmd += [sys.executable] + sys.argv
+        print(f"Re-launching under cgroup: {' '.join(cmd)}")
+        result = subprocess.run(cmd, env=env)
+        sys.exit(result.returncode)
+
+    from ml_training.identifier_dataset import (
+        run_labeling, run_labeling_parallel,
+    )
+
+    print("=" * 70)
+    print("Identifier dataset generation")
+    print(f"Target: {n_states} states × {candidates_per_state} candidates × "
+          f"{rollouts} rollouts × 2 activations")
+    print(f"Output: {output_dir}")
+    print(f"Workers: {workers}")
+    print(f"Frozen checkpoint: {checkpoint}")
+    if memory_max is not None:
+        mem_label = f"MemoryMax={memory_max}"
+        if memory_swap_max is not None:
+            mem_label += f", MemorySwapMax={memory_swap_max}"
+        print(f"Cgroup limits: {mem_label}")
+    print("=" * 70)
+
+    start = time.time()
+    if workers > 1:
+        run_labeling_parallel(
+            n_states_target=n_states,
+            candidates_per_state=candidates_per_state,
+            m_rollouts=rollouts,
+            output_dir=output_dir,
+            chunk_size=chunk_size,
+            games_per_collection_batch=games_per_batch,
+            seed=seed,
+            checkpoint_path=checkpoint,
+            n_workers=workers,
+        )
+    else:
+        run_labeling(
+            n_states_target=n_states,
+            candidates_per_state=candidates_per_state,
+            m_rollouts=rollouts,
+            output_dir=output_dir,
+            chunk_size=chunk_size,
+            games_per_collection_batch=games_per_batch,
+            seed=seed,
+            checkpoint_path=checkpoint,
+        )
+    elapsed = time.time() - start
+
+    print("\n" + "=" * 70)
+    print(f"DATASET COMPLETE — {elapsed:.1f}s")
+    print("=" * 70)
+
+
+def run_identifier_train(
+    data_dir: str = "ml_training/identifier_data",
+    checkpoint: str = "ml_checkpoints/final_model.pt",
+    out: str = "ml_checkpoints/identifier_head.pt",
+    epochs: int = 10,
+    batch_size: int = 512,
+    lr: float = 3e-4,
+    weight_decay: float = 0.0,
+    val_frac: float = 0.1,
+    seed: int = 42,
+    device: str = "auto",
+):
+    """Train the gap-identifier head on a labeled dataset.
+
+    Frozen trunk loaded from `checkpoint` — must match the dataset
+    manifest's checkpoint (the labelled log π values came from that exact π,
+    and the trunk h must come from the same model). Train/val split is by
+    game_uid so all candidates from a single self-play game stay together —
+    no leakage from temporally-correlated states.
+
+    Output: `out` (.pt) containing the head's state_dict, the calibrated β
+    (std(Q) / std(log π) on the training split), training history, and the
+    source-checkpoint path.
+    """
+    from ml_training.train_identifier import run_training_pipeline
+
+    print("=" * 70)
+    print("Identifier head training")
+    print(f"Dataset: {data_dir}")
+    print(f"Frozen trunk: {checkpoint}")
+    print(f"Output: {out}")
+    print(f"Epochs: {epochs} | Batch: {batch_size} | LR: {lr} | val_frac: {val_frac}")
+    print(f"Device: {device}")
+    print("=" * 70)
+
+    start = time.time()
+    payload = run_training_pipeline(
+        data_dir=data_dir,
+        checkpoint=checkpoint,
+        out_path=out,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr=lr,
+        weight_decay=weight_decay,
+        val_frac=val_frac,
+        seed=seed,
+        device=device,
+    )
+    elapsed = time.time() - start
+
+    print("\n" + "=" * 70)
+    print(f"IDENTIFIER TRAINING COMPLETE — {elapsed:.1f}s")
+    if payload["history"]:
+        last = payload["history"][-1]
+        print(f"  Final train MSE: {last['train_mse']:.5f}")
+        print(f"  Final val MSE:   {last['val_mse']:.5f}")
+        print(f"  Val Pearson r:   {last['val_pearson']:+.3f}")
+    print(f"  Calibrated β:    {payload['beta_calibrated']:.4f}")
+    print("=" * 70)
+
+
+def run_identifier_finetune(
+    data_dir: str = "ml_training/identifier_data",
+    trunk_in: str = "ml_checkpoints/final_model.pt",
+    head_in: str = "ml_checkpoints/identifier_head.pt",
+    trunk_out: str = "ml_checkpoints/final_model_id_finetuned.pt",
+    head_out: str = "ml_checkpoints/identifier_head_finetuned.pt",
+    epochs: int = 20,
+    batch_size: int = 512,
+    lr_head: float = 3e-4,
+    lr_trunk: float = 1e-5,
+    weight_decay: float = 1e-3,
+    val_frac: float = 0.1,
+    seed: int = 42,
+    device: str = "auto",
+):
+    """Joint fine-tune the trunk's h-producing layers (unit_encoder, stem,
+    core_block) plus the identifier head, against the same advantage targets
+    used in head-only training. Original trunk and head checkpoints are NOT
+    modified — outputs go to distinct *_finetuned.pt paths.
+
+    Use this only after `run_identifier_train` has produced a strong head;
+    the head is loaded from `head_in` and continues training jointly with
+    the trunk's h-layers. The trunk's policy and value heads stay frozen.
+    """
+    from ml_training.train_identifier import run_finetuning_pipeline
+
+    print("=" * 70)
+    print("Identifier head + trunk-h JOINT fine-tuning")
+    print(f"Dataset:        {data_dir}")
+    print(f"Original trunk: {trunk_in} (read-only)")
+    print(f"Original head:  {head_in} (read-only)")
+    print(f"Outputs:        {trunk_out}, {head_out}")
+    print(f"Epochs: {epochs} | Batch: {batch_size}")
+    print(f"LR head: {lr_head} | LR trunk: {lr_trunk} | wd: {weight_decay}")
+    print(f"Device: {device}")
+    print("=" * 70)
+
+    start = time.time()
+    payload = run_finetuning_pipeline(
+        data_dir=data_dir,
+        trunk_in=trunk_in,
+        head_in=head_in,
+        trunk_out=trunk_out,
+        head_out=head_out,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr_head=lr_head,
+        lr_trunk=lr_trunk,
+        weight_decay=weight_decay,
+        val_frac=val_frac,
+        seed=seed,
+        device=device,
+    )
+    elapsed = time.time() - start
+
+    print("\n" + "=" * 70)
+    print(f"IDENTIFIER FINETUNE COMPLETE — {elapsed:.1f}s")
+    if payload["history"]:
+        last = payload["history"][-1]
+        print(f"  Final train MSE:    {last['train_mse']:.5f}")
+        print(f"  Final val MSE:      {last['val_mse']:.5f}")
+        print(f"  Val Pearson r:      {last['val_pearson']:+.3f}")
+        print(f"  Final ws_ρ:         {last['ws_rho_mean']:+.3f}")
+        print(f"  Final top10_pred_q: {last['ws_top10_pred_q']:+.3f}")
+        print(f"  Final oracle_q:     {last['ws_top10_oracle_q']:+.3f}")
+    print(f"  Calibrated β:       {payload['beta_calibrated']:.4f}")
+    print("=" * 70)
+
+
 if __name__ == "__main__":
-    #ml_train(num_batches=300000, batch_size=512, time_limit=(180), model_type="tactical", use_c_ext=True, restart_training=True, memory_max="14G", memory_swap_max="40G", worker_count = 6, planning_rate = 0, minibatch_size = 64, blend_ratio = 0.25, phase_reencode = True)
-    #ml_train(num_batches=300000, batch_size=512, time_limit=(300), model_type="tactical", use_c_ext=True, restart_training=False, memory_max="14G", memory_swap_max="40G", worker_count = 6, planning_rate = 0, minibatch_size = 64, blend_ratio = 0.25)
-    #ml_train(num_batches=3, batch_size=256, time_limit=2, model_type="tactical", use_c_ext=False)  # pure Python
-    #run_list_evolution(graphic=True, mode="objectives", enforce_forceorg=True, use_ml=True, ml_batch_tactical=False, restart_evolution=False, use_c_ext=True)
-    from play_viewer import play_interactive
-    play_interactive()
+    ml_train(num_batches=300000, batch_size=256, time_limit=(270), model_type="tactical", use_c_ext=True, restart_training=True, memory_max="14G", memory_swap_max="40G", worker_count = 6, planning_rate = 0, minibatch_size = 64, blend_ratio = 0.25, phase_reencode = True, use_mpo=False, shaping_old_value = False, map_path="maps/map2.json", train_deployment=True, deploy_loss_coeff=1.0, deploy_post_value_bonus=0.5)
+    #ml_train(num_batches=300000, batch_size=512, time_limit=(180), model_type="tactical", use_c_ext=True, restart_training=False, memory_max="14G", memory_swap_max="40G", worker_count = 6, planning_rate = 0, minibatch_size = 128, blend_ratio = 0.25, use_mpo=False)
+    #run_list_evolution(graphic=False, mode="objectives", enforce_forceorg=True, use_ml=True, ml_batch_tactical=False, restart_evolution=True, use_c_ext=True, version = 1)
+    #from play_viewer import play_interactive
+    #play_interactive()
+    #run_identifier_data(n_states=4000, candidates_per_state=500, rollouts=8, workers=6, memory_max="14G", memory_swap_max="40G")
+    #run_identifier_train(epochs=100, batch_size=512, val_frac=0.1, device="auto", weight_decay = 3e-4)
+    #run_identifier_finetune(epochs=200, batch_size=512, lr_head=5e-4, lr_trunk=2e-4, device="auto")

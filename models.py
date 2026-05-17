@@ -27,6 +27,19 @@ class Weapon:
     melee: bool = False
     bane: bool = False
     thrust: bool = False
+    # Battle Brothers additions
+    lacerate: bool = False     # defender re-rolls successful blocks
+    shred: bool = False        # unmodified def roll of 1 → +1 wound
+    smash: bool = False        # gains Blast(3) vs targets where >50% models have Def 5+
+    indirect: bool = False     # ignores line-of-sight / cover
+    limited: bool = False      # only fires on the unit's first activation in the game
+    # Eternal Dynasty additions
+    surge: bool = False        # unmodified roll of 6 to hit → +1 extra hit
+    tear: bool = False         # AP(+4) vs targets where most models have Tough(9)+
+    puncture: bool = False     # ignores Regen, AP(+4) vs Tough(3)–Tough(9)
+    # Terrain spec §4.5: per-weapon flag suppressing the +1 cover defense bonus.
+    # OR'd with unit-level ignores_cover at resolution time.
+    ignores_cover: bool = False
 
 
 @dataclass
@@ -58,6 +71,45 @@ class UpgradeOption:
     adds_relentless: bool = False
     adds_fear: int = 0
     removes_shielded: bool = False
+    # Battle Brothers additions
+    adds_strider: bool = False
+    adds_versatile_attack: bool = False
+    adds_versatile_reach: bool = False
+    adds_unstoppable_mark: bool = False
+    adds_impact: int = 0
+    adds_shielded: bool = False
+    # Auras (granted by hero upgrades; propagate to host unit on merge)
+    adds_bane_melee_aura: bool = False
+    adds_bane_shoot_aura: bool = False
+    adds_courage_aura: bool = False
+    adds_rapid_rush_aura: bool = False
+    adds_regeneration_aura: bool = False
+    adds_versatile_reach_aura: bool = False
+    # Eternal Dynasty additions
+    adds_piercing_hunter: bool = False
+    adds_melee_evasion: bool = False
+    adds_counter_attack: bool = False
+    adds_unpredictable_fighter: bool = False
+    adds_rapid_advance: bool = False
+    adds_rapid_charge: bool = False
+    adds_bounding: bool = False
+    adds_ed_teleport: bool = False
+    adds_vengeance: bool = False
+    adds_isr_mark: bool = False
+    adds_ignores_cover: bool = False
+    adds_fearless: bool = False
+    adds_furious: bool = False
+    # ED auras
+    adds_clan_warrior_boost_aura: bool = False
+    adds_counter_attack_aura: bool = False
+    adds_fearless_aura: bool = False
+    adds_ignores_cover_aura: bool = False
+    adds_melee_evasion_aura: bool = False
+    adds_piercing_hunter_aura: bool = False
+    adds_precision_fighter_aura: bool = False    # +1 to hit in melee for the unit
+    adds_rapid_advance_aura: bool = False
+    adds_rapid_charge_aura: bool = False
+    adds_stealth_aura_ed: bool = False            # alias — same effect as existing stealth aura
 
 
 @dataclass
@@ -97,6 +149,34 @@ class UnitTemplate:
     fear: int = 0
     is_combined: bool = False
     source_template_id: str = ""
+    # Faction: "hef" (High Elf Fleet, +2" Highborn movement),
+    # "bb" (Battle Brothers, Battleborn shaken auto-recovery), or
+    # "ed" (Eternal Dynasty, army-wide Clan Warrior nat-6 hit explosion).
+    faction: str = "hef"
+    # Battle Brothers unit-level rules
+    battleborn: bool = False
+    strider: bool = False
+    versatile_attack: bool = False     # per-activation EV-pick of AP(+1) vs +1-to-hit at >9"
+    versatile_reach: bool = False      # permanent +4" range (shoot) and +2" charge
+    unstoppable_mark: bool = False     # once per activation: mark enemy → allies get Unstoppable
+    # Eternal Dynasty unit-level rules
+    clan_warrior: bool = False              # army-wide: nat 6 to hit → +1 extra attack
+    clan_warrior_boost: bool = False        # extra attacks trigger on 5-6 instead of just 6
+    piercing_hunter: bool = False           # +1 AP when shooting >9"
+    melee_evasion: bool = False             # melee attackers get -1 to hit
+    counter_attack: bool = False            # strikes first when charged
+    unpredictable_fighter: bool = False     # melee: roll d6, 1-3 AP+1, 4-6 +1 hit
+    rapid_advance: bool = False             # +4" Advance
+    rapid_charge: bool = False              # +4" Charge
+    bounding: bool = False                  # at activation, place models within D3+1"
+    ed_teleport: bool = False               # per-activation 3"/3"/6" reposition trigger
+    vengeance: bool = False                 # leaves Vengeance markers when destroyed
+    isr_mark: bool = False                  # once per activation: mark enemy → +6" range
+    ignores_cover: bool = False             # ignores stealth/cover when shooting
+    slow: bool = False                      # cannot Rush
+    precision_fighter: bool = False         # +1 to hit in melee
+    # Bane / courage / rapid_rush moved here at template level for parity
+    # (legacy: only flowed via aura; templates don't normally set these directly).
 
 
 @dataclass
@@ -118,8 +198,10 @@ class ResolvedUnit:
     stealth: bool = False
     relentless: bool = False
     fast: bool = False
-    highborn: bool = True  # all HEF units
     artillery: bool = False
+    # Faction: drives faction-wide rules. Highborn (HEF) gives +2" advance/rush;
+    # Battleborn (BB) gives a 4+ shaken auto-recovery at the start of each round.
+    faction: str = "hef"
     # Melee rules
     shielded: bool = False
     furious: bool = False
@@ -131,38 +213,118 @@ class ResolvedUnit:
     fear: int = 0
     stealth_aura: bool = False
     scout_aura: bool = False
+    # Battle Brothers unit-level rules
+    battleborn: bool = False
+    strider: bool = False
+    versatile_attack: bool = False
+    versatile_reach: bool = False
+    unstoppable_mark: bool = False
+    # Eternal Dynasty unit-level rules
+    clan_warrior: bool = False
+    clan_warrior_boost: bool = False
+    piercing_hunter: bool = False
+    melee_evasion: bool = False
+    counter_attack: bool = False
+    unpredictable_fighter: bool = False
+    rapid_advance: bool = False
+    rapid_charge: bool = False
+    bounding: bool = False
+    ed_teleport: bool = False
+    vengeance: bool = False
+    isr_mark: bool = False
+    ignores_cover: bool = False
+    slow: bool = False
+    precision_fighter: bool = False
+    # Effective rules after aura propagation
+    bane_melee: bool = False
+    bane_shoot: bool = False
+    courage: bool = False
+    rapid_rush: bool = False
+    # Aura sources (set on heroes; transferred to host on merge)
+    bane_melee_aura: bool = False
+    bane_shoot_aura: bool = False
+    courage_aura: bool = False
+    rapid_rush_aura: bool = False
+    regeneration_aura: bool = False
+    versatile_reach_aura: bool = False
+    # ED auras
+    clan_warrior_boost_aura: bool = False
+    counter_attack_aura: bool = False
+    fearless_aura: bool = False
+    ignores_cover_aura: bool = False
+    melee_evasion_aura: bool = False
+    piercing_hunter_aura: bool = False
+    precision_fighter_aura: bool = False
+    rapid_advance_aura: bool = False
+    rapid_charge_aura: bool = False
 
     @property
     def label(self) -> str:
         return f"{self.name} [{self.points}pts]"
 
     @property
+    def highborn(self) -> bool:
+        return self.faction == "hef"
+
+    @property
     def advance_distance(self) -> int:
         if self.artillery:
             return 0
-        d = 6 + 2  # base + Highborn
+        d = 6
+        if self.faction == "hef":
+            d += 2  # Highborn
         if self.fast:
             d += 2
-        if self.teleport:
+        if self.teleport or self.ed_teleport:
             d += 6
+        if self.rapid_advance:
+            d += 4
+        if self.bounding:
+            d += 3  # Bounding D3+1 reposition averages ~3"
         return d
 
     @property
     def rush_distance(self) -> int:
         if self.artillery:
             return 0
-        d = 12 + 2  # base + Highborn
+        if self.slow:
+            # Slow units cannot Rush — fall back to their Advance distance.
+            return self.advance_distance
+        d = 12
+        if self.faction == "hef":
+            d += 2  # Highborn
         if self.fast:
             d += 4
-        if self.teleport:
+        if self.teleport or self.ed_teleport:
             d += 6
+        if self.rapid_rush:
+            d += 6
+        if self.bounding:
+            d += 3
+        return d
+
+    @property
+    def charge_distance(self) -> int:
+        # Charge uses Rush distance; Versatile Reach grants +2" when charging.
+        # Rapid Charge stacks +4" on Charge specifically.
+        if self.artillery:
+            return 0
+        d = self.rush_distance
+        if self.versatile_reach:
+            d += 2
+        if self.rapid_charge:
+            d += 4
         return d
 
     @property
     def max_weapon_range(self) -> int:
         if not self.weapons:
             return 0
-        return max(w.range_inches for w in self.weapons)
+        base = max(w.range_inches for w in self.weapons)
+        # Versatile Reach: +4" to all ranged weapons in this unit.
+        if self.versatile_reach and base > 0:
+            base += 4
+        return base
 
 
 # Army list entry = template + chosen upgrades + AI role
@@ -183,6 +345,15 @@ class ArmyList:
     fitness: float = 0.0
     wins: float = 0.0
     games: int = 0
+    # Faction is "hef" (default — preserves backward compatibility for
+    # existing HEF training runs), "bb", or "ed". An ArmyList is homogeneous.
+    faction: str = "hef"
+    # Breeder type for multi-faction evolution:
+    #   "meta"      — meta-chaser; tournament samples across the whole
+    #                 population and may switch faction by inheritance.
+    #   "fan_hef" / "fan_bb" / "fan_ed" — hardcore fan; tournament samples
+    #                 only same-faction parents and never switches faction.
+    breeder_type: str = "meta"
 
     @property
     def total_cost(self) -> int:
@@ -276,6 +447,16 @@ class UnitState:
     # Hero fields
     hero_model_index: int = -1  # index of hero model in positions (-1 = no hero)
     hero_unit: ResolvedUnit | None = None  # hero's original resolved stats
+    # Battle Brothers turn-state
+    has_activated_once: bool = False     # true after the unit's first activation begins
+    limited_spent: bool = False          # Limited weapons removed after first activation
+    unstoppable_mark_used: bool = False  # once-per-activation cap for Unstoppable Mark
+    marked_by_unstoppable: bool = False  # set on a target when an enemy uses the mark
+    # Eternal Dynasty turn-state
+    isr_mark_used: bool = False          # once-per-activation cap for Increased Shooting Range Mark
+    marked_by_isr: bool = False          # set on target — friendly side gets +6" range once
+    marked_by_isr_owner: str = ""        # which owner ("A"/"B") set the mark
+    vengeance_markers: int = 0           # markers placed on this unit by destroyed Vengeance units
 
     def __post_init__(self):
         self.reset()
@@ -293,6 +474,38 @@ class UnitState:
         # Deep copy so each game gets fresh weapon lists
         self.weapons_per_model = [list(mw) for mw in self.unit.weapons_per_model]
         self._removed_positions = []
+        # BB state
+        self.has_activated_once = False
+        self.limited_spent = False
+        self.unstoppable_mark_used = False
+        self.marked_by_unstoppable = False
+        # ED state
+        self.isr_mark_used = False
+        self.marked_by_isr = False
+        self.marked_by_isr_owner = ""
+        self.vengeance_markers = 0
+
+    def has_limited_weapon(self) -> bool:
+        if self.limited_spent:
+            return False
+        for mw in self.weapons_per_model:
+            for w in mw:
+                if w.limited:
+                    return True
+        return False
+
+    def consume_limited(self) -> bool:
+        """Strip Limited weapons from per-model loadout after the first activation.
+        Returns True iff anything was removed (caller may want to re-encode features)."""
+        if self.limited_spent:
+            return False
+        removed = False
+        for i, mw in enumerate(self.weapons_per_model):
+            if any(w.limited for w in mw):
+                self.weapons_per_model[i] = [w for w in mw if not w.limited]
+                removed = True
+        self.limited_spent = True
+        return removed
 
     @property
     def destroyed(self) -> bool:
@@ -496,6 +709,38 @@ def merge_hero_into_unit(hero_resolved: ResolvedUnit,
         host_state.unit.stealth = True
     if hero_resolved.scout_aura:
         host_state.unit.scout = True
+    # Battle Brothers auras
+    if hero_resolved.bane_melee_aura:
+        host_state.unit.bane_melee = True
+    if hero_resolved.bane_shoot_aura:
+        host_state.unit.bane_shoot = True
+    if hero_resolved.courage_aura:
+        host_state.unit.courage = True
+    if hero_resolved.rapid_rush_aura:
+        host_state.unit.rapid_rush = True
+    if hero_resolved.regeneration_aura:
+        host_state.unit.regeneration = True
+    if hero_resolved.versatile_reach_aura:
+        host_state.unit.versatile_reach = True
+    # Eternal Dynasty auras
+    if hero_resolved.clan_warrior_boost_aura:
+        host_state.unit.clan_warrior_boost = True
+    if hero_resolved.counter_attack_aura:
+        host_state.unit.counter_attack = True
+    if hero_resolved.fearless_aura:
+        host_state.unit.fearless = True
+    if hero_resolved.ignores_cover_aura:
+        host_state.unit.ignores_cover = True
+    if hero_resolved.melee_evasion_aura:
+        host_state.unit.melee_evasion = True
+    if hero_resolved.piercing_hunter_aura:
+        host_state.unit.piercing_hunter = True
+    if hero_resolved.precision_fighter_aura:
+        host_state.unit.precision_fighter = True
+    if hero_resolved.rapid_advance_aura:
+        host_state.unit.rapid_advance = True
+    if hero_resolved.rapid_charge_aura:
+        host_state.unit.rapid_charge = True
     # Append hero's weapons as a new model entry
     host_state.weapons_per_model.append(list(hero_resolved.weapons))
 
@@ -542,7 +787,10 @@ def _apply_weapon_removal(weapons: list[Weapon], weapon_name: str,
 def _apply_opt_flat(opt: UpgradeOption, weapons: list[Weapon],
                     is_all_models: bool) -> None:
     """Apply an upgrade option to the flat weapon list.
-    For applies_to_all upgrades, adds proportional to actual removals."""
+    For applies_to_all upgrades, adds proportional to actual removals
+    when adds_weapons is a single per-model replacement; if the add list
+    encodes multiple weapons per removal (len divisible by removed count),
+    the full list is added verbatim."""
     if opt.removes_weapon:
         before = sum(1 for w in weapons if w.name == opt.removes_weapon)
         _apply_weapon_removal(weapons, opt.removes_weapon,
@@ -551,8 +799,12 @@ def _apply_opt_flat(opt: UpgradeOption, weapons: list[Weapon],
             _apply_weapon_removal(weapons, "Sniper Rifle", 1)
         if is_all_models and opt.adds_weapons:
             actually_removed = before - sum(1 for w in weapons if w.name == opt.removes_weapon)
-            replacement = opt.adds_weapons[0]
-            weapons.extend([replacement] * actually_removed)
+            n_add = len(opt.adds_weapons)
+            if actually_removed > 0 and n_add % actually_removed == 0:
+                weapons.extend(opt.adds_weapons)
+            else:
+                replacement = opt.adds_weapons[0]
+                weapons.extend([replacement] * actually_removed)
         else:
             weapons.extend(opt.adds_weapons)
     else:
@@ -564,8 +816,12 @@ def _apply_opt_flat(opt: UpgradeOption, weapons: list[Weapon],
                               before2 if is_all_models else opt.removes_count_2)
         if is_all_models and opt.adds_weapons_2:
             actually_removed2 = before2 - sum(1 for w in weapons if w.name == opt.removes_weapon_2)
-            replacement2 = opt.adds_weapons_2[0]
-            weapons.extend([replacement2] * actually_removed2)
+            n_add2 = len(opt.adds_weapons_2)
+            if actually_removed2 > 0 and n_add2 % actually_removed2 == 0:
+                weapons.extend(opt.adds_weapons_2)
+            else:
+                replacement2 = opt.adds_weapons_2[0]
+                weapons.extend([replacement2] * actually_removed2)
         else:
             weapons.extend(opt.adds_weapons_2)
 
@@ -625,9 +881,15 @@ def _apply_opt_wpm(opt: UpgradeOption, slot_id: str, wpm: list[list[Weapon]],
     # Primary weapon removal
     if opt.removes_weapon:
         if is_all_models:
-            # All-models: remove from each model in range, add proportionally
-            total_removed = 0
-            for mi in model_range:
+            mr = list(model_range)
+            n_models = len(mr)
+            # If adds_weapons specifies multiple weapons per model
+            # (len divisible by n_models), distribute round-robin so each
+            # model gets len/n_models weapons. Else fall back to the
+            # legacy single-replacement-scaled-by-removals behavior.
+            distribute_full = (opt.adds_weapons and n_models > 0
+                               and len(opt.adds_weapons) % n_models == 0)
+            for mi_idx, mi in enumerate(mr):
                 before = sum(1 for w in wpm[mi] if w.name == opt.removes_weapon)
                 new_mw = []
                 mi_removed = 0
@@ -637,11 +899,11 @@ def _apply_opt_wpm(opt: UpgradeOption, slot_id: str, wpm: list[list[Weapon]],
                     else:
                         new_mw.append(w)
                 wpm[mi] = new_mw
-                # Add replacement proportionally per model
-                if opt.adds_weapons and mi_removed > 0:
+                if distribute_full:
+                    wpm[mi].extend(opt.adds_weapons[mi_idx::n_models])
+                elif opt.adds_weapons and mi_removed > 0:
                     replacement = opt.adds_weapons[0]
                     wpm[mi].extend([replacement] * mi_removed)
-                total_removed += mi_removed
         else:
             removed = _remove_from_wpm(opt.removes_weapon, opt.removes_count)
             # Handle sniper+shardgun combo
@@ -676,7 +938,11 @@ def _apply_opt_wpm(opt: UpgradeOption, slot_id: str, wpm: list[list[Weapon]],
     # Second weapon removal
     if opt.removes_weapon_2:
         if is_all_models:
-            for mi in model_range:
+            mr2 = list(model_range)
+            n_models2 = len(mr2)
+            distribute_full2 = (opt.adds_weapons_2 and n_models2 > 0
+                                and len(opt.adds_weapons_2) % n_models2 == 0)
+            for mi_idx, mi in enumerate(mr2):
                 before2 = sum(1 for w in wpm[mi] if w.name == opt.removes_weapon_2)
                 new_mw = []
                 mi_removed = 0
@@ -686,7 +952,9 @@ def _apply_opt_wpm(opt: UpgradeOption, slot_id: str, wpm: list[list[Weapon]],
                     else:
                         new_mw.append(w)
                 wpm[mi] = new_mw
-                if opt.adds_weapons_2 and mi_removed > 0:
+                if distribute_full2:
+                    wpm[mi].extend(opt.adds_weapons_2[mi_idx::n_models2])
+                elif opt.adds_weapons_2 and mi_removed > 0:
                     replacement2 = opt.adds_weapons_2[0]
                     wpm[mi].extend([replacement2] * mi_removed)
         else:
@@ -723,6 +991,45 @@ def resolve_entry(entry: ArmyListEntry) -> ResolvedUnit:
     stealth_aura = False
     scout_aura = False
     impact = tpl.impact
+    # Battle Brothers
+    strider = tpl.strider
+    versatile_attack = tpl.versatile_attack
+    versatile_reach = tpl.versatile_reach
+    unstoppable_mark = tpl.unstoppable_mark
+    bane_melee_aura = False
+    bane_shoot_aura = False
+    courage_aura = False
+    rapid_rush_aura = False
+    regeneration_aura = False
+    versatile_reach_aura = False
+    # Non-hero "banner aura" effective fields (applied directly to the unit)
+    bane_melee_local = False
+    bane_shoot_local = False
+    courage_local = False
+    rapid_rush_local = False
+    # Eternal Dynasty
+    piercing_hunter = tpl.piercing_hunter
+    melee_evasion = tpl.melee_evasion
+    counter_attack = tpl.counter_attack
+    unpredictable_fighter = tpl.unpredictable_fighter
+    rapid_advance = tpl.rapid_advance
+    rapid_charge = tpl.rapid_charge
+    bounding = tpl.bounding
+    ed_teleport = tpl.ed_teleport
+    vengeance = tpl.vengeance
+    isr_mark = tpl.isr_mark
+    ignores_cover = tpl.ignores_cover
+    precision_fighter = tpl.precision_fighter
+    clan_warrior_boost = tpl.clan_warrior_boost
+    clan_warrior_boost_aura = False
+    counter_attack_aura = False
+    fearless_aura = False
+    ignores_cover_aura = False
+    melee_evasion_aura = False
+    piercing_hunter_aura = False
+    precision_fighter_aura = False
+    rapid_advance_aura = False
+    rapid_charge_aura = False
 
     # Collect chosen options with their slot IDs
     chosen: list[tuple[str, UpgradeOption]] = []
@@ -740,8 +1047,19 @@ def resolve_entry(entry: ArmyListEntry) -> ResolvedUnit:
 
     def _apply_rule_flags(opt: UpgradeOption) -> None:
         nonlocal tough, regen, spotter, scout, stealth, relentless, fast
-        nonlocal shielded, fortified, flying, teleport, fear
+        nonlocal shielded, fortified, flying, teleport, fear, fearless, impact
         nonlocal stealth_aura, scout_aura
+        nonlocal strider, versatile_attack, versatile_reach, unstoppable_mark
+        nonlocal bane_melee_aura, bane_shoot_aura, courage_aura
+        nonlocal rapid_rush_aura, regeneration_aura, versatile_reach_aura
+        # ED nonlocals
+        nonlocal piercing_hunter, melee_evasion, counter_attack
+        nonlocal unpredictable_fighter, rapid_advance, rapid_charge
+        nonlocal bounding, ed_teleport, vengeance, isr_mark, ignores_cover
+        nonlocal precision_fighter, clan_warrior_boost
+        nonlocal clan_warrior_boost_aura, counter_attack_aura, fearless_aura
+        nonlocal ignores_cover_aura, melee_evasion_aura, piercing_hunter_aura
+        nonlocal precision_fighter_aura, rapid_advance_aura, rapid_charge_aura
         if opt.adds_tough:
             tough = opt.adds_tough
         if opt.adds_regeneration:
@@ -774,6 +1092,127 @@ def resolve_entry(entry: ArmyListEntry) -> ResolvedUnit:
             relentless = True
         if opt.adds_fear:
             fear = opt.adds_fear
+        if opt.adds_impact:
+            impact = opt.adds_impact
+        if opt.adds_shielded:
+            shielded = True
+        # Battle Brothers
+        if opt.adds_strider:
+            strider = True
+        if opt.adds_versatile_attack:
+            versatile_attack = True
+        if opt.adds_versatile_reach:
+            versatile_reach = True
+        if opt.adds_unstoppable_mark:
+            unstoppable_mark = True
+        # Auras granted by heroes are stored as aura fields and propagate on
+        # attach. Auras granted by banner-style upgrades on non-hero units
+        # apply directly to the unit (one model carries the banner; we
+        # collapse this to a unit-wide flag for simplicity).
+        nonlocal bane_melee_local, bane_shoot_local, courage_local, rapid_rush_local
+        if opt.adds_bane_melee_aura:
+            if tpl.hero:
+                bane_melee_aura = True
+            else:
+                bane_melee_local = True
+        if opt.adds_bane_shoot_aura:
+            if tpl.hero:
+                bane_shoot_aura = True
+            else:
+                bane_shoot_local = True
+        if opt.adds_courage_aura:
+            if tpl.hero:
+                courage_aura = True
+            else:
+                courage_local = True
+        if opt.adds_rapid_rush_aura:
+            if tpl.hero:
+                rapid_rush_aura = True
+            else:
+                rapid_rush_local = True
+        if opt.adds_regeneration_aura:
+            if tpl.hero:
+                regeneration_aura = True
+            else:
+                regen = True
+        if opt.adds_versatile_reach_aura:
+            if tpl.hero:
+                versatile_reach_aura = True
+            else:
+                versatile_reach = True
+        # ED unit-level rule grants
+        if opt.adds_piercing_hunter:
+            piercing_hunter = True
+        if opt.adds_melee_evasion:
+            melee_evasion = True
+        if opt.adds_counter_attack:
+            counter_attack = True
+        if opt.adds_unpredictable_fighter:
+            unpredictable_fighter = True
+        if opt.adds_rapid_advance:
+            rapid_advance = True
+        if opt.adds_rapid_charge:
+            rapid_charge = True
+        if opt.adds_bounding:
+            bounding = True
+        if opt.adds_ed_teleport:
+            ed_teleport = True
+        if opt.adds_vengeance:
+            vengeance = True
+        if opt.adds_isr_mark:
+            isr_mark = True
+        if opt.adds_ignores_cover:
+            ignores_cover = True
+        if opt.adds_fearless:
+            fearless = True
+        # ED auras — propagate to a host on attach when the model is a hero;
+        # for a non-hero model the upgrade is treated as directly applying
+        # the aura's effect to the unit.
+        if opt.adds_clan_warrior_boost_aura:
+            if tpl.hero:
+                clan_warrior_boost_aura = True
+            else:
+                clan_warrior_boost = True
+        if opt.adds_counter_attack_aura:
+            if tpl.hero:
+                counter_attack_aura = True
+            else:
+                counter_attack = True
+        if opt.adds_fearless_aura:
+            if tpl.hero:
+                fearless_aura = True
+            else:
+                fearless = True
+        if opt.adds_ignores_cover_aura:
+            if tpl.hero:
+                ignores_cover_aura = True
+            else:
+                ignores_cover = True
+        if opt.adds_melee_evasion_aura:
+            if tpl.hero:
+                melee_evasion_aura = True
+            else:
+                melee_evasion = True
+        if opt.adds_piercing_hunter_aura:
+            if tpl.hero:
+                piercing_hunter_aura = True
+            else:
+                piercing_hunter = True
+        if opt.adds_precision_fighter_aura:
+            if tpl.hero:
+                precision_fighter_aura = True
+            else:
+                precision_fighter = True
+        if opt.adds_rapid_advance_aura:
+            if tpl.hero:
+                rapid_advance_aura = True
+            else:
+                rapid_advance = True
+        if opt.adds_rapid_charge_aura:
+            if tpl.hero:
+                rapid_charge_aura = True
+            else:
+                rapid_charge = True
 
     # --- Flat weapon list (two-pass) ---
     for _, opt in per_model:
@@ -816,6 +1255,37 @@ def resolve_entry(entry: ArmyListEntry) -> ResolvedUnit:
     display_name = " ".join(name_parts)
 
     entry.computed_cost = cost
+    # Hero "self-aura" reflection: an aura affects the model itself even when
+    # it is unattached. Mirror the aura sources to direct effective flags so a
+    # lone hero benefits from its own aura. For non-hero units a banner-style
+    # upgrade likewise applies the aura's effect to the unit directly.
+    eff_bane_melee = bane_melee_aura or bane_melee_local
+    eff_bane_shoot = bane_shoot_aura or bane_shoot_local
+    eff_courage = courage_aura or courage_local
+    eff_rapid_rush = rapid_rush_aura or rapid_rush_local
+    if regeneration_aura:
+        regen = True
+    if versatile_reach_aura:
+        versatile_reach = True
+    # ED hero self-aura reflection
+    if clan_warrior_boost_aura:
+        clan_warrior_boost = True
+    if counter_attack_aura:
+        counter_attack = True
+    if fearless_aura:
+        fearless = True
+    if ignores_cover_aura:
+        ignores_cover = True
+    if melee_evasion_aura:
+        melee_evasion = True
+    if piercing_hunter_aura:
+        piercing_hunter = True
+    if precision_fighter_aura:
+        precision_fighter = True
+    if rapid_advance_aura:
+        rapid_advance = True
+    if rapid_charge_aura:
+        rapid_charge = True
     return ResolvedUnit(
         template_id=tpl.id,
         name=display_name,
@@ -833,7 +1303,7 @@ def resolve_entry(entry: ArmyListEntry) -> ResolvedUnit:
         stealth=stealth,
         relentless=relentless,
         fast=fast,
-        highborn=True,
+        faction=tpl.faction,
         artillery=tpl.artillery,
         shielded=shielded,
         furious=tpl.furious,
@@ -845,6 +1315,47 @@ def resolve_entry(entry: ArmyListEntry) -> ResolvedUnit:
         fear=fear,
         stealth_aura=stealth_aura,
         scout_aura=scout_aura,
+        battleborn=tpl.battleborn,
+        strider=strider,
+        versatile_attack=versatile_attack,
+        versatile_reach=versatile_reach,
+        unstoppable_mark=unstoppable_mark,
+        bane_melee=eff_bane_melee,
+        bane_shoot=eff_bane_shoot,
+        courage=eff_courage,
+        rapid_rush=eff_rapid_rush,
+        bane_melee_aura=bane_melee_aura,
+        bane_shoot_aura=bane_shoot_aura,
+        courage_aura=courage_aura,
+        rapid_rush_aura=rapid_rush_aura,
+        regeneration_aura=regeneration_aura,
+        versatile_reach_aura=versatile_reach_aura,
+        # ED unit-level rules
+        clan_warrior=tpl.clan_warrior,
+        clan_warrior_boost=clan_warrior_boost,
+        piercing_hunter=piercing_hunter,
+        melee_evasion=melee_evasion,
+        counter_attack=counter_attack,
+        unpredictable_fighter=unpredictable_fighter,
+        rapid_advance=rapid_advance,
+        rapid_charge=rapid_charge,
+        bounding=bounding,
+        ed_teleport=ed_teleport,
+        vengeance=vengeance,
+        isr_mark=isr_mark,
+        ignores_cover=ignores_cover,
+        slow=tpl.slow,
+        precision_fighter=precision_fighter,
+        # ED aura sources
+        clan_warrior_boost_aura=clan_warrior_boost_aura,
+        counter_attack_aura=counter_attack_aura,
+        fearless_aura=fearless_aura,
+        ignores_cover_aura=ignores_cover_aura,
+        melee_evasion_aura=melee_evasion_aura,
+        piercing_hunter_aura=piercing_hunter_aura,
+        precision_fighter_aura=precision_fighter_aura,
+        rapid_advance_aura=rapid_advance_aura,
+        rapid_charge_aura=rapid_charge_aura,
     )
 
 

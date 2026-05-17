@@ -8,12 +8,29 @@ from tkinter import ttk
 import torch
 import torch.nn.functional as F
 
-from board import COLS, ROWS, OBJECTIVES
+from board import COLS, ROWS, OBJECTIVES, CoverType, MovementType
 
 # Cell size in pixels
 CELL = 12
 BOARD_W = COLS * CELL
 BOARD_H = ROWS * CELL
+
+
+# Per-(cover, movement) fills/outlines for terrain pieces. Colours track
+# view_map.py but the wall fill is lifted for visibility against the
+# game viewer's dark canvas background.
+TERRAIN_STYLES: dict[tuple[CoverType, MovementType], tuple[str, str]] = {
+    (CoverType.BLOCKING,  MovementType.IMPASSIBLE):  ("#4a4a4a", "#8e8e8e"),  # wall
+    (CoverType.OBSCURING, MovementType.DIFFICULT):   ("#2d5a2d", "#5fa45f"),  # forest
+    (CoverType.SHELTERING, MovementType.DIFFICULT):  ("#1e4d6b", "#56a8d4"),  # water
+    (CoverType.SHELTERING, MovementType.OPEN):       ("#8a6a3a", "#d4a866"),  # ruin
+}
+# Faint deployment-zone tints. Drawn under terrain so a wall in the DZ
+# still reads as a wall.
+DZ_A_FILL = "#2a3550"
+DZ_B_FILL = "#502a2a"
+# Subtle outline on objective overlay tiles (matches view_map's gold).
+OBJ_TILE_OUTLINE = "#a07c14"
 
 # Base hues for each player (HSV).  Player A = blue range, Player B = red range.
 # Each distinct template_id gets a unique hue within the player's range.
@@ -85,7 +102,8 @@ class GameViewer:
                  mode: str = "objectives", unit_points: list[int] | None = None,
                  unit_info: list[dict] | None = None,
                  parent: tk.Tk | tk.Toplevel | None = None,
-                 ai_suggest_fn=None):
+                 ai_suggest_fn=None,
+                 map_data=None):
         self.frames = frames
         self.labels = labels
         self.owners = owners
@@ -98,6 +116,11 @@ class GameViewer:
         self._parent = parent  # if provided, use Toplevel instead of Tk
         self._ai_suggest_fn = ai_suggest_fn  # callback(frame_idx) -> dict
         self._next_suggest_fn = None  # set externally by PlayViewer
+        # MapData (terrain + DZ cells + objectives) for the game just played.
+        # When set, _render paints the terrain pieces and DZ tints; objective
+        # positions are read from map_data.objectives instead of the legacy
+        # module global. None ⇒ legacy empty-board look.
+        self.map_data = map_data
 
         # Extract template_ids from unit_info (fall back to index-based)
         template_ids = []
@@ -329,6 +352,48 @@ class GameViewer:
         frame = self.frames[self.current]
         self.canvas.delete("all")
 
+        # Map-driven overlays: deployment-zone tint + terrain pieces +
+        # objective-tile outlines. Painted before the grid so the grid sits
+        # on top and stays legible. No-ops when no MapData was supplied.
+        if self.map_data is not None:
+            for col, row in self.map_data.deployment_a:
+                x = col * CELL
+                y = (ROWS - 1 - row) * CELL
+                self.canvas.create_rectangle(x, y, x + CELL, y + CELL,
+                                             fill=DZ_A_FILL, outline="")
+            for col, row in self.map_data.deployment_b:
+                x = col * CELL
+                y = (ROWS - 1 - row) * CELL
+                self.canvas.create_rectangle(x, y, x + CELL, y + CELL,
+                                             fill=DZ_B_FILL, outline="")
+            for piece in self.map_data.terrain:
+                style = TERRAIN_STYLES.get(
+                    (piece.cover_type, piece.movement_type),
+                    ("#7e7e3a", "#bfbf66"))
+                x0 = piece.x_lo * CELL
+                x1 = (piece.x_hi + 1) * CELL
+                # y_hi → top pixel after flip; y_lo → bottom.
+                y0 = (ROWS - 1 - piece.y_hi) * CELL
+                y1 = (ROWS - piece.y_lo) * CELL
+                self.canvas.create_rectangle(x0, y0, x1, y1,
+                                             fill=style[0], outline=style[1], width=1)
+            # Objective-tile overlay (the cluster squares around each obj
+            # centre). Skip the centres themselves — they get the standard
+            # circle marker further down.
+            centres = {(int(round(c)), int(round(r))) for c, r in self.map_data.objectives}
+            for col, row in self.map_data.objective_tiles:
+                if (col, row) in centres:
+                    continue
+                x = col * CELL
+                y = (ROWS - 1 - row) * CELL
+                self.canvas.create_rectangle(x + 2, y + 2, x + CELL - 2, y + CELL - 2,
+                                             outline=OBJ_TILE_OUTLINE, width=1)
+            for col, row in self.map_data.dz_objective_tiles:
+                x = col * CELL
+                y = (ROWS - 1 - row) * CELL
+                self.canvas.create_rectangle(x + 2, y + 2, x + CELL - 2, y + CELL - 2,
+                                             outline=OBJ_TILE_OUTLINE, width=1)
+
         # Draw grid lines (sparse — every 6 inches)
         for c in range(0, COLS + 1, 6):
             x = c * CELL
@@ -337,15 +402,25 @@ class GameViewer:
             y = (ROWS - r) * CELL  # flip Y so row 0 is at bottom
             self.canvas.create_line(0, y, BOARD_W, y, fill="#3a3a3a")
 
-        # Draw deployment zone boundaries
-        for row_line in [12, 36]:
-            y = (ROWS - row_line) * CELL
-            self.canvas.create_line(0, y, BOARD_W, y, fill="#555555", dash=(4, 4))
+        # Legacy DZ row dividers — only on the empty-board layout. Map-driven
+        # layouts express the DZ via the tinted cells above, so the hardcoded
+        # row=12/row=36 lines don't represent map2's irregular DZ.
+        if self.map_data is None:
+            for row_line in [12, 36]:
+                y = (ROWS - row_line) * CELL
+                self.canvas.create_line(0, y, BOARD_W, y, fill="#555555", dash=(4, 4))
 
-        # Draw objectives (objectives mode only)
+        # Draw objectives (objectives mode only). Prefer the map's objective
+        # list when available so map2's centres (which differ from the legacy
+        # constants for side objectives) are rendered correctly even if the
+        # module-level OBJECTIVES wasn't mutated in this process.
         obj_ctrl = frame['objectives']
+        objectives_to_draw = (self.map_data.objectives
+                              if self.map_data is not None else OBJECTIVES)
         if self.mode != "kill_points":
-            for oi, (oc, orow) in enumerate(OBJECTIVES):
+            for oi, (oc, orow) in enumerate(objectives_to_draw):
+                if oi >= len(obj_ctrl):
+                    break
                 x = oc * CELL + CELL // 2
                 y = (ROWS - orow) * CELL - CELL // 2
                 r = CELL * 2
@@ -1144,10 +1219,13 @@ class GameViewer:
 def show_game(frames: list[dict], labels: list[str], owners: list[str],
               mode: str = "objectives", unit_points: list[int] | None = None,
               unit_info: list[dict] | None = None,
-              parent: tk.Tk | tk.Toplevel | None = None):
-    """Launch the game viewer window."""
+              parent: tk.Tk | tk.Toplevel | None = None,
+              map_data=None):
+    """Launch the game viewer window. Pass ``map_data`` (a MapData instance)
+    to render the map's terrain and irregular deployment zones beneath the
+    units; omit for the legacy empty-board look."""
     viewer = GameViewer(frames, labels, owners, mode=mode, unit_points=unit_points,
-                        unit_info=unit_info, parent=parent)
+                        unit_info=unit_info, parent=parent, map_data=map_data)
     viewer.run()
 
 

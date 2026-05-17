@@ -67,6 +67,10 @@ class FlatReplayResult:
     is_move: torch.Tensor | None = None            # (N,) bool — dest active (non-charge, non-shaken)
     is_can_shoot: torch.Tensor | None = None       # (N,) bool — shoot active (advance-reachable dest)
     is_charge: torch.Tensor | None = None          # (N,) bool
+    # Move-head was a real choice (not shaken AND ≥1 chargeable enemy). Used
+    # to gate the move-head entropy target so masked-deterministic states
+    # don't drag the aggregate entropy below the (now-infeasible) target.
+    is_can_charge_any: torch.Tensor | None = None  # (N,) bool
     alive_mask: torch.Tensor | None = None         # (N, 10)
     enemy_alive_mask: torch.Tensor | None = None   # (N, 10)
     shoot_mask: torch.Tensor | None = None         # (N, 10)
@@ -92,6 +96,7 @@ class FlatReplayResult:
     move_logits: torch.Tensor | None = None    # (N, 2) — move type logits conditioned on chosen unit
     charge_logits: torch.Tensor | None = None  # (N, 10) — charge target logits (masked)
     shoot_logits: torch.Tensor | None = None   # (N, 10) — shoot target logits (masked)
+    dest_logits: torch.Tensor | None = None    # (N, mb_max_cands) — dest pointer logits (padded, -inf on mask)
     # Destination pointer: number of valid candidates per step (for normalised entropy)
     dest_n_valid: torch.Tensor | None = None  # (N,) — int, number of valid candidates
     # Per-phase value head outputs — only populated when the phase-reencode flag
@@ -146,6 +151,11 @@ class PreparedReplayData:
     # dest) get state_vec as their post-move value so the POST_DEST encode is a
     # no-op delta from the prior phase's input.
     state_vec_post_batch: torch.Tensor | None = None
+    # Cover-aware expected wound frac per step (TERRAIN_SPEC §5.4/§5.5). When
+    # present, replayed as ``expected_wound_frac_override`` to compute_shoot_logits
+    # so sampling and replay see the same shoot key. None ⇒ replay falls back to
+    # the cover-blind bucket lookup (used for older trajectories).
+    cover_aware_dmg: torch.Tensor | None = None  # (N, 10) float
 
 
 def prepare_replay_data(
@@ -233,6 +243,18 @@ def prepare_replay_data(
         shoot_mask_np = enemy_alive_np.copy()
     # Will apply is_shaken masking after tensor conversion
 
+    # --- Cover-aware expected wound frac (§5.4/§5.5) ---
+    # Build the batched tensor only when EVERY step has it recorded; mixed
+    # batches (older trajectories without the field) fall back to the
+    # cover-blind bucket lookup so we don't silently zero out their shoot
+    # keys.
+    cover_dmg_np: np.ndarray | None = None
+    if all(getattr(s, 'cover_aware_dmg', None) is not None for s in flat_steps):
+        cover_dmg_np = np.zeros((n_steps, MAX_UNITS_PER_SIDE), dtype=np.float32)
+        for i, s in enumerate(flat_steps):
+            cad = s.cover_aware_dmg
+            cover_dmg_np[i, :len(cad)] = np.asarray(cad, dtype=np.float32)[:MAX_UNITS_PER_SIDE]
+
     # --- Destination features (precompute once, compact buffer storage) ---
     dest_selected_np = np.zeros(n_steps, dtype=np.int64)
     dest_is_ar_np = np.ones(n_steps, dtype=np.bool_)
@@ -309,6 +331,8 @@ def prepare_replay_data(
         torch.from_numpy(state_np), torch.from_numpy(unit_idx_np)).numpy()
     shoot_mask_np = shoot_mask_np & ~np.expand_dims(is_shaken_np, -1)
     shoot_mask_t = torch.from_numpy(shoot_mask_np).to(device)
+    cover_dmg_t = (torch.from_numpy(cover_dmg_np).to(device)
+                   if cover_dmg_np is not None else None)
 
     return PreparedReplayData(
         state_batch=state_batch,
@@ -327,6 +351,7 @@ def prepare_replay_data(
         dest_offsets=dest_offsets_np, dest_counts=dest_counts_np,
         n_steps=n_steps, n_episodes=len(all_trajectories), device=device,
         state_vec_post_batch=state_post_batch,
+        cover_aware_dmg=cover_dmg_t,
     )
 
 
@@ -367,6 +392,8 @@ def replay_from_prepared(
     charge_indices = prepared.charge_indices[step_indices]
     shoot_indices_t = prepared.shoot_indices[step_indices]
     shoot_mask_batch = prepared.shoot_mask[step_indices]
+    cover_dmg_batch = (prepared.cover_aware_dmg[step_indices]
+                       if prepared.cover_aware_dmg is not None else None)
     rewards_batch = prepared.rewards[step_indices]
 
     # --- Dest features: pad compact buffer to minibatch-local max, transfer ---
@@ -475,6 +502,7 @@ def replay_from_prepared(
         h_pointer, units_pointer, unit_indices, post_move_rel_batch,
         enemy_alive_batch, shoot_range_mask=shoot_mask_batch,
         return_components=True,
+        expected_wound_frac_override=cover_dmg_batch,
     )
 
     # === Value head ===
@@ -521,12 +549,15 @@ def replay_from_prepared(
     # === Log-probs & entropies ===
     all_dead = ~alive_batch.any(dim=1, keepdim=True)
     safe_unit_logits = unit_logits.masked_fill(all_dead, 0.0)
-    safe_unit_logits = torch.nan_to_num(safe_unit_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+    # Do NOT collapse -inf: masked dead slots must stay at zero probability
+    # under softmax (otherwise log_softmax normalization leaks onto padded
+    # slots, inflating entropy and biasing unit_lp).
+    safe_unit_logits = torch.nan_to_num(safe_unit_logits, nan=0.0, posinf=50.0)
     unit_log_probs = torch.log_softmax(safe_unit_logits, dim=-1)
     unit_lp = unit_log_probs.gather(1, unit_indices.unsqueeze(1)).squeeze(1)
     unit_ent = torch.distributions.Categorical(logits=safe_unit_logits).entropy()
 
-    move_logits_safe = torch.nan_to_num(move_logits_out, nan=0.0, posinf=50.0, neginf=-50.0)
+    move_logits_safe = torch.nan_to_num(move_logits_out, nan=0.0, posinf=50.0)
     move_dist = torch.distributions.Categorical(logits=move_logits_safe)
     move_lp = move_dist.log_prob(move_indices)
     move_ent = move_dist.entropy()
@@ -534,7 +565,7 @@ def replay_from_prepared(
     has_dest = dest_mask_batch.any(dim=-1)
     safe_dest_logits = dest_logits.clone()
     safe_dest_logits[~has_dest] = 0.0
-    safe_dest_logits = torch.nan_to_num(safe_dest_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+    safe_dest_logits = torch.nan_to_num(safe_dest_logits, nan=0.0, posinf=50.0)
     dest_log_probs = torch.log_softmax(safe_dest_logits, dim=-1)
     dest_lp = dest_log_probs.gather(1, dest_selected_batch.unsqueeze(1)).squeeze(1)
     dest_lp = dest_lp.masked_fill(~has_dest, 0.0)
@@ -544,14 +575,14 @@ def replay_from_prepared(
 
     enemy_all_dead = ~enemy_alive_batch.any(dim=-1, keepdim=True)
     safe_charge_logits = charge_logits_out.masked_fill(enemy_all_dead, 0.0)
-    safe_charge_logits = torch.nan_to_num(safe_charge_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+    safe_charge_logits = torch.nan_to_num(safe_charge_logits, nan=0.0, posinf=50.0)
     charge_log_probs = torch.log_softmax(safe_charge_logits, dim=-1)
     charge_lp = charge_log_probs.gather(1, charge_indices.unsqueeze(1)).squeeze(1)
     charge_ent = torch.distributions.Categorical(logits=safe_charge_logits).entropy()
 
     no_shootable = ~shoot_mask_batch.any(dim=-1, keepdim=True)
     safe_shoot_logits = shoot_logits_out.masked_fill(no_shootable, 0.0)
-    safe_shoot_logits = torch.nan_to_num(safe_shoot_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+    safe_shoot_logits = torch.nan_to_num(safe_shoot_logits, nan=0.0, posinf=50.0)
     shoot_log_probs = torch.log_softmax(safe_shoot_logits, dim=-1)
     shoot_lp = shoot_log_probs.gather(1, shoot_indices_t.unsqueeze(1)).squeeze(1)
     shoot_lp = shoot_lp.masked_fill(no_shootable.squeeze(-1), 0.0)
@@ -577,6 +608,11 @@ def replay_from_prepared(
     total_lp = total_lp + torch.where(is_charge, charge_lp, _zero)
     total_ent = total_ent + torch.where(is_charge, charge_ent, _zero)
     n_heads = n_heads + is_charge.float()
+
+    # Move head is a real 2-way choice only when not shaken AND ≥1 chargeable
+    # enemy. State_vec masking forces deterministic move otherwise — those
+    # rows must not enter the move-entropy target average.
+    is_can_charge_any = (~is_shaken_batch) & can_charge_batch.any(dim=-1)
 
     mean_ent = total_ent / n_heads.clamp(min=1.0)
     total_reward = rewards_batch.sum().item()
@@ -623,6 +659,7 @@ def replay_from_prepared(
         dest_entropies=dest_ent, charge_entropies=charge_ent,
         shoot_entropies=shoot_ent,
         is_move=is_move, is_can_shoot=is_can_shoot, is_charge=is_charge,
+        is_can_charge_any=is_can_charge_any,
         alive_mask=alive_batch, enemy_alive_mask=enemy_alive_batch,
         shoot_mask=shoot_mask_batch,
         aux_friendly_surv_alpha=aux_fs_alpha, aux_friendly_surv_beta=aux_fs_beta,
@@ -638,6 +675,7 @@ def replay_from_prepared(
         per_opp_type_mean_values=per_opp_type_mean_values,
         unit_logits=unit_logits, move_logits=move_logits_out,
         charge_logits=charge_logits_out, shoot_logits=shoot_logits_out,
+        dest_logits=dest_logits,
         dest_n_valid=dest_mask_batch.sum(dim=-1),
         per_phase_values=per_phase_values,
     )
@@ -688,6 +726,11 @@ def compute_loss_flat(
     flat_steps: list[TacticalActivationRecord] | None = None,
     entropy_tuner: EntropyTargetTuner | None = None,
     planning_distill_max_weight: float = 0.0,
+    planning_distill_ramp: float = 1.0,
+    planning_distill_mode: str = "ce_chosen",
+    mpo_eta: float = 1.0,
+    flat_result_old: FlatReplayResult | None = None,
+    kl_trust_region_beta: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Vectorized PPO loss — no Python loops over individual steps.
 
@@ -780,16 +823,20 @@ def compute_loss_flat(
     per_head_n = {}
     if flat_result.unit_entropies is not None:
         # Conditional heads are averaged only over samples where the head is active,
-        # matching the alpha tuner's view (entropy.py). Unit and move are active for
-        # every sample, so their gate is implicit. per_head_n carries the effective
-        # sample count so minibatch aggregation can weight correctly.
+        # matching the alpha tuner's view (entropy.py). Unit is active for every
+        # sample; move is active only when ≥1 enemy is chargeable and the unit
+        # isn't shaken (otherwise charge is masked and entropy is forced to 0,
+        # which would deflate the logged value below the tuner's effective
+        # comparison). per_head_n carries the effective sample count so
+        # minibatch aggregation can weight correctly.
         is_move = flat_result.is_move
         is_can_shoot = flat_result.is_can_shoot
         is_charge_m = flat_result.is_charge
+        is_cc_any = flat_result.is_can_charge_any
         n_total = flat_result.unit_entropies.shape[0]
         for name, ent_t, gate in [
             ("unit", flat_result.unit_entropies, None),
-            ("move", flat_result.move_entropies, None),
+            ("move", flat_result.move_entropies, is_cc_any),
             ("dest", flat_result.dest_entropies, is_move),
             ("charge", flat_result.charge_entropies, is_charge_m),
             ("shoot", flat_result.shoot_entropies, is_can_shoot),
@@ -821,6 +868,7 @@ def compute_loss_flat(
             flat_result.is_move,
             flat_result.is_can_shoot,
             flat_result.is_charge,
+            is_can_charge_any=flat_result.is_can_charge_any,
         )
         loss = mean_policy_loss + value_coeff * mean_value_loss - entropy_bonus
 
@@ -838,6 +886,7 @@ def compute_loss_flat(
             flat_result.enemy_alive_mask,
             flat_result.shoot_mask,
             dest_n_valid=flat_result.dest_n_valid,
+            is_can_charge_any=flat_result.is_can_charge_any,
         )
         alpha_loss_val = alpha_loss.item()
     else:
@@ -866,16 +915,35 @@ def compute_loss_flat(
             loss = loss + effective_aux_coeff * _aux_loss
 
     # --- Planning distillation loss ---
+    # The reported `distill_loss_val` is the unramped scalar so the raw
+    # signal is visible in logs; the gradient contribution is scaled by
+    # `planning_distill_ramp` (0 during warmup, 0->1 over the ramp window).
     distill_loss_val = 0.0
     distill_sub_losses: dict[str, float] = {}
-    if planning_distill_max_weight > 0 and flat_steps is not None:
+    distill_peaks: dict[str, float] = {}
+    if (planning_distill_max_weight > 0
+            and planning_distill_ramp > 0
+            and flat_steps is not None):
         _distill = _compute_planning_distill_loss(
             flat_result, flat_steps, planning_distill_max_weight,
+            mode=planning_distill_mode, eta=mpo_eta,
         )
         if _distill is not None:
-            _distill_tensor, distill_sub_losses = _distill
+            _distill_tensor, distill_sub_losses, distill_peaks = _distill
             distill_loss_val = _distill_tensor.item()
-            loss = loss + _distill_tensor
+            loss = loss + planning_distill_ramp * _distill_tensor
+
+    # --- KL trust region against π_old ---
+    # Active only when β > 0 and the snapshot forward result is available
+    # (the trainer materialises model_old only when β > 0). β scheduling
+    # is handled in the trainer; this function consumes the resolved β.
+    kl_trust_region_loss_val = 0.0
+    kl_trust_per_head: dict[str, float] = {}
+    if kl_trust_region_beta > 0 and flat_result_old is not None:
+        _kl_total, kl_trust_per_head = _compute_kl_trust_region(
+            flat_result, flat_result_old)
+        kl_trust_region_loss_val = _kl_total.item()
+        loss = loss + kl_trust_region_beta * _kl_total
 
     # --- Planning activation metrics ---
     planning_activations = 0
@@ -893,7 +961,7 @@ def compute_loss_flat(
                     planning_argmax_best += 1
 
     weighted_aux = effective_aux_coeff * aux_loss_val
-    non_aux_loss = loss.item() - weighted_aux - distill_loss_val
+    non_aux_loss = loss.item() - weighted_aux - planning_distill_ramp * distill_loss_val
     metrics = {
         "loss": loss.item(),
         "policy_loss": mean_policy_loss.item(),
@@ -931,7 +999,9 @@ def compute_loss_flat(
         "_alpha_loss_tensor": alpha_loss,  # for backprop (not serialized)
         "per_opp_type_mean_values": flat_result.per_opp_type_mean_values or {},
         "planning_distill_loss": distill_loss_val,
+        "planning_distill_ramp": planning_distill_ramp,
         "planning_distill_sub": distill_sub_losses,
+        "planning_distill_peaks": distill_peaks,
         "planning_activations": planning_activations,
         "planning_improvement_rate": (
             planning_improvements / planning_activations
@@ -945,6 +1015,9 @@ def compute_loss_flat(
             planning_argmax_best / planning_activations
             if planning_activations > 0 else 0.0
         ),
+        "kl_trust_region_loss": kl_trust_region_loss_val,
+        "kl_trust_region_beta": kl_trust_region_beta,
+        "kl_trust_per_head": kl_trust_per_head,
     }
     return loss, metrics
 
@@ -1097,6 +1170,85 @@ def _compute_aux_loss(
 # Planning distillation loss
 # ---------------------------------------------------------------------------
 
+def _compute_kl_trust_region(
+    flat_result: FlatReplayResult,
+    flat_result_old: FlatReplayResult,
+) -> tuple[torch.Tensor, dict]:
+    """Per-head KL(π || π_old) summed across heads, gated by activation.
+
+    π_old logits come from a frozen snapshot model (`model_old` in the
+    trainer), refreshed once per outer batch iteration. The KL is
+    averaged within each active head — using the same is_move /
+    is_charge / is_can_shoot gates as the entropy tracker — and then
+    summed across heads so per-head magnitudes stay commensurate.
+
+    Returns (total_kl, per_head_kl_dict).
+    """
+    if flat_result.unit_logits is None or flat_result_old.unit_logits is None:
+        device = flat_result.values.device
+        return torch.zeros((), device=device), {}
+
+    device = flat_result.unit_logits.device
+    total = torch.zeros((), device=device)
+    per_head: dict[str, float] = {}
+
+    def _kl_per_row(logits: torch.Tensor, logits_old: torch.Tensor) -> torch.Tensor:
+        # KL(π || π_old) row-wise. -inf logits come from identical legality
+        # masks in both π and π_old, so log_p and log_p_old are both -inf at
+        # those slots. Computing log_p - log_p_old directly gives NaN
+        # (-inf − -inf), which contaminates gradients even when the forward
+        # value is later cleaned with nan_to_num — the backward through the
+        # NaN-producing op leaks NaN gradients into the logits. Use
+        # torch.where to gate the subtraction at masked slots: at safe
+        # slots compute the real KL term; at masked slots return 0 with a
+        # zero-gradient branch.
+        log_p = F.log_softmax(logits, dim=-1)
+        log_p_old = F.log_softmax(logits_old, dim=-1)
+        safe = torch.isfinite(log_p) & torch.isfinite(log_p_old)
+        log_p_safe = torch.where(safe, log_p, torch.zeros_like(log_p))
+        log_p_old_safe = torch.where(safe, log_p_old, torch.zeros_like(log_p_old))
+        # At unsafe slots: log_p_safe.exp() = 1, (0 - 0) = 0 → contribution 0.
+        # At safe slots: standard KL term. The torch.where above zeros the
+        # gradient through log_p at unsafe positions.
+        kl_terms = log_p_safe.exp() * (log_p_safe - log_p_old_safe)
+        return kl_terms.sum(dim=-1)
+
+    # Unit and move heads — always active.
+    kl_unit = _kl_per_row(flat_result.unit_logits, flat_result_old.unit_logits).mean()
+    total = total + kl_unit
+    per_head["unit"] = kl_unit.item()
+
+    if flat_result.move_logits is not None and flat_result_old.move_logits is not None:
+        kl_move = _kl_per_row(flat_result.move_logits, flat_result_old.move_logits).mean()
+        total = total + kl_move
+        per_head["move"] = kl_move.item()
+
+    # Conditional heads — gated by the same flags the entropy tuner uses.
+    def _add_gated(
+        logits: torch.Tensor | None, logits_old: torch.Tensor | None,
+        gate: torch.Tensor | None, name: str,
+    ) -> None:
+        nonlocal total
+        if logits is None or logits_old is None or gate is None:
+            return
+        n_gate = int(gate.sum().item())
+        if n_gate == 0:
+            return
+        kl_per = _kl_per_row(logits, logits_old)
+        kl_avg = (kl_per * gate.float()).sum() / n_gate
+        total = total + kl_avg
+        per_head[name] = kl_avg.item()
+
+    _add_gated(flat_result.dest_logits, flat_result_old.dest_logits,
+               flat_result.is_move, "dest")
+    _add_gated(flat_result.charge_logits, flat_result_old.charge_logits,
+               flat_result.is_charge, "charge")
+    _add_gated(flat_result.shoot_logits, flat_result_old.shoot_logits,
+               flat_result.is_can_shoot, "shoot")
+
+    return total, per_head
+
+
 def _kl_from_soft_target(
     target: torch.Tensor, log_probs: torch.Tensor,
 ) -> torch.Tensor:
@@ -1116,13 +1268,28 @@ def _compute_planning_distill_loss(
     flat_result: FlatReplayResult,
     flat_steps: list[TacticalActivationRecord],
     max_weight: float,
-) -> tuple[torch.Tensor, dict] | None:
-    """Gated distillation loss from planned activations across all heads.
+    mode: str = "ce_chosen",
+    eta: float = 1.0,
+) -> tuple[torch.Tensor, dict, dict] | None:
+    """Distillation loss from planned activations across all heads.
 
-    Only applies to activations where planning found a better action than
-    the policy argmax. Weight scales with the value gap.
+    Modes:
+      "ce_chosen"    — hard cross-entropy on the planner's chosen candidate
+                       index per head (one-hot through the KL machinery;
+                       KL(one-hot || policy) == CE). Gated on planning_improved.
+                       Weight = min(planning_value_delta, max_weight).
+      "soft_kl"      — soft KL against softmax(per-candidate V), η=1.0 implicit
+                       (η param ignored). Gated on planning_improved. Weight =
+                       min(planning_value_delta, max_weight). Legacy.
+      "mpo_marginal" — MPO marginalised loss. Soft KL against softmax(V/η),
+                       NOT gated on planning_improved (every planned step
+                       contributes). Per-step weight is uniform (1.0); the
+                       softmax(V/η) target alone shapes the gradient.
 
-    Returns (total_loss, sub_loss_dict) or None if no planned-improved steps.
+    Returns (total_loss, sub_loss_dict, peaks_dict) or None if no eligible
+    steps. peaks_dict has keys {tgt,pol}_<head> and agree_<head>; in
+    "ce_chosen" mode the target is one-hot so tgt_<head> ≈ 1.0 and
+    agree_<head> is the metric of interest.
     """
     if flat_result.unit_logits is None:
         return None
@@ -1136,66 +1303,159 @@ def _compute_planning_distill_loss(
     charge_indices, charge_targets, charge_weights = [], [], []
     # Shoot target head
     shoot_indices, shoot_targets, shoot_weights = [], [], []
+    # Destination pointer head — variable width; the model's dest_logits are
+    # padded to the minibatch-local max candidate count, so we store raw
+    # (idx, val) pairs here and build the soft target tensor after we know
+    # that width.
+    dest_indices: list[int] = []
+    dest_sparse_targets: list[list[tuple[int, float]]] = []
+    dest_weights: list[float] = []
+
+    # Dest-mode-specific buffer: in ce_chosen we only need the per-step
+    # selected-candidate index, not the (idx, val) sparse pairs.
+    dest_selected: list[int] = []
 
     for i, s in enumerate(flat_steps):
-        if not s.was_planned or not s.planning_improved:
-            continue
-        w = min(s.planning_value_delta, max_weight)
+        # Mode-dependent gate and per-step weight.
+        # Legacy modes preserve the original (gate, weight) pair bit-exactly.
+        if mode == "mpo_marginal":
+            # Every planned step contributes — per-candidate weighting
+            # comes from softmax(V/η) inside the target distribution, not
+            # from planning_value_delta, so we don't apply value-delta
+            # scaling here. We do use max_weight as a uniform per-step
+            # scale so `planning_distill_max_weight` keeps its intuitive
+            # role as the overall cap on distill influence (otherwise the
+            # mpo_marginal contribution would be ~1/max_weight times the
+            # legacy magnitude and would dominate the PPO surrogate).
+            if not s.was_planned:
+                continue
+            w = max_weight
+        else:
+            if not s.was_planned or not s.planning_improved:
+                continue
+            w = min(s.planning_value_delta, max_weight)
 
-        # --- Unit head (existing logic) ---
-        if s.planning_unit_values is not None and s.planning_unit_indices is not None:
-            target = torch.full((MAX_UNITS_PER_SIDE,), float('-inf'))
-            for idx, val in zip(s.planning_unit_indices, s.planning_unit_values):
-                target[idx] = val
-            target = torch.softmax(target, dim=0)
-            unit_indices.append(i)
-            unit_targets.append(target)
-            unit_weights.append(w)
+        if mode == "ce_chosen":
+            # --- Unit head: one-hot at chosen unit ---
+            if 0 <= s.unit_idx < MAX_UNITS_PER_SIDE:
+                target = torch.zeros(MAX_UNITS_PER_SIDE)
+                target[s.unit_idx] = 1.0
+                unit_indices.append(i)
+                unit_targets.append(target)
+                unit_weights.append(w)
 
-        # --- Move type head: ≥2 distinct move types for chosen unit ---
-        if (s.planning_move_values is not None
-                and s.planning_move_indices is not None
-                and len(s.planning_move_indices) >= 2):
-            target = torch.full((NUM_MOVE_TYPES,), float('-inf'))
-            for idx, val in zip(s.planning_move_indices, s.planning_move_values):
-                target[idx] = val
-            target = torch.softmax(target, dim=0)
-            move_indices.append(i)
-            move_targets.append(target)
-            move_weights.append(w)
+            # --- Move head: one-hot at chosen move type ---
+            if 0 <= s.move_type < NUM_MOVE_TYPES:
+                target = torch.zeros(NUM_MOVE_TYPES)
+                target[s.move_type] = 1.0
+                move_indices.append(i)
+                move_targets.append(target)
+                move_weights.append(w)
 
-        # --- Charge target head: chosen move is charge AND ≥2 distinct targets ---
-        if (s.move_type == MOVE_CHARGE
-                and s.planning_charge_values is not None
-                and s.planning_charge_indices is not None
-                and len(s.planning_charge_indices) >= 2):
-            target = torch.full((MAX_UNITS_PER_SIDE,), float('-inf'))
-            for idx, val in zip(s.planning_charge_indices, s.planning_charge_values):
-                target[idx] = val
-            target = torch.softmax(target, dim=0)
-            charge_indices.append(i)
-            charge_targets.append(target)
-            charge_weights.append(w)
+            # --- Charge target head: only when chosen action is charge ---
+            if (s.move_type == MOVE_CHARGE
+                    and 0 <= s.charge_target_idx < MAX_UNITS_PER_SIDE):
+                target = torch.zeros(MAX_UNITS_PER_SIDE)
+                target[s.charge_target_idx] = 1.0
+                charge_indices.append(i)
+                charge_targets.append(target)
+                charge_weights.append(w)
 
-        # --- Shoot target head: chosen move can shoot (advance-reachable dest) AND ≥2 distinct targets ---
-        if (s.move_type == MOVE_MOVE
-                and s.planning_shoot_values is not None
-                and s.planning_shoot_indices is not None
-                and len(s.planning_shoot_indices) >= 2):
-            target = torch.full((MAX_UNITS_PER_SIDE,), float('-inf'))
-            for idx, val in zip(s.planning_shoot_indices, s.planning_shoot_values):
-                target[idx] = val
-            target = torch.softmax(target, dim=0)
-            shoot_indices.append(i)
-            shoot_targets.append(target)
-            shoot_weights.append(w)
+            # --- Shoot target head: only when chosen move shoots ---
+            if (s.move_type == MOVE_MOVE
+                    and 0 <= s.shoot_target_idx < MAX_UNITS_PER_SIDE):
+                target = torch.zeros(MAX_UNITS_PER_SIDE)
+                target[s.shoot_target_idx] = 1.0
+                shoot_indices.append(i)
+                shoot_targets.append(target)
+                shoot_weights.append(w)
 
-    if not unit_indices and not move_indices and not charge_indices and not shoot_indices:
+            # --- Dest head: only when chosen action moves to a valid dest ---
+            if s.move_type == MOVE_MOVE and s.dest_selected_idx >= 0:
+                dest_indices.append(i)
+                dest_selected.append(s.dest_selected_idx)
+                dest_weights.append(w)
+
+        else:  # mode in ("soft_kl", "mpo_marginal") — soft target via softmax(V/η)
+            # --- Unit head ---
+            if s.planning_unit_values is not None and s.planning_unit_indices is not None:
+                target = torch.full((MAX_UNITS_PER_SIDE,), float('-inf'))
+                for idx, val in zip(s.planning_unit_indices, s.planning_unit_values):
+                    target[idx] = val
+                target = torch.softmax(target / eta, dim=0)
+                unit_indices.append(i)
+                unit_targets.append(target)
+                unit_weights.append(w)
+
+            # --- Move type head: ≥2 distinct move types for chosen unit ---
+            if (s.planning_move_values is not None
+                    and s.planning_move_indices is not None
+                    and len(s.planning_move_indices) >= 2):
+                target = torch.full((NUM_MOVE_TYPES,), float('-inf'))
+                for idx, val in zip(s.planning_move_indices, s.planning_move_values):
+                    target[idx] = val
+                target = torch.softmax(target / eta, dim=0)
+                move_indices.append(i)
+                move_targets.append(target)
+                move_weights.append(w)
+
+            # --- Charge target head: chosen move is charge AND ≥2 distinct targets ---
+            if (s.move_type == MOVE_CHARGE
+                    and s.planning_charge_values is not None
+                    and s.planning_charge_indices is not None
+                    and len(s.planning_charge_indices) >= 2):
+                target = torch.full((MAX_UNITS_PER_SIDE,), float('-inf'))
+                for idx, val in zip(s.planning_charge_indices, s.planning_charge_values):
+                    target[idx] = val
+                target = torch.softmax(target / eta, dim=0)
+                charge_indices.append(i)
+                charge_targets.append(target)
+                charge_weights.append(w)
+
+            # --- Shoot target head: chosen move can shoot AND ≥2 distinct targets ---
+            if (s.move_type == MOVE_MOVE
+                    and s.planning_shoot_values is not None
+                    and s.planning_shoot_indices is not None
+                    and len(s.planning_shoot_indices) >= 2):
+                target = torch.full((MAX_UNITS_PER_SIDE,), float('-inf'))
+                for idx, val in zip(s.planning_shoot_indices, s.planning_shoot_values):
+                    target[idx] = val
+                target = torch.softmax(target / eta, dim=0)
+                shoot_indices.append(i)
+                shoot_targets.append(target)
+                shoot_weights.append(w)
+
+            # --- Destination pointer head: chosen move is MOVE AND ≥2 distinct dests ---
+            if (s.move_type == MOVE_MOVE
+                    and s.planning_dest_values is not None
+                    and s.planning_dest_indices is not None
+                    and len(s.planning_dest_indices) >= 2):
+                dest_indices.append(i)
+                dest_sparse_targets.append(list(zip(
+                    s.planning_dest_indices, s.planning_dest_values)))
+                dest_weights.append(w)
+
+    if (not unit_indices and not move_indices and not charge_indices
+            and not shoot_indices and not dest_indices):
         return None
 
     device = flat_result.unit_logits.device
     total_loss = torch.tensor(0.0, device=device)
     sub_losses: dict[str, float] = {}
+    peaks: dict[str, float] = {}
+
+    def _record_peaks(head: str, tgt: torch.Tensor, log_p: torch.Tensor) -> None:
+        # Mean of per-row max probability for both the soft distill target
+        # and the policy output. Compared against 1/N (uniform) externally.
+        peaks[f"tgt_{head}"] = tgt.max(dim=-1).values.mean().item()
+        peaks[f"pol_{head}"] = log_p.exp().max(dim=-1).values.mean().item()
+        # Fraction of activations where the policy's argmax index matches
+        # the target's argmax index. Separates "is the peak sharp enough"
+        # from "is the peak on the right index." Low agreement + reasonable
+        # peaks => policy is confidently picking the wrong option.
+        peaks[f"agree_{head}"] = (
+            tgt.argmax(dim=-1) == log_p.argmax(dim=-1)
+        ).float().mean().item()
 
     # --- Unit selection KL ---
     if unit_indices:
@@ -1207,6 +1467,7 @@ def _compute_planning_distill_loss(
         unit_loss = (w_t * kl).mean()
         total_loss = total_loss + unit_loss
         sub_losses["unit"] = unit_loss.item()
+        _record_peaks("unit", tgt, log_p)
 
     # --- Move type KL ---
     if move_indices and flat_result.move_logits is not None:
@@ -1218,6 +1479,7 @@ def _compute_planning_distill_loss(
         move_loss = (w_t * kl).mean()
         total_loss = total_loss + move_loss
         sub_losses["move"] = move_loss.item()
+        _record_peaks("move", tgt, log_p)
 
     # --- Charge target KL ---
     if charge_indices and flat_result.charge_logits is not None:
@@ -1229,6 +1491,7 @@ def _compute_planning_distill_loss(
         charge_loss = (w_t * kl).mean()
         total_loss = total_loss + charge_loss
         sub_losses["charge"] = charge_loss.item()
+        _record_peaks("charge", tgt, log_p)
 
     # --- Shoot target KL ---
     if shoot_indices and flat_result.shoot_logits is not None:
@@ -1240,5 +1503,36 @@ def _compute_planning_distill_loss(
         shoot_loss = (w_t * kl).mean()
         total_loss = total_loss + shoot_loss
         sub_losses["shoot"] = shoot_loss.item()
+        _record_peaks("shoot", tgt, log_p)
 
-    return total_loss, sub_losses
+    # --- Destination pointer KL ---
+    # The dest head width is minibatch-local (padded to max valid candidates
+    # across the minibatch). Build soft targets at that width; positions with
+    # no planner sample get -inf (→ zero probability after softmax), and
+    # positions beyond a given step's dest_n_valid are masked by the model's
+    # own -inf, so KL stays well-behaved across padding.
+    if dest_indices and flat_result.dest_logits is not None:
+        idx_t = torch.tensor(dest_indices, dtype=torch.long, device=device)
+        dest_logits_sel = flat_result.dest_logits[idx_t]  # (P, mb_max_cands)
+        P, mb_w = dest_logits_sel.shape
+        if mode == "ce_chosen":
+            tgt = torch.zeros((P, mb_w), device=device)
+            for row, sel_idx in enumerate(dest_selected):
+                if 0 <= sel_idx < mb_w:
+                    tgt[row, sel_idx] = 1.0
+        else:
+            tgt = torch.full((P, mb_w), float('-inf'), device=device)
+            for row, pairs in enumerate(dest_sparse_targets):
+                for d_idx, d_val in pairs:
+                    if 0 <= d_idx < mb_w:
+                        tgt[row, d_idx] = d_val
+            tgt = torch.softmax(tgt / eta, dim=-1)
+        w_t = torch.tensor(dest_weights, dtype=torch.float32, device=device)
+        log_p = F.log_softmax(dest_logits_sel, dim=-1)
+        kl = _kl_from_soft_target(tgt, log_p)
+        dest_loss = (w_t * kl).mean()
+        total_loss = total_loss + dest_loss
+        sub_losses["dest"] = dest_loss.item()
+        _record_peaks("dest", tgt, log_p)
+
+    return total_loss, sub_losses, peaks

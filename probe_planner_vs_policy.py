@@ -1,0 +1,179 @@
+"""Probe: ML policy (no planning) vs ML planner with K uniform-random
+candidates. Sweeps K from 1 to 10, 100 games per K. Both sides use the
+same model (final_model.pt). Sides are randomized per game. Random
+ML HoF armies per game.
+
+Motivation: complement to probe_uniform_baseline.py. That probe asked
+"does V rank policy's argmax above random alternatives?" and found
+flat ~0.33 across training. This probe asks the dual: "given enough
+random tries, does V's pick beat policy in actual gameplay?"
+
+Interpretation:
+  K=1: planner side plays a single uniform-random legal action each
+       turn (no search — just play the random pick). Anchor for
+       "pure random vs policy."
+  K=2..10: planner picks V-best of K uniform-random candidates with
+           M=16 rollouts, N=2 lookahead.
+
+  - planner_wr rises with K, exceeds 0.5 at some K
+        ⟹ V-head + rollouts genuinely identify good actions; policy
+          is leaving value on the table that V can recover.
+  - planner_wr rises with K but stays below 0.5
+        ⟹ V helps recover from random sampling, but policy is still
+          better than what random+V can find.
+  - planner_wr flat (or decreasing)
+        ⟹ V can't tell good actions from bad; more samples don't help
+          (or actively hurt, if V is misleading).
+
+Sides are randomized per game; result is the planner's win rate
+regardless of physical side.
+"""
+
+import json
+import math
+import random
+import multiprocessing as mp
+from pathlib import Path
+
+from ml_training import load_model_state_dict
+from ml_model_tactical import TacticalModel
+from evolution import make_entry, resolve_army, _make_unit_states
+from models import ArmyList
+from game import simulate_game
+
+_DIR = Path(__file__).resolve().parent
+
+K_VALUES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+NUM_GAMES_PER_K = 100
+NUM_WORKERS = 6
+
+
+def load_army_from_hof(hof_entry: dict) -> ArmyList:
+    army = ArmyList()
+    for e in hof_entry["entries"]:
+        entry = make_entry(
+            e["template_id"],
+            upgrades=e.get("upgrades", {}),
+            ai_role=e.get("ai_role", "killer"),
+        )
+        entry.combat_preference = e.get("combat_preference", "ranged")
+        army.entries.append(entry)
+    return army
+
+
+_WORKER_MODEL = None
+_WORKER_HOF_ML = None
+
+
+def _worker_init(checkpoint_path, hof_ml_data):
+    global _WORKER_MODEL, _WORKER_HOF_ML
+    import torch
+    torch.set_num_threads(1)
+    random.seed()
+    state_dict = load_model_state_dict(checkpoint_path)
+    model = TacticalModel()
+    model.load_state_dict(state_dict, strict=False)
+    model.eval()
+    _WORKER_MODEL = model
+    _WORKER_HOF_ML = hof_ml_data
+
+
+def _play_one_game(args):
+    """args = (K, idx). Returns "planner" | "policy" | "draw"."""
+    K, _idx = args
+    army_a = load_army_from_hof(random.choice(_WORKER_HOF_ML))
+    army_b = load_army_from_hof(random.choice(_WORKER_HOF_ML))
+    res_a = resolve_army(army_a)
+    res_b = resolve_army(army_b)
+    sa = _make_unit_states(army_a, res_a, "A")
+    sb = _make_unit_states(army_b, res_b, "B")
+
+    # Coin-flip which physical side gets the planner this game.
+    planner_side = "A" if random.random() < 0.5 else "B"
+
+    planning_params = {
+        "K_INDEPENDENT_UNIFORM": K,
+        "UNIFORM_ALT_SAMPLING": True,
+        "M_ROLLOUTS": 16,
+        "N_LOOKAHEAD": 2,
+        "NUM_WORKERS": 1,  # already in a worker, no nested pool
+    }
+
+    result = simulate_game(
+        res_a, res_b, mode="objectives",
+        states_a=sa, states_b=sb,
+        ml_model_a=_WORKER_MODEL, ml_model_b=_WORKER_MODEL,
+        ml_planning=planner_side,
+        planning_params=planning_params,
+    )
+
+    if result == "draw":
+        return "draw"
+    elif result == planner_side:
+        return "planner"
+    else:
+        return "policy"
+
+
+def main():
+    with open(_DIR / "results" / "hall_of_fame_ml.json") as f:
+        hof_ml_data = json.load(f)
+
+    checkpoint_path = _DIR / "ml_checkpoints" / "final_model.pt"
+    print(f"checkpoint: {checkpoint_path}")
+    print(f"K values: {K_VALUES}")
+    print(f"games per K: {NUM_GAMES_PER_K}, workers: {NUM_WORKERS}")
+    print(f"random ML HoF armies, randomized sides per game")
+    print()
+
+    results = {}
+    with mp.Pool(
+        processes=NUM_WORKERS,
+        initializer=_worker_init,
+        initargs=(checkpoint_path, hof_ml_data),
+    ) as pool:
+        for K in K_VALUES:
+            wins = {"planner": 0, "policy": 0, "draw": 0}
+            args_list = [(K, i) for i in range(NUM_GAMES_PER_K)]
+            done = 0
+            for r in pool.imap_unordered(_play_one_game, args_list):
+                wins[r] += 1
+                done += 1
+                if done % 10 == 0 or done == NUM_GAMES_PER_K:
+                    print(f"  K={K:2d}: {done}/{NUM_GAMES_PER_K}", end="\r", flush=True)
+            results[K] = wins
+            n = sum(wins.values())
+            wr = wins["planner"] / n
+            se = math.sqrt(wr * (1 - wr) / n) if n > 0 else 0.0
+            print(f"  K={K:2d}: planner {wins['planner']:>3}/{n}  "
+                  f"({wr:.3f}±{se:.3f})  policy {wins['policy']:>3}, "
+                  f"draws {wins['draw']:>3}                ")
+
+    print()
+    print(f"{'K':>3s}  {'n':>5s}  {'planner_wr':>13s}  {'policy_wr':>10s}  {'draws':>6s}")
+    print("-" * 50)
+    for K in K_VALUES:
+        wins = results[K]
+        n = sum(wins.values())
+        wr = wins["planner"] / n
+        se = math.sqrt(wr * (1 - wr) / n) if n > 0 else 0.0
+        wr_str = f"{wr:.3f}±{se:.3f}"
+        print(f"{K:>3d}  {n:>5d}  {wr_str:>13s}  "
+              f"{wins['policy']/n:>10.3f}  {wins['draw']:>6d}")
+
+    csv_path = _DIR / "ml_logs" / "planner_vs_policy.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w") as f:
+        f.write("K,n,planner_wins,policy_wins,draws,planner_wr,se\n")
+        for K in K_VALUES:
+            wins = results[K]
+            n = sum(wins.values())
+            wr = wins["planner"] / n
+            se = math.sqrt(wr * (1 - wr) / n) if n > 0 else 0.0
+            f.write(f"{K},{n},{wins['planner']},{wins['policy']},{wins['draw']},"
+                    f"{wr:.6f},{se:.6f}\n")
+    print(f"\nSaved CSV to {csv_path}")
+
+
+if __name__ == "__main__":
+    main()

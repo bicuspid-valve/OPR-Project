@@ -47,6 +47,15 @@ def sample_tactical_actions_no_grad(
     dest_candidates: np.ndarray | None = None,      # (MAX_DEST_CANDIDATES, 2) int (game-space)
     dest_mask: np.ndarray | None = None,            # (MAX_DEST_CANDIDATES,) bool
     dest_features: np.ndarray | None = None,        # (MAX_DEST_CANDIDATES, DEST_FEATURE_DIM) float
+    # Per-destination & static visibility (precomputed by caller). When set
+    # they AND into the shoot-range mask so the policy is not asked to pick
+    # invisible targets.
+    dest_visibility: np.ndarray | None = None,      # (MAX_DEST_CANDIDATES, MAX_UNITS_PER_SIDE) bool
+    static_visibility: np.ndarray | None = None,    # (MAX_UNITS_PER_SIDE,) bool
+    # Per-destination & static cover-aware expected wound frac (§5.4/§5.5).
+    # When present, replaces the shoot head's cover-blind bucket lookup.
+    dest_expected_damage: np.ndarray | None = None, # (MAX_DEST_CANDIDATES, MAX_UNITS_PER_SIDE)
+    static_expected_damage: np.ndarray | None = None,  # (MAX_UNITS_PER_SIDE,)
 ) -> tuple[int, int, list[list[int]], list[bool], list[list[float]], int,
            int, int, list[int], list[float], float, float, list[bool]]:
     """Sample tactical actions with sequential conditioning (no gradient tracking).
@@ -156,11 +165,25 @@ def sample_tactical_actions_no_grad(
             post_move_rel, max_weapon_ranges[unit_idx], enemy_alive_mask)
     else:
         shoot_mask_t = enemy_alive_mask
+    # AND with per-destination visibility (or static visibility when no dest)
+    if move_type == MOVE_MOVE and dest_selected_idx >= 0 and dest_visibility is not None:
+        vis_row = torch.from_numpy(dest_visibility[dest_selected_idx].astype(np.bool_))
+        shoot_mask_t = shoot_mask_t & vis_row
+    elif static_visibility is not None:
+        vis_static = torch.from_numpy(static_visibility.astype(np.bool_))
+        shoot_mask_t = shoot_mask_t & vis_static
     if is_shaken:
         shoot_mask_t = torch.zeros_like(shoot_mask_t)
+    # Cover-aware expected_wound_frac override.
+    _dmg_override = None
+    if move_type == MOVE_MOVE and dest_selected_idx >= 0 and dest_expected_damage is not None:
+        _dmg_override = torch.from_numpy(dest_expected_damage[dest_selected_idx].astype(np.float32))
+    elif static_expected_damage is not None:
+        _dmg_override = torch.from_numpy(static_expected_damage.astype(np.float32))
     shoot_logits = model.compute_shoot_logits(
         h.squeeze(0), units.squeeze(0), unit_idx,
         post_move_rel, enemy_alive_mask, shoot_range_mask=shoot_mask_t,
+        expected_wound_frac_override=_dmg_override,
     )
     shoot_mask_list = shoot_mask_t.tolist()
     no_shootable = not shoot_mask_t.any()
@@ -230,10 +253,13 @@ def _batched_sample_tactical_no_grad(
 
     # Unit selection
     unit_logits = model.unit_selection_head(h)
+    # nan_to_num must not collapse -inf to a finite value: the -inf applied
+    # below for dead slots must survive softmax, otherwise multinomial can
+    # sample padded slots and downstream indexing (units_a[sel_idx]) crashes.
+    unit_logits = torch.nan_to_num(unit_logits, nan=0.0, posinf=50.0)
     unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
     all_dead = ~alive_batch.any(dim=1, keepdim=True)
     unit_logits = unit_logits.masked_fill(all_dead, 0.0)
-    unit_logits = torch.nan_to_num(unit_logits, nan=0.0, posinf=50.0, neginf=-50.0)
     unit_probs = torch.softmax(unit_logits, dim=-1)
     unit_indices = torch.multinomial(unit_probs, 1).squeeze(-1)
     unit_log_probs = torch.log_softmax(unit_logits, dim=-1)
@@ -253,7 +279,7 @@ def _batched_sample_tactical_no_grad(
     move_logits = move_logits.clone()
     move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(no_chargeable, float('-inf'))
     move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(is_shaken_batch, float('-inf'))
-    move_logits = torch.nan_to_num(move_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+    move_logits = torch.nan_to_num(move_logits, nan=0.0, posinf=50.0)
     move_probs = torch.softmax(move_logits, dim=-1)
     move_indices = torch.multinomial(move_probs, 1).squeeze(-1)
     move_log_probs = torch.log_softmax(move_logits, dim=-1)
@@ -268,7 +294,7 @@ def _batched_sample_tactical_no_grad(
     )
     no_enemies = ~enemy_alive_batch.any(dim=-1)
     charge_logits = charge_logits.masked_fill(no_enemies.unsqueeze(-1), 0.0)
-    charge_logits = torch.nan_to_num(charge_logits, nan=0.0, posinf=50.0, neginf=-50.0)
+    charge_logits = torch.nan_to_num(charge_logits, nan=0.0, posinf=50.0)
     charge_probs = torch.softmax(charge_logits, dim=-1)
     if no_enemies.any():
         uniform_c = torch.full_like(charge_probs, 1.0 / n_units)
@@ -299,6 +325,9 @@ def _batched_sample_tactical_no_grad(
     dest_lps: list[float] = []
     post_move_rels: list[list[float]] = []
     pmr_tensors: list[torch.Tensor] = []
+    vis_rows: list[np.ndarray] = []  # (10,) bool per sample — visibility mask
+    dmg_rows: list[np.ndarray] = []  # (10,) float per sample — cover-aware expected wound frac
+    has_any_dmg_override = False
 
     for i in range(n):
         req = requests[i]
@@ -331,6 +360,7 @@ def _batched_sample_tactical_no_grad(
                     dest_features_i = req.dest_features_per_unit[uid]
                 elif req.dest_lazy_units is not None:
                     move_budget = req.rush_distances[uid]
+                    _dde = (getattr(req, 'dest_expected_damage_per_unit', None) or {}).get(uid)
                     dest_features_i = compute_destination_features(
                         dest_candidates_i, dest_mask_i,
                         req.dest_lazy_units[uid], uid,
@@ -343,6 +373,7 @@ def _batched_sample_tactical_no_grad(
                         move_budget,
                         enemy_cache=req.dest_lazy_enemy_cache,
                         advance_reachable=dest_ar_i,
+                        dest_expected_damage=_dde,
                     )
                 else:
                     _n_dc = int(dest_mask_i.sum()) if dest_mask_i is not None else 1
@@ -383,6 +414,21 @@ def _batched_sample_tactical_no_grad(
             if req.player == "B":
                 px = _flip_x(px)
                 py = _flip_y(py)
+
+            # Visibility row for the chosen dest (or all-True if not provided).
+            _dvis = (getattr(req, 'dest_visibility_per_unit', None) or {}).get(uid)
+            if _dvis is not None and dest_idx < _dvis.shape[0]:
+                vis_rows.append(_dvis[dest_idx].astype(np.bool_))
+            else:
+                vis_rows.append(np.ones(MAX_UNITS_PER_SIDE, dtype=np.bool_))
+
+            # Cover-aware expected damage row for the chosen dest.
+            _dde = (getattr(req, 'dest_expected_damage_per_unit', None) or {}).get(uid)
+            if _dde is not None and dest_idx < _dde.shape[0]:
+                dmg_rows.append(_dde[dest_idx].astype(np.float32))
+                has_any_dmg_override = True
+            else:
+                dmg_rows.append(np.zeros(MAX_UNITS_PER_SIDE, dtype=np.float32))
         else:
             dest_cands_list.append([])
             dest_masks_list.append([])
@@ -394,6 +440,21 @@ def _batched_sample_tactical_no_grad(
             ucx, ucy = req.friendly_positions[uid]
             px, py = ucx, ucy
 
+            # Visibility from unit's current centre (or all-True if not provided).
+            _svis = (getattr(req, 'static_visibility_per_unit', None) or {}).get(uid)
+            if _svis is not None:
+                vis_rows.append(_svis.astype(np.bool_))
+            else:
+                vis_rows.append(np.ones(MAX_UNITS_PER_SIDE, dtype=np.bool_))
+
+            # Cover-aware expected damage from current centre.
+            _sde = (getattr(req, 'static_expected_damage_per_unit', None) or {}).get(uid)
+            if _sde is not None:
+                dmg_rows.append(_sde.astype(np.float32))
+                has_any_dmg_override = True
+            else:
+                dmg_rows.append(np.zeros(MAX_UNITS_PER_SIDE, dtype=np.float32))
+
         pmr = compute_post_move_rel(px, py, req.enemy_positions)
         post_move_rels.append(pmr.numpy())
         pmr_tensors.append(pmr)
@@ -404,15 +465,25 @@ def _batched_sample_tactical_no_grad(
     max_wr_list = [requests[i].max_weapon_ranges[unit_list[i]] for i in range(n)]
     max_wr_t = torch.tensor(max_wr_list, dtype=torch.float32)
     shoot_mask_batch = compute_in_range_mask_batched(pmr_batch, max_wr_t, enemy_alive_batch)
+    # AND per-sample visibility (precomputed by request producer per dest hex).
+    vis_batch = torch.from_numpy(np.stack(vis_rows))
+    shoot_mask_batch = shoot_mask_batch & vis_batch
     shoot_mask_batch = shoot_mask_batch & ~is_shaken_batch.unsqueeze(-1)
+
+    # Per-sample cover-aware expected wound frac override (TERRAIN_SPEC §5.4).
+    # Falls back to the cover-blind bucket lookup when no request carried it.
+    dmg_override = None
+    if has_any_dmg_override:
+        dmg_override = torch.from_numpy(np.stack(dmg_rows))
 
     shoot_logits_batch = model.compute_shoot_logits(
         h, units, unit_indices, pmr_batch, enemy_alive_batch,
         shoot_range_mask=shoot_mask_batch,
+        expected_wound_frac_override=dmg_override,
     )
     no_shootable = ~shoot_mask_batch.any(dim=-1)
     shoot_logits_batch = shoot_logits_batch.masked_fill(no_shootable.unsqueeze(-1), 0.0)
-    shoot_logits_batch = torch.nan_to_num(shoot_logits_batch, nan=0.0, posinf=50.0, neginf=-50.0)
+    shoot_logits_batch = torch.nan_to_num(shoot_logits_batch, nan=0.0, posinf=50.0)
 
     shoot_probs_batch = torch.softmax(shoot_logits_batch, dim=-1)
     if no_shootable.any():
@@ -462,5 +533,6 @@ def _batched_sample_tactical_no_grad(
             old_log_prob=total_lp,
             value=val_list[i],
             shoot_mask=shoot_mask_lists[i],
+            cover_aware_dmg=(dmg_rows[i].tolist() if has_any_dmg_override else None),
         ))
     return results

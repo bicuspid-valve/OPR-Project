@@ -142,8 +142,9 @@ def repair_forceorg(army: ArmyList, budget: int, enforce_forceorg: bool = True):
                 del entry.chosen_upgrades[slot_id]
                 compute_entry_cost(entry)
             else:
-                # Replace with a random affordable unit
-                templates = get_templates()
+                # Replace with a random affordable unit (same faction)
+                from templates import get_templates_by_faction
+                templates = get_templates_by_faction(army.faction)
                 affordable = [t for t in templates
                               if t.base_cost <= limits["max_unit_cost"]]
                 if affordable:
@@ -379,10 +380,15 @@ def _forceorg_filter(templates_list: list[UnitTemplate], army: ArmyList,
 
 
 def generate_random_army(mode: str = "objectives",
-                         enforce_forceorg: bool = False) -> ArmyList:
-    """Generate a random valid army list."""
-    templates = get_templates()
-    army = ArmyList()
+                         enforce_forceorg: bool = False,
+                         faction: str = "hef") -> ArmyList:
+    """Generate a random valid army list for the given faction.
+
+    *faction* is one of "hef" / "bb" — armies are homogeneous (no mixing).
+    """
+    from templates import get_templates_by_faction
+    templates = get_templates_by_faction(faction)
+    army = ArmyList(faction=faction)
     remaining = POINTS_BUDGET
     fails = 0
 
@@ -407,7 +413,8 @@ def generate_random_army(mode: str = "objectives",
             fails += 1
 
     if army.total_cost < 1500:
-        return generate_random_army(mode, enforce_forceorg=enforce_forceorg)
+        return generate_random_army(mode, enforce_forceorg=enforce_forceorg,
+                                    faction=faction)
 
     _attach_heroes(army)
     if mode != "kill_points":
@@ -417,8 +424,9 @@ def generate_random_army(mode: str = "objectives",
 
 def budget_fill(army: ArmyList, enforce_forceorg: bool = False):
     """Try to fill remaining budget with cheap units."""
+    from templates import get_templates_by_faction
     remaining = POINTS_BUDGET - army.total_cost
-    templates = get_templates()
+    templates = get_templates_by_faction(army.faction)
     for _ in range(5):
         if remaining < 80:  # min viable unit cost ~90
             break
@@ -496,7 +504,8 @@ def mutate(army: ArmyList, mode: str = "objectives",
             operators.pop(idx)
             weights.pop(idx)
     op = random.choices(operators, weights=weights, k=1)[0]
-    templates = get_templates()
+    from templates import get_templates_by_faction
+    templates = get_templates_by_faction(army.faction)
     td = get_templates_dict()
 
     if op == 'add_unit':
@@ -767,7 +776,12 @@ def mutate(army: ArmyList, mode: str = "objectives",
         repair_forceorg(army, POINTS_BUDGET, enforce_forceorg=enforce_forceorg)
 
     if not army.entries:
-        army.entries = [make_entry(random.choice(templates).id)]
+        seed_pool = (_forceorg_filter(templates, army, POINTS_BUDGET)
+                     if enforce_forceorg else templates)
+        if not seed_pool:
+            seed_pool = [t for t in templates
+                         if t.base_cost <= forceorg_limits(POINTS_BUDGET)["max_unit_cost"]]
+        army.entries = [make_entry(random.choice(seed_pool).id)]
         budget_fill(army, enforce_forceorg=enforce_forceorg)
 
     if mode != "kill_points":
@@ -780,7 +794,9 @@ def mutate(army: ArmyList, mode: str = "objectives",
 
 SIMILARITY_THRESHOLD = 0.5   # armies above this are "very similar"
 DIVERSITY_DECAY_RATE = 0.8   # adjusted fitness multiplier per similar higher-ranked army
-HOF_MAX_SIZE = 30             # max Hall of Fame members
+HOF_MAX_SIZE = 30             # max Hall of Fame members (global)
+HOF_PER_FACTION_MAX_SIZE = 15 # max per-faction Hall of Fame members
+HOF_PER_FACTION_CANDIDATE_COUNT = 3  # top N per faction considered each cycle
 HOF_EVAL_INTERVAL = 10        # generations between HoF evaluations
 HOF_CANDIDATE_COUNT = 5       # population members considered for HoF promotion
 HOF_GAMES_PER_MATCHUP = 10    # games per pairing in HoF round-robin
@@ -922,14 +938,28 @@ class HallOfFameEntry:
 
 
 class HallOfFame:
-    """Curated archive of all-time best armies."""
+    """Curated archive of all-time best armies.
 
-    def __init__(self):
+    *max_size* — keep at most this many entries.
+    *faction_filter* — when non-empty, only armies of this faction are eligible
+    for promotion AND only same-faction matchups happen in the round-robin.
+    """
+
+    def __init__(self, max_size: int = HOF_MAX_SIZE, faction_filter: str = ""):
         self.entries: list[HallOfFameEntry] = []
+        self.max_size = max_size
+        self.faction_filter = faction_filter
 
     @classmethod
-    def load_from_json(cls, path: str | Path) -> "HallOfFame":
-        """Load a previously saved Hall of Fame from a JSON file."""
+    def load_from_json(cls, path: str | Path,
+                       enforce_forceorg: bool = False) -> "HallOfFame":
+        """Load a previously saved Hall of Fame from a JSON file.
+
+        When *enforce_forceorg* is True, every loaded army is validated
+        against forceorg_limits(POINTS_BUDGET); non-compliant armies are
+        repaired in place. Repaired armies keep their saved fitness as a
+        prior; the next round-robin in try_promote will overwrite it.
+        """
         import json
         hof = cls()
         p = Path(path)
@@ -937,6 +967,7 @@ class HallOfFame:
             return hof
         with open(p) as f:
             data = json.load(f)
+        repaired = 0
         for item in data:
             entries = []
             for e in item['entries']:
@@ -948,12 +979,22 @@ class HallOfFame:
                     computed_cost=e['cost'],
                     attached_to=e.get('attached_to', -1),
                 ))
-            army = ArmyList(entries=entries, fitness=item['fitness'])
+            army = ArmyList(
+                entries=entries,
+                fitness=item['fitness'],
+                faction=item.get('faction', 'hef'),
+            )
+            if enforce_forceorg and validate_forceorg(army, POINTS_BUDGET):
+                repair_forceorg(army, POINTS_BUDGET, enforce_forceorg=True)
+                repaired += 1
             hof.entries.append(HallOfFameEntry(
                 army=army,
                 fitness=item['fitness'],
                 generation_added=item['generation_added'],
             ))
+        if repaired:
+            print(f"  [HoF load] {repaired} army(s) from {p.name} "
+                  f"repaired to satisfy force-org.")
         return hof
 
     def try_promote(self, population: list[ArmyList], mode: str,
@@ -965,10 +1006,16 @@ class HallOfFame:
         """
         # 1. Select top candidates by raw fitness, excluding full duplicates
         #    (same units, upgrades, AND AI assignments) of existing HoF members.
-        ranked = sorted(population, key=lambda a: a.fitness, reverse=True)
+        #    For a faction-scoped HoF, only same-faction armies are eligible.
+        eligible = (population if not self.faction_filter
+                    else [a for a in population if a.faction == self.faction_filter])
+        # Per-faction HoFs use a smaller candidate slice (top 3 vs default 5).
+        candidate_limit = (HOF_CANDIDATE_COUNT if not self.faction_filter
+                           else HOF_PER_FACTION_CANDIDATE_COUNT)
+        ranked = sorted(eligible, key=lambda a: a.fitness, reverse=True)
         candidates: list[ArmyList] = []
         for a in ranked:
-            if len(candidates) >= HOF_CANDIDATE_COUNT:
+            if len(candidates) >= candidate_limit:
                 break
             is_dup = any(army_identity_match(a, e.army) for e in self.entries)
             if not is_dup:
@@ -983,7 +1030,7 @@ class HallOfFame:
         if n < 2:
             # Not enough armies to run a round-robin — just add candidates
             for c in candidates:
-                if len(self.entries) < HOF_MAX_SIZE:
+                if len(self.entries) < self.max_size:
                     self.entries.append(HallOfFameEntry(c, c.fitness, generation))
                     # (duplicates already filtered above)
             top_fit = max((e.fitness for e in self.entries), default=0.0)
@@ -1039,26 +1086,30 @@ class HallOfFame:
 
         win_rates = [wins[i] / max(games[i], 1) for i in range(n)]
 
-        # 4. Rank by win rate, keep top HOF_MAX_SIZE
+        # 4. Rank by win rate, keep top self.max_size
         num_candidates = len(candidates)
         old_size = len(self.entries)
         pool_entries: list[HallOfFameEntry] = []
 
         for i in range(n):
             if i < num_candidates:
+                # Sync the army's own fitness to the HoF round-robin result
+                # so format_army's "Win rate" matches the HoF ranking.
+                eval_armies[i].fitness = win_rates[i]
                 pool_entries.append(HallOfFameEntry(
                     eval_armies[i], win_rates[i], generation))
             else:
                 hof_idx = i - num_candidates
                 entry = self.entries[hof_idx]
                 entry.fitness = win_rates[i]
+                entry.army.fitness = win_rates[i]
                 pool_entries.append(entry)
 
         pool_entries.sort(key=lambda e: e.fitness, reverse=True)
 
         # Demote lower-scoring composition twins (same units/upgrades,
         # different AI assignments) to the bottom 5 slots.
-        bottom_start = max(0, HOF_MAX_SIZE - 5)
+        bottom_start = max(0, self.max_size - 5)
         claimed: set[int] = set()  # indices of "winner" entries
         demote_indices: list[int] = []
         for i, entry_i in enumerate(pool_entries):
@@ -1078,7 +1129,7 @@ class HallOfFame:
             insert_pos = min(bottom_start, len(kept))
             pool_entries = kept[:insert_pos] + demoted_entries + kept[insert_pos:]
 
-        self.entries = pool_entries[:HOF_MAX_SIZE]
+        self.entries = pool_entries[:self.max_size]
 
         # Count promotions/demotions
         new_armies = {id(c) for c in candidates}
@@ -1112,14 +1163,21 @@ class HallOfFame:
 # EVOLUTIONARY ALGORITHM
 # ===================================================================
 
-POPULATION_SIZE = 100 #100
-ELITE_COUNT =   15
-OFFSPRING_COUNT = POPULATION_SIZE - ELITE_COUNT  # 88
+POPULATION_SIZE = 150
+META_CHASERS = 75                  # split 25/25/25 across factions at init
+HARDCORE_FANS_PER_FACTION = 25     # × 3 factions = 75
+ELITE_META = 15                    # top meta-chasers preserved each gen
+ELITE_PER_FAN = 5                  # top hardcore fans per faction preserved each gen
+META_OFFSPRING = META_CHASERS - ELITE_META                       # 60
+FAN_OFFSPRING_PER_FACTION = HARDCORE_FANS_PER_FACTION - ELITE_PER_FAN  # 20
+ELITE_COUNT = ELITE_META + 3 * ELITE_PER_FAN                     # 30
+OFFSPRING_COUNT = POPULATION_SIZE - ELITE_COUNT                  # 120
+FACTIONS = ("hef", "bb", "ed")
 GAMES_PER_MATCHUP = 2 #3
 GENERATIONS = 100000 #200
 TOURNAMENT_SIZE = 4
 SWISS_ROUNDS = 10  # Swiss-system rounds (ceil(log2(N)) ≈ 7, +2 for ranking stability)
-TIME_LIMIT = 240  # wall-clock limit in minutes; None = no limit
+TIME_LIMIT = 540  # wall-clock limit in minutes; None = no limit
 
 
 def resolve_army(army: ArmyList) -> list[ResolvedUnit]:
@@ -1272,11 +1330,18 @@ def _play_matchup(args):
 
 
 def _play_matchup_batched(args):
-    """Worker: run a chunk of matchups using batched cross-game inference."""
+    """Worker: run a chunk of matchups using batched cross-game inference.
+
+    Uses the two-phase coroutine protocol so each game's destination pointer
+    runs against real Dijkstra candidates (not the centroid fallback).
+    """
     matchup_list, mode, *rest = args
     games_per_override = rest[0] if rest else None
 
-    from ml_integration_tactical import batched_argmax_tactical
+    from ml_integration_tactical import (
+        Phase1Request, Phase2Request,
+        batched_phase1_inference, batched_phase2_inference,
+    )
 
     games_per = games_per_override if games_per_override is not None else GAMES_PER_MATCHUP
 
@@ -1294,7 +1359,7 @@ def _play_matchup_batched(args):
             game_to_matchup.append(m_idx)
 
     # Prime all generators
-    pending = []
+    pending: list[tuple[int, object]] = []
     results = [None] * len(generators)
     for i, gen in enumerate(generators):
         try:
@@ -1303,20 +1368,43 @@ def _play_matchup_batched(args):
         except StopIteration as e:
             results[i] = e.value
 
-    # Coordinator loop: batch all pending inference requests
+    # Per-generator trunk cache, held between Phase 1 and Phase 2.
+    trunk_cache: dict[int, dict] = {}
+
     import torch
     with torch.no_grad():
         while pending:
-            reqs = [req for _, req in pending]
-            batch_results = batched_argmax_tactical(_g_evo_ml_model, reqs)
+            # Split by phase. A generator can only be at one phase per tick.
+            phase1_pairs = [(i, r) for i, r in pending if isinstance(r, Phase1Request)]
+            phase2_pairs = [(i, r) for i, r in pending if isinstance(r, Phase2Request)]
+            next_pending: list[tuple[int, object]] = []
 
-            next_pending = []
-            for k, (i, _req) in enumerate(pending):
-                try:
-                    next_req = generators[i].send(batch_results[k])
-                    next_pending.append((i, next_req))
-                except StopIteration as e:
-                    results[i] = e.value
+            if phase1_pairs:
+                p1_reqs = [r for _, r in phase1_pairs]
+                p1_results, p1_caches = batched_phase1_inference(
+                    _g_evo_ml_model, p1_reqs)
+                for (gen_idx, _r), result, cache in zip(phase1_pairs, p1_results, p1_caches):
+                    trunk_cache[gen_idx] = cache
+                    try:
+                        next_req = generators[gen_idx].send(result)
+                        next_pending.append((gen_idx, next_req))
+                    except StopIteration as e:
+                        results[gen_idx] = e.value
+                        # Generator finished without yielding phase 2.
+                        trunk_cache.pop(gen_idx, None)
+
+            if phase2_pairs:
+                p2_reqs = [r for _, r in phase2_pairs]
+                caches = [trunk_cache.pop(i) for i, _ in phase2_pairs]
+                p2_results = batched_phase2_inference(
+                    _g_evo_ml_model, p2_reqs, caches)
+                for (gen_idx, _r), result in zip(phase2_pairs, p2_results):
+                    try:
+                        next_req = generators[gen_idx].send(result)
+                        next_pending.append((gen_idx, next_req))
+                    except StopIteration as e:
+                        results[gen_idx] = e.value
+
             pending = next_pending
 
     # Aggregate into per-matchup (a_wins, b_wins)
@@ -1451,8 +1539,8 @@ def evaluate_population(population: list[ArmyList], mode: str = "objectives",
                 population[i].games += GAMES_PER_MATCHUP
                 population[j].wins += b_wins
                 population[j].games += GAMES_PER_MATCHUP
-            scores[i] = population[i].wins / max(population[i].games, 1)
-            scores[j] = population[j].wins / max(population[j].games, 1)
+                scores[i] = population[i].wins / max(population[i].games, 1)
+                scores[j] = population[j].wins / max(population[j].games, 1)
 
     for ind in population:
         ind.fitness = ind.wins / max(ind.games, 1)
@@ -1460,29 +1548,95 @@ def evaluate_population(population: list[ArmyList], mode: str = "objectives",
 
 def next_generation(population: list[ArmyList], mode: str = "objectives",
                     enforce_forceorg: bool = False) -> list[ArmyList]:
-    # Compute diversity-penalised fitness for selection
+    """Advance the multi-faction population by one generation.
+
+    Population is partitioned into:
+      - meta-chasers (breeder_type='meta'), 75 lists, may switch faction by
+        inheriting from a cross-faction tournament winner.
+      - hardcore fans (breeder_type='fan_hef' / 'fan_bb' / 'fan_ed'), 25 each,
+        whose tournament samples only same-faction parents.
+
+    Per-group elites are preserved (ELITE_META meta + ELITE_PER_FAN per fan
+    faction). Each group fills its remaining slots via tournament selection
+    inside its allowed parent pool.
+    """
     adjusted = _compute_adjusted_fitness(population)
 
-    # Elite selection by adjusted fitness
-    ranked_indices = sorted(range(len(population)),
-                            key=lambda i: adjusted[i], reverse=True)
-    survivors = [copy.deepcopy(population[i]) for i in ranked_indices[:ELITE_COUNT]]
+    # Indices grouped by breeder_type
+    meta_idxs = [i for i, a in enumerate(population) if a.breeder_type == "meta"]
+    fan_idxs: dict[str, list[int]] = {f"fan_{f}": [] for f in FACTIONS}
+    for i, a in enumerate(population):
+        if a.breeder_type in fan_idxs:
+            fan_idxs[a.breeder_type].append(i)
 
-    # Tournament selection using adjusted fitness
-    offspring = []
-    for _ in range(OFFSPRING_COUNT):
-        candidate_indices = random.sample(range(len(population)),
-                                          min(TOURNAMENT_SIZE, len(population)))
-        parent_idx = max(candidate_indices, key=lambda i: adjusted[i])
-        child = copy.deepcopy(population[parent_idx])
+    # ── Per-group elite selection by adjusted fitness ──
+    survivors: list[ArmyList] = []
+    if meta_idxs:
+        meta_sorted = sorted(meta_idxs, key=lambda i: adjusted[i], reverse=True)
+        for i in meta_sorted[:ELITE_META]:
+            survivors.append(copy.deepcopy(population[i]))
+    for fan_key, idxs in fan_idxs.items():
+        if not idxs:
+            continue
+        fan_sorted = sorted(idxs, key=lambda i: adjusted[i], reverse=True)
+        for i in fan_sorted[:ELITE_PER_FAN]:
+            survivors.append(copy.deepcopy(population[i]))
+
+    # ── Tournament selection for each group ──
+    def _pick_parent(pool_idxs: list[int]) -> int:
+        k = min(TOURNAMENT_SIZE, len(pool_idxs))
+        sampled = random.sample(pool_idxs, k)
+        return max(sampled, key=lambda i: adjusted[i])
+
+    def _make_child(parent: ArmyList, breeder_type: str) -> ArmyList:
+        child = copy.deepcopy(parent)
+        child.breeder_type = breeder_type
         for _ in range(random.randint(1, 4)):
             mutate(child, mode=mode, enforce_forceorg=enforce_forceorg)
         child.fitness = 0.0
         child.wins = 0.0
         child.games = 0
-        offspring.append(child)
+        return child
+
+    offspring: list[ArmyList] = []
+
+    # Meta-chasers: parent pool is the WHOLE population (any breeder, any
+    # faction). Faction is inherited from whichever parent wins.
+    if meta_idxs:
+        whole_pop_idxs = list(range(len(population)))
+        for _ in range(META_OFFSPRING):
+            p_idx = _pick_parent(whole_pop_idxs)
+            offspring.append(_make_child(population[p_idx], "meta"))
+
+    # Hardcore fans: parent pool is restricted to lists of their faction
+    # (any breeder type — meta-chasers currently in that faction count).
+    for f in FACTIONS:
+        fan_key = f"fan_{f}"
+        if not fan_idxs[fan_key]:
+            continue
+        same_faction_pool = [i for i, a in enumerate(population)
+                              if a.faction == f]
+        if not same_faction_pool:
+            # Degenerate case: no same-faction candidate. Fall back to
+            # the fan's own elite slot to avoid stalling.
+            same_faction_pool = fan_idxs[fan_key]
+        for _ in range(FAN_OFFSPRING_PER_FACTION):
+            p_idx = _pick_parent(same_faction_pool)
+            offspring.append(_make_child(population[p_idx], fan_key))
 
     return survivors + offspring
+
+
+def faction_share(population: list[ArmyList],
+                  breeder_type: str = "meta") -> dict[str, int]:
+    """Count how many lists in *population* of the given breeder_type belong
+    to each faction. Used for the per-generation meta-chaser print line.
+    Returns a dict {faction: count} with all factions present."""
+    out = {f: 0 for f in FACTIONS}
+    for a in population:
+        if a.breeder_type == breeder_type and a.faction in out:
+            out[a.faction] += 1
+    return out
 
 
 if __name__ == "__main__":

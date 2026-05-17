@@ -51,7 +51,10 @@ class TrainingMetrics:
                 self.heuristic_hof_ml_results.append(win)
             else:
                 self.heuristic_random_results.append(win)
-        else:
+        elif opponent_type == "selfplay":
+            # Checkpoint opponents only. Mirror matches are excluded: both sides
+            # are logged, so the pair always averages to 0.5 and would bias the
+            # metric toward 0.5. Mirrors feed the per-side deques below instead.
             self.selfplay_results.append(win)
             if army_type == "hof":
                 self.selfplay_hof_results.append(win)
@@ -148,7 +151,8 @@ def _load_hof_armies_from_file(filename: str) -> list:
     if not _HAS_EVOLUTION:
         return []
     try:
-        from evolution import make_entry
+        from evolution import make_entry, _attached_hero_count
+        from ml_features import MAX_UNITS_PER_SIDE
         from models import ArmyList
         hof_path = Path(__file__).resolve().parent.parent / "results" / filename
         if not hof_path.exists():
@@ -156,6 +160,7 @@ def _load_hof_armies_from_file(filename: str) -> list:
         with open(hof_path) as f:
             hof_data = json.load(f)
         armies = []
+        skipped = 0
         for entry_data in hof_data:
             army = ArmyList()
             for e in entry_data["entries"]:
@@ -165,8 +170,19 @@ def _load_hof_armies_from_file(filename: str) -> list:
                     ai_role=e.get("ai_role", "killer"),
                 )
                 entry.combat_preference = e.get("combat_preference", "ranged")
+                entry.attached_to = e.get("attached_to", -1)
                 army.entries.append(entry)
+            # Drop legacy HoF armies that exceed the unit slot count — older
+            # evolution runs without enforce_forceorg occasionally produced
+            # 11+ effective-unit armies, which the model can't represent.
+            effective_units = len(army.entries) - _attached_hero_count(army)
+            if effective_units > MAX_UNITS_PER_SIDE:
+                skipped += 1
+                continue
             armies.append(army)
+        if skipped:
+            print(f"[hof] {filename}: skipped {skipped} legacy armies "
+                  f"with >{MAX_UNITS_PER_SIDE} effective units")
         return armies
     except Exception:
         return []
@@ -186,8 +202,8 @@ def _generate_army_pair(
     opp_type: str = "heuristic",
     hof_armies: list | None = None,
     hof_ml_armies: list | None = None,
-) -> tuple[list[ResolvedUnit], list[ResolvedUnit],
-           list[UnitState], list[UnitState], str]:
+    return_attach_data: bool = False,
+) -> tuple:
     """Generate a pair of armies for a training game.
 
     Army selection depends on opponent type:
@@ -216,7 +232,7 @@ def _generate_army_pair(
         if hof_armies:
             army_b = random.choice(hof_armies)
         else:
-            army_b = generate_random_army(mode="objectives")
+            army_b = generate_random_army(mode="objectives", enforce_forceorg=True)
 
         # Player A (ML): 50% hall_of_fame.json, 50% hall_of_fame_ml.json
         if random.random() < 0.5:
@@ -224,21 +240,21 @@ def _generate_army_pair(
                 army_a = random.choice(hof_armies)
                 army_type = "hof"
             else:
-                army_a = generate_random_army(mode="objectives")
+                army_a = generate_random_army(mode="objectives", enforce_forceorg=True)
                 army_type = "random"
         else:
             if hof_ml_armies:
                 army_a = random.choice(hof_ml_armies)
                 army_type = "hof_ml"
             else:
-                army_a = generate_random_army(mode="objectives")
+                army_a = generate_random_army(mode="objectives", enforce_forceorg=True)
                 army_type = "random"
     else:
         # Self-play: both get same type — random 50%, hof 25%, hof_ml 25%
         roll = random.random()
         if roll < 0.5:
-            army_a = generate_random_army(mode="objectives")
-            army_b = generate_random_army(mode="objectives")
+            army_a = generate_random_army(mode="objectives", enforce_forceorg=True)
+            army_b = generate_random_army(mode="objectives", enforce_forceorg=True)
             army_type = "random"
         elif roll < 0.75:
             if hof_armies:
@@ -246,8 +262,8 @@ def _generate_army_pair(
                 army_b = random.choice(hof_armies)
                 army_type = "hof"
             else:
-                army_a = generate_random_army(mode="objectives")
-                army_b = generate_random_army(mode="objectives")
+                army_a = generate_random_army(mode="objectives", enforce_forceorg=True)
+                army_b = generate_random_army(mode="objectives", enforce_forceorg=True)
                 army_type = "random"
         else:
             if hof_ml_armies:
@@ -255,12 +271,34 @@ def _generate_army_pair(
                 army_b = random.choice(hof_ml_armies)
                 army_type = "hof_ml"
             else:
-                army_a = generate_random_army(mode="objectives")
-                army_b = generate_random_army(mode="objectives")
+                army_a = generate_random_army(mode="objectives", enforce_forceorg=True)
+                army_b = generate_random_army(mode="objectives", enforce_forceorg=True)
                 army_type = "random"
 
     res_a = resolve_army(army_a)
     res_b = resolve_army(army_b)
     states_a = _make_unit_states(army_a, res_a, "A")
     states_b = _make_unit_states(army_b, res_b, "B")
+    if return_attach_data:
+        attach_a = _entries_attach_data(army_a)
+        attach_b = _entries_attach_data(army_b)
+        return res_a, res_b, states_a, states_b, army_type, attach_a, attach_b
     return res_a, res_b, states_a, states_b, army_type
+
+
+def _entries_attach_data(army) -> list[tuple[int, bool]]:
+    """Per-entry (attached_to, is_hero) data for an ArmyList. Used by the
+    training generator to redo hero merging on a fresh UnitState list — the
+    spec sends ``res_a`` (per-entry ResolvedUnits) and ``states_a_data``
+    (per-state, post-merge), and without this attach data the generator
+    cannot tell which res_a entries are heroes that should be merged into
+    a host. Returns a list of (attached_to, is_hero) tuples, one per entry,
+    aligned with ``resolve_army(army)``."""
+    from templates import get_templates_dict
+    td = get_templates_dict()
+    out: list[tuple[int, bool]] = []
+    for e in army.entries:
+        tpl = td.get(e.template_id)
+        is_hero = bool(tpl and tpl.hero)
+        out.append((int(e.attached_to), is_hero))
+    return out

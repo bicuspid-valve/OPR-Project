@@ -80,6 +80,27 @@ def run_training(
     is_tactical = config.model_type == "tactical"
     device = _resolve_device(config.device)
 
+    # Load the map once at training startup, before the multiprocessing
+    # workers are spawned (the MapData dataclass is pickleable, so workers
+    # receive a copy in each dispatch chunk). When map_path is None we keep
+    # the legacy empty-board layout.
+    map_data = None
+    if config.map_path is not None:
+        from map_loader import load_map
+        map_data = load_map(config.map_path)
+        # Install the map in the main process too so any in-process code
+        # paths (e.g. validation games) see the right OBJECTIVES.
+        from board import Board as _Board
+        from map_loader import apply_map as _apply_map
+        _apply_map(_Board(), map_data, build_vis_cover=False)
+        if verbose:
+            print(f"Loaded map: {config.map_path} "
+                  f"({len(map_data.terrain)} terrain pieces, "
+                  f"{len(map_data.objectives)} objectives, "
+                  f"DZ-A={len(map_data.deployment_a)} cells, "
+                  f"DZ-B={len(map_data.deployment_b)} cells)")
+            print(f"Train deployment: {config.train_deployment}")
+
     # Toggle C extension in main process
     import fast_core
     fast_core.USE_C_EXT = config.use_c_ext and fast_core.is_available()
@@ -144,6 +165,27 @@ def run_training(
     elif verbose:
         print("Restart requested — training from scratch")
 
+    # V_old shaping: capture the pre-restart final_model.pt state_dict NOW —
+    # the deletion block below will unlink the file. We instantiate the
+    # shared model lower down once we know the deletion was confirmed.
+    v_old_state_dict = None
+    if config.shaping_old_value:
+        if not restart:
+            raise ValueError(
+                "shaping_old_value=True requires restart=True (V_old is the "
+                "frozen pre-restart final_model; without restart the live "
+                "model is the same checkpoint)."
+            )
+        final_path = Path(config.checkpoint_dir) / "final_model.pt"
+        if not final_path.exists():
+            raise FileNotFoundError(
+                f"shaping_old_value=True but {final_path} not found. "
+                "Run a baseline training first to produce final_model.pt."
+            )
+        v_old_state_dict = load_model_state_dict(final_path)
+        if verbose:
+            print(f"V_old shaping enabled — captured value head from {final_path}")
+
     if restart:
         # Remove all previous checkpoint files
         ckpt_dir = Path(config.checkpoint_dir)
@@ -166,6 +208,24 @@ def run_training(
     model.to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+    # Phase 1 MPO scaffolding: a parallel π_old snapshot used by the
+    # Phase 2 KL trust-region term. Materialised only when
+    # config.kl_trust_region_beta > 0 so legacy runs pay nothing — no
+    # extra parameters, no extra forward pass, no extra memory. The
+    # snapshot is refreshed from `model.state_dict()` once per outer
+    # batch iteration (see snapshot site below), matching the
+    # pre_ppo_state cadence.
+    model_old: nn.Module | None = None
+    if config.kl_trust_region_beta > 0.0:
+        model_old = _make_model(config.model_type)
+        model_old.load_state_dict(model.state_dict(), strict=True)
+        model_old.to(device)
+        model_old.eval()
+        for _p in model_old.parameters():
+            _p.requires_grad_(False)
+        if verbose:
+            print(f"KL trust region snapshot active (β={config.kl_trust_region_beta})")
 
     # Per-head entropy target tuner (tactical model only)
     entropy_tuner: EntropyTargetTuner | None = None
@@ -194,7 +254,8 @@ def run_training(
         print(f"Planning-augmented training: rate={config.planning_rate}{_pr_end}, "
               f"K={config.training_planning_K} C={config.training_planning_C} "
               f"M={config.training_planning_M} N={config.training_planning_N}, "
-              f"distill_max_weight={config.planning_distill_max_weight}")
+              f"distill_max_weight={config.planning_distill_max_weight} "
+              f"distill_mode={config.planning_distill_mode}")
 
     checkpoint_pool = CheckpointPool(
         max_size=config.max_checkpoints,
@@ -227,9 +288,19 @@ def run_training(
             "val_sp_ml", "val_sp_random",
             "plan_activations", "plan_improve_rate",
             "plan_mean_vdelta", "plan_distill_loss",
+            "plan_distill_ramp",
             "plan_argmax_rate",
             "plan_dl_unit", "plan_dl_move",
             "plan_dl_charge", "plan_dl_shoot",
+            "plan_dl_dest",
+            "plan_tgt_peak_unit", "plan_pol_peak_unit",
+            "plan_tgt_peak_move", "plan_pol_peak_move",
+            "plan_tgt_peak_charge", "plan_pol_peak_charge",
+            "plan_tgt_peak_shoot", "plan_pol_peak_shoot",
+            "plan_tgt_peak_dest", "plan_pol_peak_dest",
+            "plan_argmax_agree_unit", "plan_argmax_agree_move",
+            "plan_argmax_agree_charge", "plan_argmax_agree_shoot",
+            "plan_argmax_agree_dest",
             "wr_side_a", "wr_side_b", "val_side_a", "val_side_b",
             "shoot_eff_reward",
             "charge_eff_reward",
@@ -246,6 +317,13 @@ def run_training(
             "pp_v_loss_mt", "pp_v_loss_dest",
             "pp_v_mean_pre", "pp_v_mean_sel",
             "pp_v_mean_mt", "pp_v_mean_dest",
+            # MPO trust region — reported for every batch but only nonzero
+            # when β > 0 and a model_old snapshot is active. Useful for
+            # verifying the switch fired post-mpo_switch_batch and for
+            # tracking whether π is staying close to the per-batch snapshot.
+            "kl_trust_region_beta", "kl_trust_region_loss",
+            "kl_trust_unit", "kl_trust_move", "kl_trust_dest",
+            "kl_trust_charge", "kl_trust_shoot",
         ])
     _log_writer.writerow([datetime.now().isoformat(), "---",
                           f"Training started (start_batch={start_batch})",
@@ -273,12 +351,22 @@ def run_training(
         m.eval()
         shared_opponents.append(m)
 
+    shared_v_old: nn.Module | None = None
+    if v_old_state_dict is not None:
+        shared_v_old = _make_model(config.model_type)
+        shared_v_old.load_state_dict(v_old_state_dict, strict=False)
+        shared_v_old.eval()
+        for _p in shared_v_old.parameters():
+            _p.requires_grad_(False)
+        shared_v_old.share_memory()
+
     ctx = _mp.get_context('spawn')
     pool = ctx.Pool(
         processes=worker_count,
         initializer=_init_shared_worker,
         initargs=(shared_model, shared_opponents, config.model_type,
-                  config.use_c_ext, config.phase_reencode_enabled),
+                  config.use_c_ext, config.phase_reencode_enabled,
+                  shared_v_old),
     )
 
     # --- Helper: build game specs, load opponent weights, dispatch workers ---
@@ -319,15 +407,27 @@ def run_training(
                 res_a, res_b = random.choice(army_pairs)
                 states_a_data = [("killer", "ranged", -1)] * len(res_a)
                 states_b_data = [("killer", "ranged", -1)] * len(res_b)
+                # No hero attachments in army_pairs path — entries map 1:1
+                # to UnitStates already (assumed to be hero-merged upstream).
+                attach_a: list[tuple[int, bool]] = [(-1, False)] * len(res_a)
+                attach_b: list[tuple[int, bool]] = [(-1, False)] * len(res_b)
                 army_type = "random"
             else:
-                res_a, res_b, states_a, states_b, army_type = _generate_army_pair(
+                # Request the per-entry hero-attach data so the generator
+                # can redo the merge on its fresh UnitState list. Without
+                # this, HoF armies with len(entries) > MAX_UNITS_PER_SIDE
+                # (heroes inflate the entry count past 10) crash deploy_armies
+                # because the unmerged heroes overflow the model's slot grid.
+                (res_a, res_b, states_a, states_b, army_type,
+                 attach_a, attach_b) = _generate_army_pair(
                     opp_type=opp_type, hof_armies=hof_armies,
-                    hof_ml_armies=hof_ml_armies)
+                    hof_ml_armies=hof_ml_armies,
+                    return_attach_data=True)
                 states_a_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_a]
                 states_b_data = [(u.ai_role, u.combat_preference, u.assigned_objective) for u in states_b]
 
-            game_specs.append((res_a, res_b, states_a_data, states_b_data, opp_type, opp_sd_idx, army_type))
+            game_specs.append((res_a, res_b, states_a_data, states_b_data,
+                               opp_type, opp_sd_idx, army_type, attach_a, attach_b))
 
         opp_slot_map: dict[int, int] = {}
         for i, sd in enumerate(opponent_state_dicts):
@@ -354,23 +454,39 @@ def run_training(
             if config.time_limit is not None:
                 pp = max(pp, (time.time() - start_time) / 60.0 / config.time_limit)
             pp = min(pp, 1.0)
-            epr = (config.planning_rate + pp * (config.planning_rate_end - config.planning_rate)
-                   if config.planning_rate_end is not None else config.planning_rate)
-            pcw = {
-                "planning_rate": epr,
-                "planning_params": {
-                    "K_UNITS": config.training_planning_K,
-                    "C_SAMPLES_PER_UNIT": config.training_planning_C,
-                    "M_ROLLOUTS": config.training_planning_M,
-                    "N_LOOKAHEAD": config.training_planning_N,
-                },
-            }
+            base_rate = (config.planning_rate + pp * (config.planning_rate_end - config.planning_rate)
+                         if config.planning_rate_end is not None else config.planning_rate)
+            # Warmup/ramp: 0 during warmup, then linear 0->1 over ramp window.
+            b0 = batch_num_for_specs - start_batch
+            warmup = config.planning_warmup_batches
+            ramp = config.planning_distill_ramp_batches
+            if b0 <= warmup:
+                ramp_frac = 0.0
+            elif ramp > 0:
+                ramp_frac = min(1.0, (b0 - warmup) / ramp)
+            else:
+                ramp_frac = 1.0
+            epr = base_rate * ramp_frac
+            if epr > 0:
+                pcw = {
+                    "planning_rate": epr,
+                    "planning_params": {
+                        "K_UNITS": config.training_planning_K,
+                        "C_SAMPLES_PER_UNIT": config.training_planning_C,
+                        "M_ROLLOUTS": config.training_planning_M,
+                        "N_LOOKAHEAD": config.training_planning_N,
+                        "SEQUENTIAL_HALVING": config.training_planning_sequential_halving,
+                        "SH_SCHEDULE": tuple(config.training_planning_sh_schedule),
+                    },
+                }
 
         n_chunks = worker_count
         chunk_sz = max(1, len(game_specs) // n_chunks)
         chunks = []
+        v_old_active = shared_v_old is not None
         for ci in range(0, len(game_specs), chunk_sz):
-            chunks.append((opp_slot_map, game_specs[ci:ci + chunk_sz], ss, pcw))
+            chunks.append((opp_slot_map, game_specs[ci:ci + chunk_sz], ss,
+                            pcw, v_old_active, map_data, config.train_deployment))
 
         if async_mode:
             return pool.map_async(_collect_episodes_shared_worker, chunks), ss
@@ -408,16 +524,18 @@ def run_training(
 
         # --- Phase 3: compute GAE advantages (fixed across PPO epochs) ---
         model.train()
-        all_trajs = [traj_rounds for traj_rounds, _, _, _, _, _ in trajectories]
+        # Episodes are 7-tuples once deploy training is wired; 6-tuples on
+        # the legacy path. Index 0 is the trajectory in both cases.
+        all_trajs = [ep[0] for ep in trajectories]
         all_advantages, all_returns = compute_gae(
             all_trajs, gamma=1.0, gae_lambda=config.gae_lambda,
             unit_local_blend=config.unit_local_advantage_blend,
         )
 
-        # Record game outcomes for metrics tracking
-        # Skip mirror_b entries for overall win-rate stats (avoid double-counting),
-        # but DO record them for per-side tracking (mirror matches are the
-        # cleanest signal for A/B symmetry).
+        # Record game outcomes for metrics tracking. record_game routes each
+        # game to the right deques by opp_type: "heuristic" → heuristic WR,
+        # "selfplay" → self-play WR (checkpoints only), "selfplay_mirror" /
+        # "mirror_b" → per-physical-side WR.
         opp_types = []
         _h_shoot_eff_sum = 0.0
         _h_charge_eff_sum = 0.0
@@ -427,14 +545,36 @@ def run_training(
         _ml_h_charge_eff_sum = 0.0
         _ml_h_shoot_n = 0
         _ml_h_charge_n = 0
-        for traj, result, opp_type, army_type, phys_side, h_eff in trajectories:
-            if opp_type != "mirror_b":
-                metrics.record_game(result, opp_type, army_type,
-                                    physical_side=phys_side)
+        deploy_records_all: list = []
+        deploy_returns_all: list[float] = []
+        for ep_tuple in trajectories:
+            # Backwards-compat: episodes are 6-tuples in legacy collection
+            # paths and 7-tuples once deploy training is wired (the 7th
+            # element is the per-game DeploymentRecord list).
+            if len(ep_tuple) == 7:
+                traj, result, opp_type, army_type, phys_side, h_eff, _deploy_recs = ep_tuple
+                if (config.train_deployment
+                        and config.deploy_loss_coeff > 0.0
+                        and _deploy_recs):
+                    # Terminal-outcome return from this side's perspective.
+                    # result is already main-perspective ("main"/"opp"/"draw")
+                    # so the sign maps cleanly: main=+1, opp=-1, draw=0.
+                    terminal = 1.0 if result == "main" else (-1.0 if result == "opp" else 0.0)
+                    # Post-deploy value-head bonus: V(s_first_tactical) under
+                    # the collection policy approximates the model's belief
+                    # at the deploy→turn-1 boundary, smoothing the long-
+                    # horizon credit assignment over ~10-15 deploy steps.
+                    bonus_v = 0.0
+                    if traj and config.deploy_post_value_bonus != 0.0:
+                        bonus_v = float(getattr(traj[0], "old_value", 0.0))
+                    per_record_return = terminal + config.deploy_post_value_bonus * bonus_v
+                    for r in _deploy_recs:
+                        deploy_records_all.append(r)
+                        deploy_returns_all.append(per_record_return)
             else:
-                # Record B-side of mirror match for side-symmetry tracking only
-                metrics.record_game(result, opp_type, army_type,
-                                    physical_side=phys_side)
+                traj, result, opp_type, army_type, phys_side, h_eff = ep_tuple
+            metrics.record_game(result, opp_type, army_type,
+                                physical_side=phys_side)
             opp_types.append(opp_type)
             if h_eff is not None:
                 _h_shoot_eff_sum += h_eff['shoot']
@@ -460,6 +600,73 @@ def run_training(
             progress = progress2
         progress = min(progress, 1.0)
         entropy_coeff = config.entropy_coeff_start + progress * (config.entropy_coeff_end - config.entropy_coeff_start)
+
+        # Planning distill ramp (same schedule as the rollout rate ramp).
+        _b0 = batch_num - start_batch
+        if _b0 <= config.planning_warmup_batches:
+            distill_ramp = 0.0
+        elif config.planning_distill_ramp_batches > 0:
+            distill_ramp = min(
+                1.0,
+                (_b0 - config.planning_warmup_batches) / config.planning_distill_ramp_batches,
+            )
+        else:
+            distill_ramp = 1.0
+
+        # MPO switch + KL trust-region β resolution.
+        #
+        # mpo_switch_batch (absolute batch number) flips the loss from
+        # `planning_distill_mode` (legacy PPO + ce_chosen / soft_kl) to
+        # "mpo_marginal" and activates the KL trust region. When the
+        # switch is unset, behaviour is unchanged: configured mode +
+        # β = config.kl_trust_region_beta (with optional schedule from
+        # start_batch).
+        #
+        # When the switch is set:
+        #   batch_num <= mpo_switch_batch → legacy mode, β = 0.
+        #   batch_num >  mpo_switch_batch → "mpo_marginal", β starts at
+        #     config.kl_trust_region_beta and (if mpo_kl_beta_end and
+        #     mpo_kl_beta_ramp_batches are set) linearly anneals toward
+        #     mpo_kl_beta_end over the next mpo_kl_beta_ramp_batches
+        #     batches counted from the switch.
+        if config.mpo_switch_batch is not None:
+            mpo_active = batch_num > config.mpo_switch_batch
+            effective_distill_mode = (
+                "mpo_marginal" if mpo_active else config.planning_distill_mode
+            )
+            if not mpo_active:
+                kl_beta_now = 0.0
+            elif (config.kl_trust_region_beta > 0
+                    and config.mpo_kl_beta_end is not None
+                    and config.mpo_kl_beta_ramp_batches > 0):
+                _post = batch_num - config.mpo_switch_batch - 1  # 0-indexed
+                _kb_progress = min(1.0, max(0.0, _post / config.mpo_kl_beta_ramp_batches))
+                kl_beta_now = (
+                    config.kl_trust_region_beta
+                    + _kb_progress * (config.mpo_kl_beta_end - config.kl_trust_region_beta)
+                )
+            else:
+                kl_beta_now = config.kl_trust_region_beta
+        else:
+            mpo_active = False
+            effective_distill_mode = config.planning_distill_mode
+            if (config.kl_trust_region_beta > 0
+                    and config.mpo_kl_beta_end is not None
+                    and config.mpo_kl_beta_ramp_batches > 0):
+                _kb_progress = min(1.0, max(0.0, _b0 / config.mpo_kl_beta_ramp_batches))
+                kl_beta_now = (
+                    config.kl_trust_region_beta
+                    + _kb_progress * (config.mpo_kl_beta_end - config.kl_trust_region_beta)
+                )
+            else:
+                kl_beta_now = config.kl_trust_region_beta
+
+        # One-time banner when the switch flips this batch.
+        if (verbose and config.mpo_switch_batch is not None
+                and batch_num == config.mpo_switch_batch + 1):
+            print(f"  [MPO] switching loss to 'mpo_marginal' at batch "
+                  f"{batch_num} (was {config.planning_distill_mode!r}); "
+                  f"β = {kl_beta_now}")
 
         # Pre-flatten advantages/returns/old_log_probs for vectorized tactical path
         if is_tactical:
@@ -487,6 +694,14 @@ def run_training(
 
         # Snapshot model weights before PPO epochs so we can rollback on NaN
         pre_ppo_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+        # Refresh π_old to the policy at the start of this batch's PPO
+        # epochs. The KL trust region (Phase 2) is computed against this
+        # snapshot, not against per-rollout behaviour. Same cadence as
+        # pre_ppo_state so the snapshot is always consistent with the
+        # policy that produced this batch's gradients.
+        if model_old is not None:
+            model_old.load_state_dict(pre_ppo_state, strict=True)
 
         minibatch_games = config.ppo_minibatch_games
         nan_detected = False
@@ -518,6 +733,16 @@ def run_training(
                         model, prepared, idx_t,
                         n_episodes=len(mb_game_idx),
                     )
+                    # π_old forward — only when KL trust region is active.
+                    # No grad through the snapshot; its params are already
+                    # frozen but no_grad still saves activation memory.
+                    mb_flat_result_old = None
+                    if model_old is not None and kl_beta_now > 0:
+                        with torch.no_grad():
+                            mb_flat_result_old = replay_from_prepared(
+                                model_old, prepared, idx_t,
+                                n_episodes=len(mb_game_idx),
+                            )
                     mb_flat_steps = [all_flat_steps[i] for i in mb_flat_idx]
                     with _force_tensor_device(device):
                         loss, loss_metrics = compute_loss_flat(
@@ -529,6 +754,11 @@ def run_training(
                             planning_distill_max_weight=(
                                 config.planning_distill_max_weight
                                 if config.planning_rate > 0 else 0.0),
+                            planning_distill_ramp=distill_ramp,
+                            planning_distill_mode=effective_distill_mode,
+                            mpo_eta=config.mpo_eta,
+                            flat_result_old=mb_flat_result_old,
+                            kl_trust_region_beta=kl_beta_now,
                         )
 
                     optimizer.zero_grad()
@@ -580,6 +810,12 @@ def run_training(
                     pds_mb = loss_metrics.get("planning_distill_sub", {})
                     for pk, pv in pds_mb.items():
                         epoch_metrics[f"_pds_{pk}"] = epoch_metrics.get(f"_pds_{pk}", 0.0) + pv * n_mb
+                    pdp_mb = loss_metrics.get("planning_distill_peaks", {})
+                    for pk, pv in pdp_mb.items():
+                        epoch_metrics[f"_pdp_{pk}"] = epoch_metrics.get(f"_pdp_{pk}", 0.0) + pv * n_mb
+                    klt_mb = loss_metrics.get("kl_trust_per_head", {})
+                    for kk, kv in klt_mb.items():
+                        epoch_metrics[f"_klt_{kk}"] = epoch_metrics.get(f"_klt_{kk}", 0.0) + kv * n_mb
                     epoch_count += n_mb
 
                 if nan_detected:
@@ -589,6 +825,8 @@ def run_training(
                     phe_agg = {}
                     opv_agg = {}
                     pds_agg = {}
+                    pdp_agg = {}
+                    klt_agg = {}
                     non_phe = {}
                     # First pass: pull out per-head weight sums so we can divide
                     # per-head entropies by their true gated-sample total.
@@ -606,12 +844,18 @@ def run_training(
                             opv_agg[k[5:]] = v / epoch_count
                         elif k.startswith("_pds_"):
                             pds_agg[k[5:]] = v / epoch_count
+                        elif k.startswith("_pdp_"):
+                            pdp_agg[k[5:]] = v / epoch_count
+                        elif k.startswith("_klt_"):
+                            klt_agg[k[5:]] = v / epoch_count
                         else:
                             non_phe[k] = v / epoch_count
                     loss_metrics = non_phe
                     loss_metrics["per_head_entropy"] = phe_agg
                     loss_metrics["per_opp_type_mean_values"] = opv_agg
                     loss_metrics["planning_distill_sub"] = pds_agg
+                    loss_metrics["planning_distill_peaks"] = pdp_agg
+                    loss_metrics["kl_trust_per_head"] = klt_agg
 
             elif is_tactical:
                 # Full-batch tactical path (minibatch disabled or batch too small)
@@ -620,6 +864,13 @@ def run_training(
                     model, prepared, all_idx_t,
                     n_episodes=len(all_trajs),
                 )
+                flat_result_old_full = None
+                if model_old is not None and kl_beta_now > 0:
+                    with torch.no_grad():
+                        flat_result_old_full = replay_from_prepared(
+                            model_old, prepared, all_idx_t,
+                            n_episodes=len(all_trajs),
+                        )
                 with _force_tensor_device(device):
                     loss, loss_metrics = compute_loss_flat(
                         flat_result, flat_old_lps, flat_advantages_t, flat_returns_t,
@@ -630,6 +881,11 @@ def run_training(
                         planning_distill_max_weight=(
                             config.planning_distill_max_weight
                             if config.planning_rate > 0 else 0.0),
+                        planning_distill_ramp=distill_ramp,
+                        planning_distill_mode=effective_distill_mode,
+                        mpo_eta=config.mpo_eta,
+                        flat_result_old=flat_result_old_full,
+                        kl_trust_region_beta=kl_beta_now,
                     )
 
                 optimizer.zero_grad()
@@ -658,6 +914,57 @@ def run_training(
                     break
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+
+            # Deployment-head PPO update — one optimizer step per epoch,
+            # in addition to the tactical step above. Same model parameters,
+            # so the gradients accumulate into the deploy heads + the trunk.
+            # Kept as a separate step (rather than summed into the tactical
+            # loss) because the deploy minibatch is small and unminibatched
+            # — folding it into per-minibatch tactical loss would overweight
+            # it n_minibatches-fold without making the math cleaner.
+            if (config.train_deployment
+                    and config.deploy_loss_coeff > 0.0
+                    and deploy_records_all
+                    and not nan_detected):
+                from ml_training.deploy_loss import compute_deploy_loss
+                deploy_returns_t = torch.tensor(
+                    deploy_returns_all, dtype=torch.float32, device=device,
+                )
+                with _force_tensor_device(device):
+                    dep_out = compute_deploy_loss(
+                        model, deploy_records_all, deploy_returns_t,
+                        clip_eps=config.clip_epsilon,
+                        value_coef=config.value_coeff,
+                        entropy_coef=entropy_coeff,
+                        device=device,
+                    )
+                dep_loss = config.deploy_loss_coeff * dep_out["total_loss"]
+                optimizer.zero_grad()
+                if torch.isnan(dep_loss) or torch.isinf(dep_loss):
+                    print(f"  WARNING: NaN/Inf deploy loss at batch {batch_num}, rolling back weights")
+                    model.load_state_dict(pre_ppo_state)
+                    nan_detected = True
+                else:
+                    dep_loss.backward()
+                    grad_nan = any(
+                        p.grad is not None and torch.isnan(p.grad).any()
+                        for p in model.parameters()
+                    )
+                    if grad_nan:
+                        print(f"  WARNING: NaN deploy gradients at batch {batch_num}, rolling back weights")
+                        model.load_state_dict(pre_ppo_state)
+                        nan_detected = True
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        optimizer.step()
+                        # Fold deploy metrics into loss_metrics so the logger
+                        # picks them up alongside the tactical metrics.
+                        loss_metrics["deploy_policy_loss"] = dep_out["policy_loss"]
+                        loss_metrics["deploy_value_loss"] = dep_out["value_loss"]
+                        loss_metrics["deploy_entropy"] = dep_out["entropy"]
+                        loss_metrics["deploy_approx_kl"] = dep_out["approx_kl"]
+                        loss_metrics["deploy_clip_frac"] = dep_out["clip_frac"]
+                        loss_metrics["deploy_n_records"] = len(deploy_records_all)
 
         # Log
         batch_time = time.time() - batch_start
@@ -752,9 +1059,20 @@ def run_training(
             f"{loss_metrics.get('planning_improvement_rate', 0.0):.4f}",
             f"{loss_metrics.get('planning_mean_value_delta', 0.0):.4f}",
             f"{loss_metrics.get('planning_distill_loss', 0.0):.6f}",
+            f"{loss_metrics.get('planning_distill_ramp', 1.0):.4f}",
             f"{loss_metrics.get('planning_argmax_rate', 0.0):.4f}",
             *[f"{loss_metrics.get('planning_distill_sub', {}).get(k, 0.0):.6f}"
-              for k in ("unit", "move", "charge", "shoot")],
+              for k in ("unit", "move", "charge", "shoot", "dest")],
+            *[f"{loss_metrics.get('planning_distill_peaks', {}).get(k, 0.0):.6f}"
+              for k in ("tgt_unit", "pol_unit",
+                        "tgt_move", "pol_move",
+                        "tgt_charge", "pol_charge",
+                        "tgt_shoot", "pol_shoot",
+                        "tgt_dest", "pol_dest")],
+            *[f"{loss_metrics.get('planning_distill_peaks', {}).get(k, 0.0):.4f}"
+              for k in ("agree_unit", "agree_move",
+                        "agree_charge", "agree_shoot",
+                        "agree_dest")],
             f"{metrics.a_side_win_rate:.3f}",
             f"{metrics.b_side_win_rate:.3f}",
             f"{_opp_val_dict.get('mean_value_side_a', '')}",
@@ -769,6 +1087,13 @@ def run_training(
             # Per-phase V head: aggregate loss, then per-phase loss + mean output.
             # Empty strings when flag is off so the CSV round-trips cleanly.
             *_format_per_phase_value(loss_metrics),
+            # MPO trust region. β=0 and KL=0 when the trust region is
+            # inactive (pre-switch or in pure-PPO/legacy modes), so these
+            # cells are populated for every row even on legacy runs.
+            f"{loss_metrics.get('kl_trust_region_beta', 0.0):.4f}",
+            f"{loss_metrics.get('kl_trust_region_loss', 0.0):.6f}",
+            *[f"{loss_metrics.get('kl_trust_per_head', {}).get(k, 0.0):.6f}"
+              for k in ("unit", "move", "dest", "charge", "shoot")],
         ])
         _log_file.flush()
 

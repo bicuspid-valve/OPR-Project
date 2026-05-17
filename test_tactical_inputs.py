@@ -1585,9 +1585,9 @@ class TestPhaseReencodeGradientEquivalence:
         chain but keeps state_vec_post == state_vec so the ablation gate holds.
 
         All 10 enemy slots are alive — this matters because the charge head
-        masks logits at dead enemies with -inf, which turn into gradient-free
-        -50 after nan_to_num. A single-alive-enemy record would collapse the
-        charge softmax to a point mass with near-zero gradient, preventing
+        masks logits at dead enemies with -inf, which softmax turns into
+        exactly zero probability. A single-alive-enemy record would collapse
+        the charge softmax to a point mass with zero gradient, preventing
         the POST_MOVETYPE / POST_DEST adjustment blocks from receiving signal
         via the charge path.
         """

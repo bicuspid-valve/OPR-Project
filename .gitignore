@@ -18,3 +18,8 @@ ml_checkpoints_test/
 diagnostics/
 results/
 training_metrics.png
+
+# Large generated data and rulebook PDFs (kept locally, not in repo)
+ml_training/identifier_data/
+terrain_cache/
+*.pdf

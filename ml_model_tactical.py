@@ -45,11 +45,14 @@ from ml_features import (
     RANGE_THRESHOLDS, NUM_RANGE_THRESHOLDS, BOARD_DIAG,
     _TOFF_RANGED, _TOFF_MELEE, _TOFF_ACTIVATED, _TOFF_FATIGUED,
     _TOFF_SHAKEN, _TOFF_OBJ_REL,
+    DEPLOY_POS_GRID, DEPLOY_POS_DEPTH,
 )
-from board import OBJ_SEIZE_RANGE
+from board import OBJ_SEIZE_RANGE, COLS
 
 # Model version tag — bump when head architecture changes so old checkpoints reject.
-MODEL_VERSION = 3
+# v4: added deploy_unit_head and deploy_pos_head + is_deployed/deploy globals
+# (TACTICAL_UNIT_FEATURES 200→201, GLOBAL_FEATURES 16→22).
+MODEL_VERSION = 4
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -410,6 +413,21 @@ class TacticalModel(nn.Module):
         self.aux_friendly_activations_head = nn.Linear(H, 1)
         self.aux_enemy_activations_head = nn.Linear(H, 1)
 
+        # Deployment heads (chunk 2 — architecture only; trained in chunk 3):
+        #   deploy_unit_head: pointer over the 10 friendly slots; masked at
+        #     inference to "eligible (right phase) AND unplaced".
+        #   deploy_pos_head:  1728 logits over a 24×COLS egocentric grid of
+        #     anchor cells in the deploying player's own zone; masked to the
+        #     non-scout depth (12 rows) or scout depth (24 rows) per phase.
+        # Both zero-initialised so untrained inference falls back to the mask
+        # (uniform over legal actions) rather than producing arbitrary policy.
+        self.deploy_unit_head = nn.Linear(H, N_FRIENDLY)
+        self.deploy_pos_head = nn.Linear(H, DEPLOY_POS_GRID)
+        nn.init.zeros_(self.deploy_unit_head.weight)
+        nn.init.zeros_(self.deploy_unit_head.bias)
+        nn.init.zeros_(self.deploy_pos_head.weight)
+        nn.init.zeros_(self.deploy_pos_head.bias)
+
     def trunk(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run input through per-unit encoder + aggregation + recurrent core.
 
@@ -620,12 +638,20 @@ class TacticalModel(nn.Module):
         units: torch.Tensor,          # (..., 20, UF)
         chosen_idx: int | torch.Tensor,
         post_move_rel: torch.Tensor,  # (..., 30)
+        expected_wound_frac_override: torch.Tensor | None = None,  # (..., 10)
     ) -> torch.Tensor:
         """Per-candidate shoot keys: (..., 10, 2).
 
         Layout per candidate (enemy slot j):
           [expected_wound_frac, current_wound_frac]
 
+        ``expected_wound_frac_override`` (TERRAIN_SPEC §5.4): when provided,
+        it replaces the cover-blind bucket lookup with a precomputed
+        cover-aware value (sum E_damage[Y, U_def_j, cover_state(dest, U_def_j)]
+        over surviving shooters, normalised by U_def_j starting wounds, scaled
+        by attacker alive frac). Shape (..., 10) matches the per-enemy axis.
+
+        Cover-blind fallback (when override is None):
         expected_wound_frac = acting unit's ranged matchup (expected wounds as
         fraction of target's starting wounds, capped at 1.0) at the bucketed
         post-move distance to enemy j. Already scaled by
@@ -638,20 +664,23 @@ class TacticalModel(nn.Module):
         enemies = units[..., N_FRIENDLY:, :]  # (..., 10, UF)
         acting = self._index_units(units, chosen_idx)  # (..., UF)
 
-        # Acting unit's ranged matchup row: (..., 10, NUM_RANGE_THRESHOLDS)
-        ranged_row = acting[..., _TOFF_RANGED:_TOFF_RANGED + N_ENEMY * NUM_RANGE_THRESHOLDS]
-        ranged_row = ranged_row.reshape(*acting.shape[:-1], N_ENEMY, NUM_RANGE_THRESHOLDS)
+        if expected_wound_frac_override is not None:
+            expected_wound_frac = expected_wound_frac_override.to(dtype=acting.dtype)
+        else:
+            # Acting unit's ranged matchup row: (..., 10, NUM_RANGE_THRESHOLDS)
+            ranged_row = acting[..., _TOFF_RANGED:_TOFF_RANGED + N_ENEMY * NUM_RANGE_THRESHOLDS]
+            ranged_row = ranged_row.reshape(*acting.shape[:-1], N_ENEMY, NUM_RANGE_THRESHOLDS)
 
-        # Bucketed expected_wound_frac at post-move distance.
-        dist_norm = post_move_rel.reshape(
-            *post_move_rel.shape[:-1], N_ENEMY, 3,
-        )[..., 2]
-        dist_inches = dist_norm * BOARD_DIAG
-        thresholds = self._range_thresholds
-        k = torch.searchsorted(thresholds, dist_inches, right=False).clamp(
-            max=NUM_RANGE_THRESHOLDS - 1
-        )
-        expected_wound_frac = ranged_row.gather(-1, k.unsqueeze(-1)).squeeze(-1)
+            # Bucketed expected_wound_frac at post-move distance.
+            dist_norm = post_move_rel.reshape(
+                *post_move_rel.shape[:-1], N_ENEMY, 3,
+            )[..., 2]
+            dist_inches = dist_norm * BOARD_DIAG
+            thresholds = self._range_thresholds
+            k = torch.searchsorted(thresholds, dist_inches, right=False).clamp(
+                max=NUM_RANGE_THRESHOLDS - 1
+            )
+            expected_wound_frac = ranged_row.gather(-1, k.unsqueeze(-1)).squeeze(-1)
 
         current_wound_frac = enemies[..., 3]  # survival_frac
 
@@ -770,6 +799,7 @@ class TacticalModel(nn.Module):
         shoot_range_mask: torch.Tensor | None = None,  # (..., 10)
         *,
         return_components: bool = False,
+        expected_wound_frac_override: torch.Tensor | None = None,  # (..., 10)
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Lightweight two-pathway shoot pointer: return (..., 10) masked logits.
 
@@ -783,7 +813,10 @@ class TacticalModel(nn.Module):
         Set return_components=True to also receive (primary, bias) for
         diagnostics (both pre-mask).
         """
-        keys = self._build_shoot_keys(units.detach(), chosen_idx, post_move_rel)  # (..., 10, 2)
+        keys = self._build_shoot_keys(
+            units.detach(), chosen_idx, post_move_rel,
+            expected_wound_frac_override=expected_wound_frac_override,
+        )  # (..., 10, 2)
 
         query = self.shoot_W_q(h)                                                 # (..., 2)
         primary = (query.unsqueeze(-2) @ keys.transpose(-1, -2)).squeeze(-2)      # (..., 10)
@@ -841,6 +874,7 @@ class TacticalModel(nn.Module):
         enemy_alive_mask: torch.Tensor | None,
         post_move_rel: torch.Tensor | None,
         can_charge_mask: torch.Tensor | None = None,
+        expected_wound_frac_override: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run move_type → charge pointer → shoot pointer chain.
 
@@ -885,6 +919,7 @@ class TacticalModel(nn.Module):
         shoot_target_logits = self.compute_shoot_logits(
             h, units, chosen_idx, post_move_rel, enemy_alive_mask,
             shoot_range_mask=None,
+            expected_wound_frac_override=expected_wound_frac_override,
         )
 
         return move_logits, charge_target_logits, shoot_target_logits
@@ -900,6 +935,7 @@ class TacticalModel(nn.Module):
         opponent_type: int | None = None,
         dest_features: torch.Tensor | None = None,
         dest_mask: torch.Tensor | None = None,
+        expected_wound_frac_override: torch.Tensor | None = None,
     ) -> TacticalModelOutput:
         """Forward pass with sequential conditioning.
 
@@ -953,6 +989,7 @@ class TacticalModel(nn.Module):
             self._run_conditioned_heads(
                 h, units, chosen_idx, enemy_alive_mask, post_move_rel,
                 can_charge_mask,
+                expected_wound_frac_override=expected_wound_frac_override,
             )
         )
 
@@ -988,6 +1025,115 @@ class TacticalModel(nn.Module):
             shoot_target_logits=shoot_logits,
             value=value,
         )
+
+    def value_only(
+        self,
+        x: torch.Tensor,
+        opponent_type: int | torch.Tensor | None = None,
+        side: str | int | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Trunk + value-head only — skips every policy head.
+
+        Used by V_old reward shaping where we need V(s) for many states but
+        none of the action distributions. opponent_type/side may be scalars
+        (broadcast over the batch) or per-sample LongTensors.
+        """
+        single = x.dim() == 1
+        if single:
+            x = x.unsqueeze(0)
+        B = x.shape[0]
+        h, _, round_onehot = self.trunk(x)
+
+        if opponent_type is None:
+            opp_embed = self.opponent_embedding.weight.mean(dim=0).unsqueeze(0).expand(B, -1)
+        elif isinstance(opponent_type, torch.Tensor):
+            opp_embed = self.opponent_embedding(opponent_type.to(h.device).long())
+        else:
+            opp_embed = self.opponent_embedding(
+                torch.tensor(int(opponent_type), device=h.device)
+            ).unsqueeze(0).expand(B, -1)
+
+        if side is None:
+            side_embed = self.side_embedding.weight.mean(dim=0).unsqueeze(0).expand(B, -1)
+        elif isinstance(side, torch.Tensor):
+            side_embed = self.side_embedding(side.to(h.device).long())
+        else:
+            s_idx = (0 if side == "A" else 1) if isinstance(side, str) else int(side)
+            side_embed = self.side_embedding(
+                torch.tensor(s_idx, device=h.device)
+            ).unsqueeze(0).expand(B, -1)
+
+        value = self.value_head(h, round_onehot, opp_embed, side_embed)
+        return value.squeeze(0) if single else value
+
+    def forward_deploy(
+        self,
+        x: torch.Tensor,
+        eligible_mask: torch.Tensor,
+        legal_pos_mask: torch.Tensor,
+        *,
+        opponent_type: int | torch.Tensor | None = None,
+        side: str | int | torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Deployment-phase forward pass — invoked once per placement.
+
+        Parameters
+        ----------
+        x : (TACTICAL_TOTAL_FEATURES,) or (B, TACTICAL_TOTAL_FEATURES)
+            Encoded mid-deployment state from ml_features.encode_state_deploy.
+        eligible_mask : (N_FRIENDLY,) or (B, N_FRIENDLY) bool
+            True for friendly slots that are eligible to deploy *this step*
+            (right phase AND not yet placed). Used to mask deploy_unit_logits.
+        legal_pos_mask : (DEPLOY_POS_GRID,) or (B, DEPLOY_POS_GRID) bool
+            True for anchor cells in the deploying player's egocentric zone
+            that fit the chosen unit. Used to mask deploy_pos_logits.
+
+        Returns
+        -------
+        unit_logits : (N_FRIENDLY,) or (B, N_FRIENDLY) — masked
+        pos_logits  : (DEPLOY_POS_GRID,) or (B, DEPLOY_POS_GRID) — masked
+        value       : scalar or (B,) — shared with tactical value head
+        """
+        single = x.dim() == 1
+        if single:
+            x = x.unsqueeze(0)
+            eligible_mask = eligible_mask.unsqueeze(0)
+            legal_pos_mask = legal_pos_mask.unsqueeze(0)
+        B = x.shape[0]
+        h, _, round_onehot = self.trunk(x)
+
+        unit_logits = self.deploy_unit_head(h)
+        pos_logits = self.deploy_pos_head(h)
+        unit_logits = unit_logits.masked_fill(~eligible_mask, float('-inf'))
+        pos_logits = pos_logits.masked_fill(~legal_pos_mask, float('-inf'))
+
+        # Reuse the tactical value head — value is shared across the activation
+        # and deployment phases. opp/side embeddings are passed through the same
+        # paths as value_only().
+        if opponent_type is None:
+            opp_embed = self.opponent_embedding.weight.mean(dim=0).unsqueeze(0).expand(B, -1)
+        elif isinstance(opponent_type, torch.Tensor):
+            opp_embed = self.opponent_embedding(opponent_type.to(h.device).long())
+        else:
+            opp_embed = self.opponent_embedding(
+                torch.tensor(int(opponent_type), device=h.device)
+            ).unsqueeze(0).expand(B, -1)
+
+        if side is None:
+            side_embed = self.side_embedding.weight.mean(dim=0).unsqueeze(0).expand(B, -1)
+        elif isinstance(side, torch.Tensor):
+            side_embed = self.side_embedding(side.to(h.device).long())
+        else:
+            s_idx = (0 if side == "A" else 1) if isinstance(side, str) else int(side)
+            side_embed = self.side_embedding(
+                torch.tensor(s_idx, device=h.device)
+            ).unsqueeze(0).expand(B, -1)
+
+        value = self.value_head(h, round_onehot, opp_embed, side_embed)
+
+        if single:
+            return unit_logits.squeeze(0), pos_logits.squeeze(0), value.squeeze(0)
+        return unit_logits, pos_logits, value
 
     def forward_per_unit(
         self,
@@ -1059,3 +1205,140 @@ class TacticalModel(nn.Module):
             ))
 
         return results
+
+
+# ---------------------------------------------------------------------------
+# IdentifierHead — gap-identifier scalar Q(s, a) head
+#
+# Trained separately (Phase 2 of the gap-identifier project) on supervised
+# rollout-based labels. Reuses TacticalModel.trunk (frozen) for h, plus raw
+# per-entity feature slices for the entities the action operates on (selected
+# unit, optional charge target, optional shoot target) and the chosen
+# destination's pointer features. Predicts a single scalar Q in [-1, 1].
+#
+# At inference the planner composes the gap as:
+#     gap(s, a) = Q_id(s, a) - beta * log pi_old(a | s)
+# where log pi comes from the same frozen TacticalModel and beta is a
+# deployment-time hyperparameter (calibrated post-hoc on the labeled set).
+# ---------------------------------------------------------------------------
+
+
+# Friendly slot offsets in the encoded state vector. The encoder lays out
+# 10 friendly slots (0..9) followed by 10 enemy slots (10..19), each with
+# TACTICAL_UNIT_FEATURES floats. We rely on this layout to gather raw entity
+# slices without an extra encoder pass.
+def _gather_unit_features(
+    state_vec: torch.Tensor,    # (B, TACTICAL_TOTAL_FEATURES)
+    slot_idx: torch.Tensor,     # (B,) long, in [0, 20)
+) -> torch.Tensor:
+    """Return (B, TACTICAL_UNIT_FEATURES) raw per-unit slice."""
+    B = state_vec.shape[0]
+    unit_block = state_vec[:, : 2 * MAX_UNITS_PER_SIDE * TACTICAL_UNIT_FEATURES]
+    unit_block = unit_block.view(B, 2 * MAX_UNITS_PER_SIDE, TACTICAL_UNIT_FEATURES)
+    idx_exp = slot_idx.view(B, 1, 1).expand(B, 1, TACTICAL_UNIT_FEATURES)
+    return unit_block.gather(1, idx_exp).squeeze(1)
+
+
+class IdentifierHead(nn.Module):
+    """Scalar Q(s, a) head conditioned on a structured action description.
+
+    Architecture mirrors the trunk's recurrent-core pattern: project the action
+    description to a fixed-width embedding, then iteratively refine the trunk
+    state via a shared-weight residual block conditioned on (current h, initial
+    h, action). Each iteration sees the same action embedding but operates on
+    a progressively-refined hidden state — same shape as the trunk's
+    `h = h + core_block(cat([h, h0]))` pattern, with the action injected as a
+    third input.
+
+    Inputs (all batched):
+        h               : (B, trunk_dim)   frozen trunk output
+        unit_feat       : (B, 200)         raw selected-unit slice from state_vec
+        charge_feat     : (B, 200)         charge-target enemy slice (zeros if not active)
+        shoot_feat      : (B, 200)         shoot-target enemy slice (zeros if not active)
+        dest_feat       : (B, 76)          chosen hex's pointer features (zeros if charge)
+        unit_idx        : (B,)             friendly slot id (0..9)
+        move_type       : (B,)             0 = move, 1 = charge
+        active_flags    : (B, 4)           [charge_active, shoot_active, dest_active, move_type_bit]
+
+    Output:
+        Q_id            : (B,)             unbounded scalar (advantage units;
+                                           anchored to advantage range by the
+                                           training-time MSE auxiliary)
+    """
+
+    UNIT_EMB_DIM = 32
+    MOVE_EMB_DIM = 16
+    ACTION_DIM = 256
+    ACTIVE_FLAGS = 4
+    N_ITERS = 3
+
+    def __init__(self, trunk_dim: int = TRUNK_WIDTH, n_iters: int = N_ITERS):
+        super().__init__()
+        self.unit_embed = nn.Embedding(MAX_UNITS_PER_SIDE, self.UNIT_EMB_DIM)
+        self.move_embed = nn.Embedding(NUM_MOVE_TYPES, self.MOVE_EMB_DIM)
+
+        raw_action_dim = (
+            TACTICAL_UNIT_FEATURES        # selected unit raw slice
+            + TACTICAL_UNIT_FEATURES      # charge target raw slice (or zeros)
+            + TACTICAL_UNIT_FEATURES      # shoot target raw slice (or zeros)
+            + DEST_FEATURE_DIM            # dest hex features (or zeros)
+            + self.UNIT_EMB_DIM
+            + self.MOVE_EMB_DIM
+            + self.ACTIVE_FLAGS
+        )
+        # Project the variable-shape action description to a fixed embedding
+        # that conditions every iteration of the recurrent core.
+        self.action_proj = nn.Sequential(
+            nn.Linear(raw_action_dim, self.ACTION_DIM),
+            nn.LayerNorm(self.ACTION_DIM),
+            nn.ReLU(),
+        )
+
+        # Shared-weight recurrent core: input is [h_current, h_initial, action].
+        # Same shape as the trunk's core_block (Linear → LayerNorm → ReLU).
+        core_in = trunk_dim * 2 + self.ACTION_DIM
+        self.core_block = nn.Sequential(
+            nn.Linear(core_in, trunk_dim),
+            nn.LayerNorm(trunk_dim),
+            nn.ReLU(),
+        )
+        self.n_iters = n_iters
+
+        # Final scalar projection on the refined h. Zero-init so the head
+        # outputs 0 at start (tanh(0) = 0, advantage mean ≈ 0); without this,
+        # the cumulative non-negative residual updates push h far enough that
+        # default-init scalar_head saturates the tanh and gradients vanish.
+        self.scalar_head = nn.Linear(trunk_dim, 1)
+        nn.init.zeros_(self.scalar_head.weight)
+        nn.init.zeros_(self.scalar_head.bias)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        unit_feat: torch.Tensor,
+        charge_feat: torch.Tensor,
+        shoot_feat: torch.Tensor,
+        dest_feat: torch.Tensor,
+        unit_idx: torch.Tensor,
+        move_type: torch.Tensor,
+        active_flags: torch.Tensor,
+    ) -> torch.Tensor:
+        u = self.unit_embed(unit_idx)
+        m = self.move_embed(move_type)
+        action_raw = torch.cat(
+            [unit_feat, charge_feat, shoot_feat, dest_feat, u, m, active_flags],
+            dim=-1,
+        )
+        a = self.action_proj(action_raw)
+
+        # Treat the trunk hidden as the initial state h0; iteratively refine
+        # via residual updates conditioned on (h, h0, action) — same residual
+        # update pattern as the trunk's core loop.
+        h0 = h
+        for _ in range(self.n_iters):
+            h = h + self.core_block(torch.cat([h, h0, a], dim=-1))
+
+        # No tanh: under ListMLE the head needs unbounded score spread to
+        # peak the softmax sharply at the top-target candidate. The auxiliary
+        # MSE term keeps the absolute scale anchored to advantage units.
+        return self.scalar_head(h).squeeze(-1)

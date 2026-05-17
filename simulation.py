@@ -36,6 +36,8 @@ class ActivationResult:
     """Result of executing a single unit activation."""
     description: str
     combat_stats: dict | None = None
+    shoot_target: UnitState | None = None
+    charge_target: UnitState | None = None
 
 
 # ===================================================================
@@ -82,6 +84,25 @@ def execute_activation(
         skip shooting entirely (e.g. rush, or no resolver available).
     """
     active.activated = True
+    # Battle Brothers turn-state housekeeping:
+    # - Clear any incoming Unstoppable Mark on this unit (the marked unit is
+    #   activating now, so the mark expires).
+    # - Reset the once-per-activation Unstoppable Mark cap on this unit.
+    active.marked_by_unstoppable = False
+    active.unstoppable_mark_used = False
+
+    # Apply Unstoppable Mark before resolving combat. The unit picks the
+    # enemy with the highest AI target-score within 18" and marks them; the
+    # next attack against that enemy gains Unstoppable.
+    if active.unit.unstoppable_mark and not active.unstoppable_mark_used:
+        _apply_unstoppable_mark(active, opp_units, board)
+
+    # ED: Increased Shooting Range Mark — same once-per-activation pattern
+    # as Unstoppable Mark, but the bonus is +6" range when any friendly unit
+    # shoots at the marked target (consumed by the first attack).
+    active.isr_mark_used = False
+    if active.unit.isr_mark and not active.isr_mark_used:
+        _apply_isr_mark(active, opp_units, board)
 
     # Shaken units must hold and recover
     if active.shaken:
@@ -93,6 +114,7 @@ def execute_activation(
 
     desc_parts: list[str] = []
     combat_stats: dict | None = None
+    shoot_target: UnitState | None = None
     verbs = {"hold": "Holds", "advance": "Advances", "rush": "Rushes"}
 
     # ── CHARGE ──────────────────────────────────────────────────
@@ -116,19 +138,33 @@ def execute_activation(
                 impact_info = (f"Impact: {imp['impact_hits']} hits, "
                                f"{imp['impact_wounds']} wounds")
 
+        # ED: Counter-Attack on the defender flips strike order — the
+        # defender goes first as a "strike-back" (no charge bonuses), then
+        # the charger strikes if still alive.
+        counter_attack = charge_target.unit.counter_attack
         charger_w = 0
-        if charge_target.models_alive > 0:
-            combat_stats = resolve_melee(
-                active, charge_target, is_charge=True, recorded=True)
-            charger_w = combat_stats['wounds_dealt'] if combat_stats else 0
-            _sync_dead_models(charge_target, board)
-
         defender_w = 0
-        if active.models_alive > 0 and charge_target.models_alive > 0:
+        if counter_attack and active.models_alive > 0:
             ds = resolve_melee(
                 charge_target, active, is_strike_back=True, recorded=True)
             defender_w = ds['wounds_dealt'] if ds else 0
             _sync_dead_models(active, board)
+            if active.models_alive > 0 and charge_target.models_alive > 0:
+                combat_stats = resolve_melee(
+                    active, charge_target, is_charge=True, recorded=True)
+                charger_w = combat_stats['wounds_dealt'] if combat_stats else 0
+                _sync_dead_models(charge_target, board)
+        else:
+            if charge_target.models_alive > 0:
+                combat_stats = resolve_melee(
+                    active, charge_target, is_charge=True, recorded=True)
+                charger_w = combat_stats['wounds_dealt'] if combat_stats else 0
+                _sync_dead_models(charge_target, board)
+            if active.models_alive > 0 and charge_target.models_alive > 0:
+                ds = resolve_melee(
+                    charge_target, active, is_strike_back=True, recorded=True)
+                defender_w = ds['wounds_dealt'] if ds else 0
+                _sync_dead_models(active, board)
 
         melee_parts = []
         if impact_info:
@@ -178,6 +214,7 @@ def execute_activation(
         rt, wr = _kite_range_params(active, opp_units, reason)
         execute_movement(active, goal, budget, board, epos,
                          flying=active.unit.flying,
+                         strider=active.unit.strider,
                          range_target=rt, weapon_range=wr)
         post = active.centre()
         md = _dist(pre, post)
@@ -185,7 +222,7 @@ def execute_activation(
             f"{al} {verbs.get(action, action)} {md:.0f}\" ({reason})")
 
         if action != "rush":
-            combat_stats, shot_desc = _resolve_shooting_phase(
+            combat_stats, shot_desc, shoot_target = _resolve_shooting_phase(
                 active, opp_units, board, labels, unit_to_idx,
                 resolve_shoot_target)
             if shot_desc:
@@ -194,16 +231,75 @@ def execute_activation(
     # ── HOLD ────────────────────────────────────────────────────
     elif action == "hold":
         desc_parts.append(f"{al} Holds ({reason})")
-        combat_stats, shot_desc = _resolve_shooting_phase(
+        combat_stats, shot_desc, shoot_target = _resolve_shooting_phase(
             active, opp_units, board, labels, unit_to_idx,
             resolve_shoot_target)
         if shot_desc:
             desc_parts.append(shot_desc)
 
+    # Limited weapons fire on the unit's first activation, then are stripped
+    # from the loadout for the rest of the game (BB rules + user spec).
+    if not active.has_activated_once:
+        active.has_activated_once = True
+        active.consume_limited()
+
     return ActivationResult(
         description=" ".join(desc_parts),
         combat_stats=combat_stats,
+        shoot_target=shoot_target,
+        charge_target=charge_target if action == "charge" else None,
     )
+
+
+def _apply_unstoppable_mark(
+    active: UnitState,
+    opp_units: list[UnitState],
+    board: Board | None = None,
+) -> None:
+    """Mark the best enemy unit within 18" with Unstoppable Mark for this turn."""
+    from combat import closest_attacker_distance_sq, evaluate_target
+    best: UnitState | None = None
+    best_score = -1.0
+    range_sq = 18 * 18
+    for u in opp_units:
+        if u.models_alive <= 0:
+            continue
+        if closest_attacker_distance_sq(active, u) > range_sq:
+            continue
+        _, score, _ = evaluate_target(active, u, board)
+        if score > best_score:
+            best_score = score
+            best = u
+    if best is not None:
+        best.marked_by_unstoppable = True
+        active.unstoppable_mark_used = True
+
+
+def _apply_isr_mark(
+    active: UnitState,
+    opp_units: list[UnitState],
+    board: Board | None = None,
+) -> None:
+    """ED: Increased Shooting Range Mark — pick the best enemy within 18"
+    and mark it. Friendly units of the marker's owner get +6" shooting range
+    against that target once."""
+    from combat import closest_attacker_distance_sq, evaluate_target
+    best: UnitState | None = None
+    best_score = -1.0
+    range_sq = 18 * 18
+    for u in opp_units:
+        if u.models_alive <= 0:
+            continue
+        if closest_attacker_distance_sq(active, u) > range_sq:
+            continue
+        _, score, _ = evaluate_target(active, u, board)
+        if score > best_score:
+            best_score = score
+            best = u
+    if best is not None:
+        best.marked_by_isr = True
+        best.marked_by_isr_owner = active.owner
+        active.isr_mark_used = True
 
 
 def _resolve_shooting_phase(
@@ -213,25 +309,25 @@ def _resolve_shooting_phase(
     labels: list[str],
     unit_to_idx: dict[int, int],
     resolve_shoot_target,
-) -> tuple[dict | None, str]:
+) -> tuple[dict | None, str, UnitState | None]:
     """Handle the shooting sub-phase after hold/advance.
 
-    Returns (combat_stats, description_fragment).
+    Returns (combat_stats, description_fragment, shoot_target).
     """
     if active.shaken:
         active.shaken = False
-        return None, "(was Shaken, recovers)"
+        return None, "(was Shaken, recovers)", None
 
     if resolve_shoot_target is None:
-        return None, "(no targets in range)"
+        return None, "(no targets in range)", None
 
     tgt = resolve_shoot_target(active, opp_units)
     if tgt is None:
-        return None, "(no targets in range)"
+        return None, "(no targets in range)", None
 
     tl = _label(tgt, labels, unit_to_idx)
     before_alive = tgt.models_alive
-    combat_stats = resolve_shooting(active, tgt, recorded=True)
+    combat_stats = resolve_shooting(active, tgt, recorded=True, board=board)
     check_morale(tgt)
     _sync_dead_models(tgt, board)
     killed = before_alive - tgt.models_alive
@@ -244,7 +340,7 @@ def _resolve_shooting_phase(
                     f"model{'s' if killed != 1 else ''}")
     else:
         desc = f"and shoots {tl}, no casualties"
-    return combat_stats, desc
+    return combat_stats, desc, tgt
 
 
 # ===================================================================
@@ -373,6 +469,16 @@ def start_round(
     for u in units_b:
         u.activated = False
         u.fatigued = False
+
+    # Battleborn (army-wide BB rule): at the start of the round, every shaken
+    # unit whose models all have Battleborn rolls one die — on 4+ it stops
+    # being Shaken. We approximate "all models have it" with the unit-level
+    # template flag, which is set for every BB unit.
+    from models import _roll1
+    for u in units_a + units_b:
+        if u.shaken and u.unit.battleborn:
+            if _roll1() >= 4:
+                u.shaken = False
 
     if mode != "kill_points":
         if "A" not in ml_sides:

@@ -23,6 +23,7 @@ from ml_integration_tactical import (
     MOVE_TYPE_NAMES, execute_decoded_decision, pick_target_from_ranking,
     compute_post_move_rel,
     compute_destination_candidates, compute_destination_features,
+    compute_unit_visibility_arrays, compute_unit_expected_damage_arrays,
     build_dest_enemy_cache,
     _get_model_space_positions, _get_movement_budgets, _get_max_weapon_ranges,
     project_post_move_unit_state, is_phase_reencode_enabled,
@@ -58,6 +59,7 @@ _MAX_SHARED_OPPONENTS = 20
 _g_shared_model: nn.Module | None = None
 _g_shared_opponents: list[nn.Module] = []
 _g_worker_model_type: str = "tactical"
+_g_shared_v_old: nn.Module | None = None
 
 
 def _maybe_build_post_move_state_vec(
@@ -121,12 +123,15 @@ def _maybe_build_post_move_state_vec(
 
 
 def _init_shared_worker(shared_model, shared_opponents, model_type="tactical",
-                         use_c_ext=True, phase_reencode_enabled=True):
+                         use_c_ext=True, phase_reencode_enabled=True,
+                         shared_v_old=None):
     """Initialize worker process with references to shared-memory models."""
     global _g_shared_model, _g_shared_opponents, _g_worker_model_type
+    global _g_shared_v_old
     _g_shared_model = shared_model
     _g_shared_opponents = shared_opponents
     _g_worker_model_type = model_type
+    _g_shared_v_old = shared_v_old
     # Each worker runs small single-sample inferences — using multiple torch
     # threads per worker causes massive oversubscription (8 workers × 8 threads
     # = 64 threads on 16 logical cores).  Pin to 1 thread per worker.
@@ -148,20 +153,39 @@ def _collect_episodes_shared_worker(args) -> list[tuple[list[TacticalActivationR
     shared memory instead of deserializing state dicts.  Only lightweight
     game specs and an opponent slot map are sent via IPC.
 
-    Args is (opp_slot_map, game_specs, shaping_scale[, planning_config]) where
-    opp_slot_map maps opp_sd_index -> index into _g_shared_opponents (or absent
-    for heuristic). shaping_scale controls the per-round reward shaping
-    magnitude (1.0 = full, 0.0 = off).
+    Args is (opp_slot_map, game_specs, shaping_scale[, planning_config[, v_old_shaping]])
+    where opp_slot_map maps opp_sd_index -> index into _g_shared_opponents (or
+    absent for heuristic). shaping_scale controls the per-round reward shaping
+    magnitude (1.0 = full, 0.0 = off). v_old_shaping flips heuristic shaping
+    off and applies V_old potential-based shaping using _g_shared_v_old.
 
     Returns list of (trajectory_rounds, result, opponent_type, army_type).
     """
-    if len(args) >= 4:
+    v_old_shaping = False
+    map_data = None
+    train_deployment = False
+    if len(args) >= 7:
+        (opp_slot_map, game_specs, shaping_scale, planning_config,
+         v_old_shaping, map_data, train_deployment) = args
+    elif len(args) >= 5:
+        opp_slot_map, game_specs, shaping_scale, planning_config, v_old_shaping = args
+    elif len(args) >= 4:
         opp_slot_map, game_specs, shaping_scale, planning_config = args
     else:
         opp_slot_map, game_specs, shaping_scale = args
         planning_config = None
 
     from board import OBJECTIVES as BOARD_OBJECTIVES
+
+    # Map install: workers run in their own process — they need apply_map to
+    # mutate the worker's module-level OBJECTIVES (the engine's downstream
+    # readers, e.g. ml_features.encode_state_tactical, import OBJECTIVES at
+    # module load and use it for objective-cell features). One call per worker
+    # is enough: the mutation is idempotent for the same map.
+    if map_data is not None:
+        from board import Board as _Board
+        from map_loader import apply_map as _apply_map
+        _apply_map(_Board(), map_data, build_vis_cover=False)
 
     model = _g_shared_model
 
@@ -180,10 +204,14 @@ def _collect_episodes_shared_worker(args) -> list[tuple[list[TacticalActivationR
         planning_rate = planning_config.get("planning_rate", 0.0)
         planning_params = planning_config.get("planning_params")
 
+    v_old_model = _g_shared_v_old if v_old_shaping else None
     return _run_games_batched_tactical(model, game_specs, opp_models,
                                        shaping_scale=shaping_scale,
                                        planning_rate=planning_rate,
-                                       planning_params=planning_params)
+                                       planning_params=planning_params,
+                                       v_old_model=v_old_model,
+                                       map_data=map_data,
+                                       train_deployment=train_deployment)
 
 
 
@@ -199,7 +227,11 @@ def _episode_tactical_generator(opponent_model,
                                 army_type="random",
                                 planning_enabled=False,
                                 has_tactical_opponent=False,
-                                model_side: str = "A"):
+                                model_side: str = "A",
+                                map_data=None,
+                                main_model_for_deploy=None,
+                                attach_a: list[tuple[int, bool]] | None = None,
+                                attach_b: list[tuple[int, bool]] | None = None):
     """Run one training episode with the tactical per-activation model.
 
     Yields _TacticalInferenceRequest at each ML decision point.
@@ -246,13 +278,38 @@ def _episode_tactical_generator(opponent_model,
     # Rebuild UnitState objects — units_a is ALWAYS the main model's army.
     # Owner tags match physical deployment: main on physical model_side,
     # opponent on physical _opp_side.
-    units_a = [UnitState(ru) for ru in res_a]
-    for u in units_a:
-        u.owner = model_side
-    units_b = [UnitState(ru) for ru in res_b]
-    for u in units_b:
-        u.owner = _opp_side
+    #
+    # res_a/res_b are PER-ENTRY (one ResolvedUnit per ArmyList entry,
+    # including hero entries that are meant to be merged into a host). To
+    # reach the post-merge shape that states_a_data describes, we have to
+    # redo the hero merge here using attach_a/attach_b. Without this step,
+    # hero entries on HoF armies (where forceorg permits entries=11 with
+    # attached=1) survive as standalone UnitStates and the resulting
+    # 11-unit army overflows MAX_UNITS_PER_SIDE during deployment.
+    def _build_side(res, attach, side_label):
+        all_units = [UnitState(copy.copy(ru)) for ru in res]
+        for u in all_units:
+            u.owner = side_label
+        merged: set[int] = set()
+        if attach is not None:
+            for i, (attached_to, is_hero) in enumerate(attach):
+                if i >= len(all_units):
+                    break
+                if (attached_to is None or attached_to < 0 or not is_hero
+                        or attached_to >= len(all_units) or attached_to == i):
+                    continue
+                merge_hero_into_unit(res[i], all_units[attached_to])
+                merged.add(i)
+        return [u for i, u in enumerate(all_units) if i not in merged]
 
+    import copy
+    from models import merge_hero_into_unit
+    units_a = _build_side(res_a, attach_a, model_side)
+    units_b = _build_side(res_b, attach_b, _opp_side)
+
+    # ai_role/combat_preference/assigned_objective come from the POST-merge
+    # state list — its length matches units_a/units_b now that the merge
+    # mirrors _make_unit_states.
     for u, (ai_role, combat_pref, assigned_obj) in zip(units_a, states_a_data):
         u.ai_role = ai_role
         u.combat_preference = combat_pref
@@ -263,13 +320,57 @@ def _episode_tactical_generator(opponent_model,
         u.assigned_objective = assigned_obj
 
     board = Board()
+    if map_data is not None:
+        from map_loader import apply_map as _apply_map
+        _apply_map(board, map_data)
+
+    # Build per-side deployment decision functions. When main_model_for_deploy
+    # is provided, the main model drives placement for its side (and, in
+    # mirror self-play, the opponent side too — both are the same model).
+    # Records are appended into deploy_records_* so the PPO step can replay
+    # the deploy heads. Without a model, deploy_armies defaults to the
+    # legacy role-anchored heuristic.
+    deploy_records_main: list = []
+    deploy_records_opp: list = []
+    fn_main = fn_opp = None
+    if main_model_for_deploy is not None:
+        from ml_training.deploy_collection import make_model_deploy_decision_fn
+        # Main learning model controls "model_side"; the opponent side runs
+        # the model too in mirror self-play, and otherwise either runs an
+        # opponent checkpoint (only the main side's records are used for the
+        # PPO update) or the legacy heuristic.
+        fn_main = make_model_deploy_decision_fn(
+            main_model_for_deploy, player=model_side,
+            opponent_type_idx=opponent_type_idx, side_idx=(0 if model_side == "A" else 1),
+            record_into=deploy_records_main,
+        )
+        _opponent_deploy_model = None
+        if is_mirror:
+            _opponent_deploy_model = main_model_for_deploy
+        elif has_tactical_opponent and opponent_model is not None:
+            _opponent_deploy_model = opponent_model
+        if _opponent_deploy_model is not None:
+            fn_opp = make_model_deploy_decision_fn(
+                _opponent_deploy_model, player=_opp_side,
+                opponent_type_idx=opponent_type_idx,
+                side_idx=(0 if _opp_side == "A" else 1),
+                # Only record opponent-side records for the mirror case (both
+                # sides train); for tactical opponents the records are not
+                # used in the main model's loss.
+                record_into=deploy_records_opp if is_mirror else None,
+            )
+
     # deploy_armies puts its first positional arg on physical side A and
     # second on physical side B — so if the main model is on side B we
     # pass (units_b, units_a) to land the opponent on A and main on B.
     if model_side == "A":
-        deploy_armies(units_a, units_b, board)
+        _df_a, _df_b = fn_main, fn_opp
+        deploy_armies(units_a, units_b, board,
+                      decision_fn_a=_df_a, decision_fn_b=_df_b)
     else:
-        deploy_armies(units_b, units_a, board)
+        _df_a, _df_b = fn_opp, fn_main
+        deploy_armies(units_b, units_a, board,
+                      decision_fn_a=_df_a, decision_fn_b=_df_b)
 
     fr_a, fm_a = precompute_damage([u.unit for u in units_a], [u.unit for u in units_b])
     fr_b, fm_b = precompute_damage([u.unit for u in units_b], [u.unit for u in units_a])
@@ -385,6 +486,11 @@ def _episode_tactical_generator(opponent_model,
                 _ga_cands_dict = {}
                 _ga_mask_dict = {}
                 _ga_ar_dict = {}
+                _ga_dest_vis_dict = {}
+                _ga_static_vis_dict = {}
+                _ga_dest_dmg_dict = {}
+                _ga_static_dmg_dict = {}
+                _ga_e_dmg_table = getattr(board, 'expected_damage_table', None)
                 for _gui in range(min(len(units_a), MAX_UNITS_PER_SIDE)):
                     if alive_mask_list[_gui]:
                         _gc, _gm, _gar = compute_destination_candidates(
@@ -393,6 +499,16 @@ def _episode_tactical_generator(opponent_model,
                         _ga_cands_dict[_gui] = _gc
                         _ga_mask_dict[_gui] = _gm
                         _ga_ar_dict[_gui] = _gar
+                        _gdv, _gsv = compute_unit_visibility_arrays(
+                            units_a[_gui], _gc, _gm, units_b, board,
+                        )
+                        _ga_dest_vis_dict[_gui] = _gdv
+                        _ga_static_vis_dict[_gui] = _gsv
+                        _gdd, _gsd = compute_unit_expected_damage_arrays(
+                            units_a[_gui], _gc, _gm, units_b, board, _ga_e_dmg_table,
+                        )
+                        _ga_dest_dmg_dict[_gui] = _gdd
+                        _ga_static_dmg_dict[_gui] = _gsd
                 _ga_enemy_cache = build_dest_enemy_cache(units_b, _ga_enemy_alive_np, model_side)
 
                 # >>> YIELD for batched inference (or planning, decided by coordinator) <<<
@@ -406,6 +522,10 @@ def _episode_tactical_generator(opponent_model,
                 _req.dest_mask_per_unit = _ga_mask_dict
                 _req.dest_advance_reachable_per_unit = _ga_ar_dict
                 _req.dest_features_per_unit = None  # computed lazily
+                _req.dest_visibility_per_unit = _ga_dest_vis_dict
+                _req.static_visibility_per_unit = _ga_static_vis_dict
+                _req.dest_expected_damage_per_unit = _ga_dest_dmg_dict
+                _req.static_expected_damage_per_unit = _ga_static_dmg_dict
                 _req.dest_lazy_units = units_a
                 _req.dest_lazy_enemy_units = units_b
                 _req.dest_lazy_enemy_alive = _ga_enemy_alive_np
@@ -427,6 +547,14 @@ def _episode_tactical_generator(opponent_model,
                     _req.planning_pts_a = pts_a
                     _req.planning_pts_b = pts_b
                     _req.planning_opponent_type_idx = opponent_type_idx
+                    # A-side requests always pass "A" — by collection convention
+                    # (lines 241-243) units_a is the main model's army regardless
+                    # of physical side, and the planner expects friendly to map
+                    # to its internal "A". Setting this to model_side breaks
+                    # non-mirror games where model_side="B" because the dispatcher
+                    # then swaps friendly/enemy and the planner runs on the wrong
+                    # unit list.
+                    _req.planning_player = "A"
 
                 _inf_result = yield _req
 
@@ -439,6 +567,7 @@ def _episode_tactical_generator(opponent_model,
                 old_lp = _inf_result.old_log_prob
                 value_est = _inf_result.value
                 shoot_mask_a = _inf_result.shoot_mask
+                cover_aware_dmg_a = getattr(_inf_result, 'cover_aware_dmg', None)
                 dest_cands_a = _inf_result.dest_candidates
                 dest_sel_a = _inf_result.dest_selected_idx
                 dest_ar_a = _inf_result.dest_advance_reachable
@@ -487,6 +616,7 @@ def _episode_tactical_generator(opponent_model,
                     charge_target_idx=charge_tgt_a,
                     shoot_target_idx=shoot_tgt_a,
                     shoot_mask=shoot_mask_a,
+                    cover_aware_dmg=cover_aware_dmg_a,
                     post_move_rel=pmr_a,
                     state_vec_post=_a_state_vec_post_np,
                     old_log_prob=old_lp,
@@ -503,6 +633,8 @@ def _episode_tactical_generator(opponent_model,
                     planning_charge_indices=_inf_result.planning_charge_indices,
                     planning_shoot_values=_inf_result.planning_shoot_values,
                     planning_shoot_indices=_inf_result.planning_shoot_indices,
+                    planning_dest_values=_inf_result.planning_dest_values,
+                    planning_dest_indices=_inf_result.planning_dest_indices,
                 )
                 round_step_indices.append(len(trajectory))
                 trajectory.append(step)
@@ -570,6 +702,11 @@ def _episode_tactical_generator(opponent_model,
                         _gb_cands_dict = {}
                         _gb_mask_dict = {}
                         _gb_ar_dict = {}
+                        _gb_dest_vis_dict = {}
+                        _gb_static_vis_dict = {}
+                        _gb_dest_dmg_dict = {}
+                        _gb_static_dmg_dict = {}
+                        _gb_e_dmg_table = getattr(board, 'expected_damage_table', None)
                         for _gbui in range(min(len(units_b), MAX_UNITS_PER_SIDE)):
                             if b_alive_list[_gbui]:
                                 _gbc, _gbm, _gbar = compute_destination_candidates(
@@ -578,6 +715,16 @@ def _episode_tactical_generator(opponent_model,
                                 _gb_cands_dict[_gbui] = _gbc
                                 _gb_mask_dict[_gbui] = _gbm
                                 _gb_ar_dict[_gbui] = _gbar
+                                _gbdv, _gbsv = compute_unit_visibility_arrays(
+                                    units_b[_gbui], _gbc, _gbm, units_a, board,
+                                )
+                                _gb_dest_vis_dict[_gbui] = _gbdv
+                                _gb_static_vis_dict[_gbui] = _gbsv
+                                _gbdd, _gbsd = compute_unit_expected_damage_arrays(
+                                    units_b[_gbui], _gbc, _gbm, units_a, board, _gb_e_dmg_table,
+                                )
+                                _gb_dest_dmg_dict[_gbui] = _gbdd
+                                _gb_static_dmg_dict[_gbui] = _gbsd
                         _gb_enemy_cache = build_dest_enemy_cache(units_a, _gb_enemy_alive_np, _opp_side)
 
                         # >>> YIELD for batched main-model inference (mirror B) <<<
@@ -591,6 +738,10 @@ def _episode_tactical_generator(opponent_model,
                         _gb_req.dest_mask_per_unit = _gb_mask_dict
                         _gb_req.dest_advance_reachable_per_unit = _gb_ar_dict
                         _gb_req.dest_features_per_unit = None
+                        _gb_req.dest_visibility_per_unit = _gb_dest_vis_dict
+                        _gb_req.static_visibility_per_unit = _gb_static_vis_dict
+                        _gb_req.dest_expected_damage_per_unit = _gb_dest_dmg_dict
+                        _gb_req.static_expected_damage_per_unit = _gb_static_dmg_dict
                         _gb_req.dest_lazy_units = units_b
                         _gb_req.dest_lazy_enemy_units = units_a
                         _gb_req.dest_lazy_enemy_alive = _gb_enemy_alive_np
@@ -599,6 +750,20 @@ def _episode_tactical_generator(opponent_model,
                         _gb_req.dest_lazy_melee_matchups = fm_a
                         _gb_req.dest_lazy_player = _opp_side
                         _gb_req.dest_lazy_enemy_cache = _gb_enemy_cache
+                        if planning_enabled:
+                            _gb_req.planning_units_a = units_a
+                            _gb_req.planning_units_b = units_b
+                            _gb_req.planning_board = board
+                            _gb_req.planning_round_num = round_num
+                            _gb_req.planning_current_is_a = current_is_a
+                            _gb_req.planning_fr_a = fr_a
+                            _gb_req.planning_fm_a = fm_a
+                            _gb_req.planning_fr_b = fr_b
+                            _gb_req.planning_fm_b = fm_b
+                            _gb_req.planning_pts_a = pts_a
+                            _gb_req.planning_pts_b = pts_b
+                            _gb_req.planning_opponent_type_idx = opponent_type_idx
+                            _gb_req.planning_player = _opp_side
                         _b_inf = yield _gb_req
 
                         sel_b = _b_inf.unit_idx
@@ -645,6 +810,7 @@ def _episode_tactical_generator(opponent_model,
                                 charge_target_idx=_b_inf.charge_target_idx,
                                 shoot_target_idx=_b_inf.shoot_target_idx,
                                 shoot_mask=_b_inf.shoot_mask,
+                                cover_aware_dmg=getattr(_b_inf, 'cover_aware_dmg', None),
                                 post_move_rel=_b_inf.post_move_rel,
                                 state_vec_post=_b_state_vec_post_np,
                                 old_log_prob=_b_inf.old_log_prob,
@@ -720,6 +886,11 @@ def _episode_tactical_generator(opponent_model,
                         _gopp_cands_dict = {}
                         _gopp_mask_dict = {}
                         _gopp_ar_dict = {}
+                        _gopp_dest_vis_dict = {}
+                        _gopp_static_vis_dict = {}
+                        _gopp_dest_dmg_dict = {}
+                        _gopp_static_dmg_dict = {}
+                        _gopp_e_dmg_table = getattr(board, 'expected_damage_table', None)
                         for _goppi in range(min(len(units_b), MAX_UNITS_PER_SIDE)):
                             if b_alive_list[_goppi]:
                                 _goppc, _goppm, _goppar = compute_destination_candidates(
@@ -728,6 +899,16 @@ def _episode_tactical_generator(opponent_model,
                                 _gopp_cands_dict[_goppi] = _goppc
                                 _gopp_mask_dict[_goppi] = _goppm
                                 _gopp_ar_dict[_goppi] = _goppar
+                                _goppdv, _goppsv = compute_unit_visibility_arrays(
+                                    units_b[_goppi], _goppc, _goppm, units_a, board,
+                                )
+                                _gopp_dest_vis_dict[_goppi] = _goppdv
+                                _gopp_static_vis_dict[_goppi] = _goppsv
+                                _goppdd, _goppsd = compute_unit_expected_damage_arrays(
+                                    units_b[_goppi], _goppc, _goppm, units_a, board, _gopp_e_dmg_table,
+                                )
+                                _gopp_dest_dmg_dict[_goppi] = _goppdd
+                                _gopp_static_dmg_dict[_goppi] = _goppsd
                         _gopp_enemy_cache = build_dest_enemy_cache(units_a, _gopp_enemy_alive_np, _opp_side)
 
                         # >>> YIELD for batched opponent-model inference <<<
@@ -741,6 +922,10 @@ def _episode_tactical_generator(opponent_model,
                         _gopp_req.dest_mask_per_unit = _gopp_mask_dict
                         _gopp_req.dest_advance_reachable_per_unit = _gopp_ar_dict
                         _gopp_req.dest_features_per_unit = None
+                        _gopp_req.dest_visibility_per_unit = _gopp_dest_vis_dict
+                        _gopp_req.static_visibility_per_unit = _gopp_static_vis_dict
+                        _gopp_req.dest_expected_damage_per_unit = _gopp_dest_dmg_dict
+                        _gopp_req.static_expected_damage_per_unit = _gopp_static_dmg_dict
                         _gopp_req.dest_lazy_units = units_b
                         _gopp_req.dest_lazy_enemy_units = units_a
                         _gopp_req.dest_lazy_enemy_alive = _gopp_enemy_alive_np
@@ -1048,7 +1233,68 @@ def _episode_tactical_generator(opponent_model,
         'shoot_n': _h_shoot_count,
         'charge_n': _h_charge_count,
     } if opponent_type == "heuristic" else None
-    return trajectory, result, opponent_type, trajectory_b, heuristic_eff
+    # Tagged deploy records: (records_main, records_opp_for_mirror_only).
+    # When deployment training is disabled (no main_model_for_deploy was
+    # passed), both lists are empty so downstream consumers can no-op.
+    deploy_payload = (deploy_records_main, deploy_records_opp)
+    return (trajectory, result, opponent_type, trajectory_b,
+            heuristic_eff, deploy_payload)
+
+
+def _apply_v_old_shaping(
+    finished: dict,
+    game_model_sides: list[str],
+    v_old_model: TacticalModel,
+    shaping_scale: float,
+) -> None:
+    """Add Φ-delta shaping to every collected trajectory in place.
+
+    Stacks all step state_vecs across trajectories into a single batched
+    forward through V_old, then writes per-step shaping rewards back to
+    each TacticalActivationRecord. Terminal Φ is taken as 0.
+    """
+    rows: list[np.ndarray] = []
+    opp_indices: list[int] = []
+    side_indices: list[int] = []
+    bounds: list[tuple[int, int, list]] = []  # (start, end, traj_records)
+
+    for gid, val in finished.items():
+        traj, _result, _opp_type, traj_b, _h_eff = val
+        m_side = game_model_sides[gid]
+        if traj:
+            start = len(rows)
+            for r in traj:
+                rows.append(r.state_vec)
+                opp_indices.append(int(r.opponent_type_idx))
+                side_indices.append(0 if m_side == "A" else 1)
+            bounds.append((start, len(rows), traj))
+        if traj_b:
+            opp_m_side = "B" if m_side == "A" else "A"
+            start = len(rows)
+            for r in traj_b:
+                rows.append(r.state_vec)
+                opp_indices.append(int(r.opponent_type_idx))
+                side_indices.append(0 if opp_m_side == "A" else 1)
+            bounds.append((start, len(rows), traj_b))
+
+    if not rows:
+        return
+
+    state_vecs = torch.from_numpy(np.stack(rows)).float()
+    opp_t = torch.tensor(opp_indices, dtype=torch.long)
+    side_t = torch.tensor(side_indices, dtype=torch.long)
+
+    with torch.no_grad():
+        v_olds = v_old_model.value_only(
+            state_vecs, opponent_type=opp_t, side=side_t
+        ).cpu().numpy()
+
+    for start, end, traj in bounds:
+        T = end - start
+        for i in range(T):
+            v_curr = float(v_olds[start + i])
+            v_next = float(v_olds[start + i + 1]) if i + 1 < T else 0.0
+            traj[i].reward += shaping_scale * (v_next - v_curr)
 
 
 def _run_games_batched_tactical(
@@ -1059,6 +1305,9 @@ def _run_games_batched_tactical(
     planning_rate: float = 0.0,
     planning_params: dict | None = None,
     randomize_sides: bool = True,
+    v_old_model: TacticalModel | None = None,
+    map_data=None,
+    train_deployment: bool = False,
 ) -> list[tuple]:
     """Run multiple tactical training games with batched inference.
 
@@ -1077,13 +1326,29 @@ def _run_games_batched_tactical(
     """
     from board import OBJECTIVES as BOARD_OBJECTIVES
 
+    # When V_old shaping is active, the heuristic shapers must not fire — the
+    # generator gets shaping_scale=0 and we apply Φ-deltas after collection.
+    use_v_old_shaping = v_old_model is not None
+    gen_shaping_scale = 0.0 if use_v_old_shaping else shaping_scale
+
     # Create generators and track opponent models for tactical opponents
     generators: list = []
     game_army_types: list[str] = []
     game_model_sides: list[str] = []
     game_opp_tactical_models: dict[int, nn.Module] = {}
 
-    for i, (res_a, res_b, sa_data, sb_data, opp_type, opp_sd_idx, army_type) in enumerate(game_specs):
+    for i, spec in enumerate(game_specs):
+        # Specs from loop.py are 9-tuples (the last two carry per-entry hero
+        # attach data so the generator can redo the merge). Legacy callers
+        # (probe/profile scripts) still pass 7-tuples — synthesise empty
+        # attach data so heroes simply pass through as standalone units.
+        if len(spec) == 9:
+            (res_a, res_b, sa_data, sb_data, opp_type, opp_sd_idx, army_type,
+             attach_a, attach_b) = spec
+        else:
+            (res_a, res_b, sa_data, sb_data, opp_type, opp_sd_idx, army_type) = spec
+            attach_a = [(-1, False)] * len(res_a)
+            attach_b = [(-1, False)] * len(res_b)
         opp_model = opp_models.get(opp_sd_idx)
 
         if opp_model is not None:
@@ -1096,13 +1361,22 @@ def _run_games_batched_tactical(
             _model_side = "A"
 
         gen = _episode_tactical_generator(
-            None,
+            opp_model,
             res_a, res_b, sa_data, sb_data, opp_type, BOARD_OBJECTIVES,
-            shaping_scale=shaping_scale,
+            shaping_scale=gen_shaping_scale,
             army_type=army_type,
-            planning_enabled=(planning_rate > 0),
+            # Planning is restricted to current-vs-current mirror matches so
+            # both sides see (and learn from) planned trajectories under
+            # symmetric conditions. Non-mirror games (vs heuristic, HoF,
+            # checkpoints, random) train without planning so the model gets
+            # broader state-distribution coverage from fair-skill play.
+            planning_enabled=(planning_rate > 0 and is_mirror_game),
             has_tactical_opponent=(opp_model is not None),
             model_side=_model_side,
+            map_data=map_data,
+            main_model_for_deploy=(main_model if train_deployment else None),
+            attach_a=attach_a,
+            attach_b=attach_b,
         )
         generators.append(gen)
         game_army_types.append(army_type)
@@ -1139,7 +1413,9 @@ def _run_games_batched_tactical(
 
         all_results: dict[int, _TacticalSamplingResult] = {}
 
-        # Synchronized planning decision: roll once for all Player A requests
+        # Synchronized planning decision: roll once for all main-model requests
+        # (covers A-side and mirror B-side; opponent-checkpoint requests use
+        # model_key="opponent" and never enter this loop).
         use_planning_this_round = (
             planning_rate > 0
             and main_reqs
@@ -1147,20 +1423,22 @@ def _run_games_batched_tactical(
         )
 
         if use_planning_this_round:
-            # Planning round: run plan_training_activation for each A request
+            # Planning round: run plan_training_activation for each main request
             from ml_planning import plan_training_activation
             for gid, req in zip(main_gids, main_reqs):
                 if req.planning_units_a is not None:
-                    (uid, mt, plan_dcol, plan_drow, plan_dcidx,
-                     ct, st, ranking,
-                     pmr, olp, val, sm,
-                     wp, pi, pvd, puv, pui,
-                     pmv, pmi, pcv, pci, psv, psi,
-                    ) = plan_training_activation(
+                    if req.planning_player == "A":
+                        _plan_friendly = req.planning_units_a
+                        _plan_enemy = req.planning_units_b
+                    else:
+                        _plan_friendly = req.planning_units_b
+                        _plan_enemy = req.planning_units_a
+                    _plan_out = plan_training_activation(
                         main_model, req.state_vec, req.alive_mask,
                         req.enemy_alive_mask,
-                        req.planning_units_a, req.planning_units_b,
-                        req.planning_round_num, req.planning_board, "A",
+                        _plan_friendly, _plan_enemy,
+                        req.planning_round_num, req.planning_board,
+                        req.planning_player,
                         current_is_a=req.planning_current_is_a,
                         mode="objectives",
                         friendly_positions=req.friendly_positions,
@@ -1174,14 +1452,30 @@ def _run_games_batched_tactical(
                         planning_params=planning_params,
                         opponent_type=req.planning_opponent_type_idx,
                     )
-                    # Planning returns (dest_col, dest_row, dest_cand_idx) —
-                    # build dest pointer data for the record.
-                    # Dest candidates were not pre-computed for planning path;
-                    # store empty dest data (planning does its own candidate search).
+                    if _plan_out is None:
+                        # Planning bailed (no valid live units after safety
+                        # clamp); fall through to the unhandled path below so
+                        # this gid is picked up by the normal inference batch.
+                        continue
+                    (uid, mt, plan_dcol, plan_drow, plan_dcidx,
+                     ct, st, ranking,
+                     pmr, olp, val, sm,
+                     wp, pi, pvd, puv, pui,
+                     pmv, pmi, pcv, pci, psv, psi,
+                     pdv, pdi, plan_dcands, plan_dar,
+                    ) = _plan_out
+                    # Planning returns dest candidates for the chosen unit
+                    # (MOVE_MOVE only); pass them into the replay record so the
+                    # dest head gets replay log-probs and distillation targets.
+                    _dcands = plan_dcands if plan_dcands is not None else []
+                    _dar = plan_dar if plan_dar is not None else None
+                    _dmask = [True] * len(_dcands)
                     all_results[gid] = _TacticalSamplingResult(
                         unit_idx=uid, move_type=mt,
-                        dest_candidates=[], dest_mask=[], dest_features=[],
-                        dest_selected_idx=-1,
+                        dest_candidates=_dcands, dest_mask=_dmask,
+                        dest_features=[],
+                        dest_selected_idx=plan_dcidx,
+                        dest_advance_reachable=_dar,
                         charge_target_idx=ct, shoot_target_idx=st,
                         target_ranking=ranking, post_move_rel=pmr,
                         old_log_prob=olp, value=val, shoot_mask=sm,
@@ -1195,12 +1489,15 @@ def _run_games_batched_tactical(
                         planning_charge_indices=pci,
                         planning_shoot_values=psv,
                         planning_shoot_indices=psi,
+                        planning_dest_values=pdv,
+                        planning_dest_indices=pdi,
                     )
                 else:
-                    # B-side mirror request with model_key="main" — no planning
+                    # Main request without planning fields (e.g. planning was
+                    # disabled when the generator was constructed) — fall through.
                     pass
 
-            # Any main requests not handled (e.g. mirror B) get normal inference
+            # Any main requests not handled get normal inference
             unhandled_gids = [g for g in main_gids if g not in all_results]
             if unhandled_gids:
                 unhandled_reqs = [main_reqs[main_gids.index(g)]
@@ -1236,6 +1533,14 @@ def _run_games_batched_tactical(
 
         active = new_active
 
+    # Apply V_old potential-based shaping to all collected trajectories.
+    # Simpler form r_t += scale · (V_old(s_{t+1}) − V_old(s_t)) with terminal
+    # Φ ≡ 0; telescopes to a constant per-trajectory shift, redistributing
+    # value information to per-step gradients. Heuristic shapers are already
+    # disabled (gen_shaping_scale=0) when this branch fires.
+    if use_v_old_shaping and shaping_scale > 0.0:
+        _apply_v_old_shaping(finished, game_model_sides, v_old_model, shaping_scale)
+
     # Return results in original order, adding army_type.
     # Transform physical winner ("A"/"B") to main-perspective ("main"/"opp")
     # so record_game sees the same semantic regardless of which physical
@@ -1247,10 +1552,13 @@ def _run_games_batched_tactical(
 
     results = []
     for i in range(len(generators)):
-        traj, result, opp_type, traj_b, h_eff = finished[i]
+        traj, result, opp_type, traj_b, h_eff, deploy_payload = finished[i]
+        deploy_records_main, deploy_records_opp = deploy_payload
         m_side = game_model_sides[i]
-        results.append((traj, _to_main(result, m_side), opp_type, game_army_types[i], m_side, h_eff))
+        results.append((traj, _to_main(result, m_side), opp_type,
+                        game_army_types[i], m_side, h_eff, deploy_records_main))
         if traj_b is not None:
             opp_m_side = "B" if m_side == "A" else "A"
-            results.append((traj_b, _to_main(result, opp_m_side), "mirror_b", game_army_types[i], opp_m_side, None))
+            results.append((traj_b, _to_main(result, opp_m_side), "mirror_b",
+                            game_army_types[i], opp_m_side, None, deploy_records_opp))
     return results

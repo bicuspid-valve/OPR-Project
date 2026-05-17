@@ -13,6 +13,10 @@ SQRT2 = math.sqrt(2)
 COHERENCY_NEAR_SQ = 4    # 2" c2c → within 1" edge-to-edge
 COHERENCY_FAR_SQ = 100   # 10" c2c → within 9" edge-to-edge
 
+# Difficult terrain budget cap — see TERRAIN_SPEC.md §3.2.
+DIFFICULT_CAP = 6.0
+DIFFICULT_CAP_MILLI = int(DIFFICULT_CAP * 1000 + 0.5)
+
 # 8 directions: (dc, dr, cost)
 _DIRS = [
     (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
@@ -32,9 +36,8 @@ def is_in_exclusion_zone(col: int, row: int,
     return False
 
 
-def build_exclusion_grid(enemy_positions: set[tuple[int, int]]) -> bytearray:
-    """Precompute a flat grid marking squares within 1\" of any enemy model.
-    Uses O(1) index lookup instead of set membership checks."""
+def _build_exclusion_grid_py(enemy_positions: set[tuple[int, int]]) -> bytearray:
+    """Pure-Python reference. Kept for when the C extension is off."""
     grid = bytearray(COLS * ROWS)
     for c, r in enemy_positions:
         for dc in range(-1, 2):
@@ -45,6 +48,14 @@ def build_exclusion_grid(enemy_positions: set[tuple[int, int]]) -> bytearray:
                 if 0 <= nc < COLS and 0 <= nr < ROWS:
                     grid[nr * COLS + nc] = 1
     return grid
+
+
+def build_exclusion_grid(enemy_positions: set[tuple[int, int]]) -> bytearray:
+    """Precompute a flat grid marking squares within 1\" of any enemy model.
+    Uses O(1) index lookup instead of set membership checks."""
+    if _fc.USE_C_EXT and _fc.is_available():
+        return _fc.fast_build_exclusion_grid(enemy_positions, COLS, ROWS)
+    return _build_exclusion_grid_py(enemy_positions)
 
 
 def check_coherency(positions: list[tuple[int, int]]) -> bool:
@@ -78,7 +89,9 @@ def _greedy_move(start: tuple[int, int], goal: tuple[int, int],
                  enemy_positions: set[tuple[int, int]],
                  is_charge: bool = False,
                  flying: bool = False,
-                 exclusion_grid: bytearray | None = None) -> tuple[int, int]:
+                 strider: bool = False,
+                 exclusion_grid: bytearray | None = None,
+                 enemy_bytes: bytes | None = None) -> tuple[int, int]:
     """Move one model toward goal using Dijkstra pathfinding within budget.
 
     Explores all reachable cells within the movement budget, then picks the
@@ -89,21 +102,38 @@ def _greedy_move(start: tuple[int, int], goal: tuple[int, int],
     Cannot move through enemy-occupied squares (unless flying).
     Can move through friendly-occupied squares but not end there.
     Non-charge movement rejects squares in the 1\" exclusion zone
-    (unless the model started adjacent to enemies)."""
+    (unless the model started adjacent to enemies).
 
-    # --- C-accelerated fast path ---
+    Terrain (TERRAIN_SPEC.md §3): a path that enters difficult terrain caps
+    total length at 6.0\" (unless the unit is flying or strider). Impassible
+    pieces cannot be entered (unless flying), and no model — including flying
+    units — may end its move on an impassible square.
+
+    ``enemy_bytes`` is an optional pre-packed int32 buffer of *enemy_positions*;
+    callers that walk many models of the same unit should build it once
+    (via ``fast_core._positions_to_int_bytes``) and pass it through to amortise
+    the serialisation cost."""
+
+    has_terrain = bool(board.terrain)
+
+    # --- C-accelerated fast path (terrain-aware) ---
     if _fc.USE_C_EXT:
         if exclusion_grid is None:
             exclusion_grid = build_exclusion_grid(enemy_positions)
         result = _fc.fast_pathfind_move(
             start, goal, budget, board.occupancy, enemy_positions,
-            is_charge=is_charge, flying=flying,
+            is_charge=is_charge, flying=flying, strider=strider,
             exclusion_grid=exclusion_grid, cols=COLS, rows=ROWS,
+            enemy_bytes=enemy_bytes,
+            impassible_grid=board.impassible_grid if has_terrain else None,
+            difficult_grid=board.difficult_grid if has_terrain else None,
         )
-        # C path may return a position that is occupied if it couldn't find
-        # an alternative — in that case fall back to start (matching Python behavior).
-        if result != start and board.is_occupied(result[0], result[1]):
-            return start
+        # C path may return a position that is occupied or impassible if it
+        # couldn't find an alternative — fall back to start (matches Python).
+        if result != start:
+            ridx = result[1] * COLS + result[0]
+            if board.is_occupied(result[0], result[1]) or (has_terrain and board.impassible_grid[ridx]):
+                return start
         return result
 
     # --- Pure Python Dijkstra ---
@@ -133,23 +163,34 @@ def _greedy_move(start: tuple[int, int], goal: tuple[int, int],
     no_enemies = not enemy_positions
     has_excl = check_exclusion and exclusion_grid is not None
 
+    impassible_grid = board.impassible_grid if has_terrain else None
+    difficult_grid = board.difficult_grid if has_terrain else None
+    apply_difficult_cap = has_terrain and not flying and not strider
+    block_impassible = has_terrain and not flying
+
     # Dijkstra: explore all reachable cells within budget
-    # Use a flat cost array for speed (grid is only 72*48 = 3456 cells)
+    # State per cell is (cell_index, has_entered_difficult). When the cap
+    # applies we expand the search to two layers per cell, otherwise one.
     total = max_col * max_row
     INF_COST = 999999999
-    # cost_arr[cell_index] = best cost in milli-inches to reach cell
-    cost_arr = [INF_COST] * total
+    if apply_difficult_cap:
+        # Two layers: layer 0 = no difficult entered, layer 1 = entered.
+        cost_arr = [INF_COST] * (2 * total)
+    else:
+        cost_arr = [INF_COST] * total
     start_idx = row * max_col + col
-    cost_arr[start_idx] = 0
+    cost_arr[start_idx] = 0  # start_layer = 0; s_0 never counts as "entered"
 
     budget_milli = int(budget * 1000 + 0.5)
-    # Priority queue: (cost_milli, col, row)
-    pq = [(0, col, row)]
+    cap_milli = DIFFICULT_CAP_MILLI
+    # Priority queue: (cost_milli, col, row, layer)
+    pq = [(0, col, row, 0)]
 
     while pq:
-        c, cc, cr = heapq.heappop(pq)
+        c, cc, cr, layer = heapq.heappop(pq)
         cidx = cr * max_col + cc
-        if c > cost_arr[cidx]:
+        slot = (layer * total + cidx) if apply_difficult_cap else cidx
+        if c > cost_arr[slot]:
             continue
         for ddc, ddr, step_cost in _DIRS:
             nc = cc + ddc
@@ -160,24 +201,44 @@ def _greedy_move(start: tuple[int, int], goal: tuple[int, int],
                 continue
             if has_excl and exclusion_grid[nr * max_col + nc]:
                 continue
+            n_grid_idx = nr * max_col + nc
+            if block_impassible and impassible_grid[n_grid_idx]:
+                continue
             new_cost = c + int(step_cost * 1000 + 0.5)
             if new_cost > budget_milli + 10:  # small tolerance
                 continue
-            nidx = nr * max_col + nc
-            if new_cost < cost_arr[nidx]:
-                cost_arr[nidx] = new_cost
-                heapq.heappush(pq, (new_cost, nc, nr))
+            new_layer = layer
+            if apply_difficult_cap and difficult_grid[n_grid_idx]:
+                new_layer = 1
+            if apply_difficult_cap and new_layer == 1:
+                if new_cost > cap_milli + 10:
+                    continue
+            nslot = (new_layer * total + n_grid_idx) if apply_difficult_cap else n_grid_idx
+            if new_cost < cost_arr[nslot]:
+                cost_arr[nslot] = new_cost
+                heapq.heappush(pq, (new_cost, nc, nr, new_layer))
 
-    # Find best reachable, non-occupied cell closest to goal
+    # Find best reachable, non-occupied cell closest to goal.
+    # When the cap is active, take the min cost over both layers per cell;
+    # the destination is "reachable" iff at least one layer reached it.
     best_pos = start
     best_goal_dist = start_dist_sq
     for idx in range(total):
-        if cost_arr[idx] >= INF_COST:
+        if apply_difficult_cap:
+            min_cost = cost_arr[idx]
+            if cost_arr[total + idx] < min_cost:
+                min_cost = cost_arr[total + idx]
+        else:
+            min_cost = cost_arr[idx]
+        if min_cost >= INF_COST:
+            continue
+        if occupancy[idx]:
+            continue
+        # Destination must not be impassible — applies to flying too (§3.3).
+        if has_terrain and impassible_grid[idx]:
             continue
         cc = idx % max_col
         cr = idx // max_col
-        if occupancy[idx]:
-            continue
         if not no_enemies and (cc, cr) in enemy_positions:
             continue
         dgc = cc - gc
@@ -193,6 +254,7 @@ def _greedy_move(start: tuple[int, int], goal: tuple[int, int],
 def execute_movement(unit_state, goal: tuple[int, int], budget: float,
                      board: Board, enemy_positions: set[tuple[int, int]],
                      is_charge: bool = False, flying: bool = False,
+                     strider: bool = False,
                      range_target: tuple[int, int] | None = None,
                      weapon_range: float = 0):
     """Move all models in a unit toward goal, maintaining coherency.
@@ -207,8 +269,19 @@ def execute_movement(unit_state, goal: tuple[int, int], budget: float,
     if n == 0 or budget <= 0:
         return
 
-    # Precompute exclusion grid once for all models
-    exclusion_grid = None if is_charge else build_exclusion_grid(enemy_positions)
+    # Precompute both exclusion grid and packed enemy bytes once.
+    # build_exclusion_grid already calls _positions_to_int_bytes internally when
+    # C is on, so grab the packed bytes alongside to hand to fast_pathfind_move
+    # per model below (avoids re-packing on each _greedy_move call).
+    enemy_bytes = _fc._positions_to_int_bytes(enemy_positions)
+    if is_charge:
+        exclusion_grid = None
+    else:
+        exclusion_grid = (_fc.fast_build_exclusion_grid(
+                              enemy_positions, COLS, ROWS,
+                              enemy_bytes=enemy_bytes)
+                          if _fc.USE_C_EXT and _fc.is_available()
+                          else build_exclusion_grid(enemy_positions))
 
     # Sort models by distance to goal (closest first)
     model_order = sorted(range(n), key=lambda i: dist_sq(positions[i], goal))
@@ -249,7 +322,9 @@ def execute_movement(unit_state, goal: tuple[int, int], budget: float,
 
         new_pos = _greedy_move(old_pos, model_goal, budget, board, enemy_positions,
                               is_charge=is_charge, flying=flying,
-                              exclusion_grid=exclusion_grid)
+                              strider=strider,
+                              exclusion_grid=exclusion_grid,
+                              enemy_bytes=enemy_bytes)
 
         # _greedy_move avoids occupied squares at the end, but if the model
         # couldn't move (returns start) and start is now occupied by a
@@ -260,6 +335,11 @@ def execute_movement(unit_state, goal: tuple[int, int], budget: float,
             best_alt_dist = 999999
             for dc, dr, _ in _DIRS:
                 nc, nr = new_pos[0] + dc, new_pos[1] + dr
+                if not (0 <= nc < COLS and 0 <= nr < ROWS):
+                    continue
+                # Destination must not be impassible — applies to flying too.
+                if board.terrain and board.impassible_grid[nr * COLS + nc]:
+                    continue
                 if board.is_free(nc, nr) and (nc, nr) not in enemy_positions:
                     if placed_positions:
                         # Prefer proximity to nearest teammate
@@ -298,20 +378,23 @@ def execute_movement(unit_state, goal: tuple[int, int], budget: float,
         if pre_dist - budget <= weapon_range:
             _ensure_weapon_range(unit_state, board, enemy_positions,
                                  range_target, weapon_range,
-                                 exclusion_grid=exclusion_grid)
+                                 exclusion_grid=exclusion_grid,
+                                 enemy_bytes=enemy_bytes)
 
     # Coherency repair: if violated, pull stragglers toward the group centre
     if n > 1 and not check_coherency(unit_state.alive_positions()):
         _repair_coherency(unit_state, board, enemy_positions,
                           exclusion_grid=exclusion_grid,
-                          is_charge=is_charge)
+                          is_charge=is_charge,
+                          enemy_bytes=enemy_bytes)
 
 
 def _ensure_weapon_range(unit_state, board: Board,
                          enemy_positions: set[tuple[int, int]],
                          range_target: tuple[int, int],
                          weapon_range: float,
-                         exclusion_grid: bytearray | None = None):
+                         exclusion_grid: bytearray | None = None,
+                         enemy_bytes: bytes | None = None):
     """Post-pass: nudge models that are outside *weapon_range* of *range_target*
     toward the target so they can contribute to shooting.
 
@@ -340,7 +423,8 @@ def _ensure_weapon_range(unit_state, board: Board,
         board.remove(pos[0], pos[1])
         nudge_goal = range_target
         new_pos = _greedy_move(pos, nudge_goal, 3.0, board, enemy_positions,
-                               exclusion_grid=exclusion_grid)
+                               exclusion_grid=exclusion_grid,
+                               enemy_bytes=enemy_bytes)
 
         # Accept nudge only if it got us closer to being in range
         if dist_sq(new_pos, range_target) < dist_sq(pos, range_target):
@@ -356,12 +440,16 @@ def _ensure_weapon_range(unit_state, board: Board,
 def _repair_coherency(unit_state, board: Board,
                       enemy_positions: set[tuple[int, int]],
                       exclusion_grid: bytearray | None = None,
-                      is_charge: bool = False):
+                      is_charge: bool = False,
+                      enemy_bytes: bytes | None = None):
     """Pull straggling models toward unit centre to restore coherency.
 
     When *is_charge* is True the exclusion zone is intentionally ignored
     (matching charge movement rules) so the repair doesn't get blocked
-    by enemy proximity that the charge was allowed to ignore."""
+    by enemy proximity that the charge was allowed to ignore.
+
+    ``enemy_bytes`` is an optional pre-packed int32 buffer of enemy positions
+    to amortise serialisation across the per-model `_greedy_move` calls."""
     positions = unit_state.alive_positions()
     n = len(positions)
     if n <= 1:
@@ -372,6 +460,9 @@ def _repair_coherency(unit_state, board: Board,
     # the grid if the caller didn't provide one.
     if not is_charge and exclusion_grid is None:
         exclusion_grid = build_exclusion_grid(enemy_positions)
+
+    if enemy_bytes is None:
+        enemy_bytes = _fc._positions_to_int_bytes(enemy_positions)
 
     # Compute centre
     cx = sum(p[0] for p in positions) / n
@@ -398,7 +489,8 @@ def _repair_coherency(unit_state, board: Board,
             board.remove(pos[0], pos[1])
             new_pos = _greedy_move(pos, centre, 4.0, board, enemy_positions,
                                    is_charge=is_charge,
-                                   exclusion_grid=exclusion_grid)
+                                   exclusion_grid=exclusion_grid,
+                                   enemy_bytes=enemy_bytes)
             if new_pos != pos and board.is_free(new_pos[0], new_pos[1]):
                 unit_state.positions[i] = new_pos
                 board.place(new_pos[0], new_pos[1])
@@ -412,12 +504,14 @@ def _repair_coherency(unit_state, board: Board,
 
 def execute_charge_movement(charger, target, board: Board,
                             enemy_positions: set[tuple[int, int]]):
-    """Move charger toward target using rush budget, ignoring exclusion zone."""
+    """Move charger toward target using rush budget, ignoring exclusion zone.
+    Versatile Reach grants +2" specifically when charging."""
     tc = target.centre()
     goal = (int(round(tc[0])), int(round(tc[1])))
-    budget = charger.unit.rush_distance
+    budget = charger.unit.charge_distance
     execute_movement(charger, goal, budget, board, enemy_positions,
-                     is_charge=True, flying=charger.unit.flying)
+                     is_charge=True, flying=charger.unit.flying,
+                     strider=charger.unit.strider)
 
 
 def execute_counter_charge(defender, charger, board: Board):
@@ -462,7 +556,12 @@ def post_melee_separation(charger, defender, board: Board,
     if n == 0:
         return
 
-    exclusion_grid = build_exclusion_grid(enemy_positions)
+    # Pack enemy positions once (threads through to _repair_coherency below).
+    enemy_bytes = _fc._positions_to_int_bytes(enemy_positions)
+    exclusion_grid = (_fc.fast_build_exclusion_grid(
+                          enemy_positions, COLS, ROWS, enemy_bytes=enemy_bytes)
+                      if _fc.USE_C_EXT and _fc.is_available()
+                      else build_exclusion_grid(enemy_positions))
 
     # Remove all charger models from occupancy first
     for i in range(n):
@@ -501,7 +600,8 @@ def post_melee_separation(charger, defender, board: Board,
     # Repair coherency if needed
     if n > 1 and not check_coherency(charger.alive_positions()):
         _repair_coherency(charger, board, enemy_positions,
-                          exclusion_grid=exclusion_grid)
+                          exclusion_grid=exclusion_grid,
+                          enemy_bytes=enemy_bytes)
 
 
 def _find_nearest_outside_exclusion(

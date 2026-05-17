@@ -106,22 +106,78 @@ class TrainingConfig:
     worker_count: int | None = 6       # number of pool workers (None = use module default)
     device: str = "auto"               # "auto" (GPU if available), "cuda", or "cpu"
     shaping_anneal_end: float = 0.5    # fraction of training at which per-round reward shaping reaches 0
+    # When True, replace the heuristic shapers (kill / obj-capture / shoot-eff
+    # / charge-eff) with potential-based shaping driven by the *prior*
+    # final_model.pt value head: r_t += scale · (V_old(s_{t+1}) − V_old(s_t)),
+    # with terminal Φ ≡ 0. Annealed under the same shaping_anneal_end
+    # schedule. Requires restart=True (V_old comes from the pre-restart
+    # final_model.pt, captured before checkpoint deletion).
+    shaping_old_value: bool = False
     aux_coeff: float = 0.1            # max weight for auxiliary prediction losses (survival + obj control)
     aux_ratio: float = 0.2             # aux contributes at most this fraction of policy loss magnitude
     # Per-head entropy targets (adaptive entropy tuning)
     use_entropy_targets: bool = True   # if True, use per-head adaptive entropy; else use entropy_coeff
     entropy_target_fraction: float = 0.25  # fraction of max entropy for masked categoricals
-    entropy_target_move: float = 0.25 * math.log(2)      # ~0.173 (2-way: move/charge)
+    entropy_target_move: float = 0.15 * math.log(2)      # ~0.104 (2-way: move/charge)
     entropy_target_dest_fraction: float = 0.25               # target 25% of max entropy for destination pointer (normalised by ln(N_valid))
-    entropy_alpha_lr: float = 3e-4                         # learning rate for entropy alpha params
+    entropy_alpha_lr: float = 4.5e-4                         # learning rate for entropy alpha params
     # Planning-augmented training (Expert Iteration)
     planning_rate: float = 0.0                # probability of planning per activation (0 = disabled)
     planning_rate_end: float | None = None    # if set, anneal planning_rate linearly to this value
     planning_distill_max_weight: float = 0.1  # max weight for distillation KL loss
+    # Distillation target mode:
+    #   "ce_chosen" — hard cross-entropy on the planner's chosen candidate
+    #                 index per head. Drives argmax agreement directly.
+    #   "soft_kl"   — soft KL against per-candidate value softmax (legacy).
+    # See ml_training/loss.py:_compute_planning_distill_loss for details.
+    planning_distill_mode: str = "ce_chosen"
     training_planning_K: int = 3              # candidate units (reduced from eval default 6)
     training_planning_C: int = 3              # action samples per unit (reduced from 4)
-    training_planning_M: int = 4              # rollouts per candidate (same as eval)
-    training_planning_N: int = 3              # lookahead activations (reduced from 4)
+    training_planning_M: int = 32              # rollouts per candidate (same as eval)
+    training_planning_N: int = 2              # lookahead activations (reduced from 4)
+    # Sequential halving across candidate evaluation. When enabled, candidates
+    # are padded to 9 with dummy -inf slots, then per phase i in sh_schedule
+    # each alive candidate gets sh_schedule[i] new rollouts; after each non-
+    # final phase the bottom ceil(n_alive/2) are dropped (argmax-unit candidate
+    # is immune). Schedule must sum to training_planning_M; otherwise code
+    # silently falls back to uniform M rollouts.
+    training_planning_sequential_halving: bool = True
+    training_planning_sh_schedule: tuple[int, ...] = (8, 8, 16)
+    # Planning warmup/ramp. Disables planning entirely for the first
+    # `planning_warmup_batches` (saves compute while the value head is
+    # uncalibrated), then linearly ramps both the rollout planning rate
+    # and the distill loss contribution from 0 to full over the next
+    # `planning_distill_ramp_batches`. Defaults keep legacy behaviour.
+    planning_warmup_batches: int = 0
+    planning_distill_ramp_batches: int = 0
+    # KL trust region against an epoch-start policy snapshot. Active when
+    # > 0 — materialises a parallel `model_old`, runs an extra no-grad
+    # forward per minibatch, and adds β · KL(π || π_old) summed over
+    # heads (with the same head-activation gating as the entropy tuner).
+    # Defaults to 0.0 — no snapshot, no forward pass, no overhead.
+    kl_trust_region_beta: float = 0.0
+    # Optional linear schedule on β. When mpo_kl_beta_end is None or
+    # mpo_kl_beta_ramp_batches <= 0, β is held at kl_trust_region_beta.
+    # Otherwise β anneals linearly from kl_trust_region_beta toward
+    # mpo_kl_beta_end over the first mpo_kl_beta_ramp_batches batches
+    # (relative to start_batch). Recommended: start at 1.0, anneal to
+    # 0.1-0.3 once V is mature.
+    mpo_kl_beta_end: float | None = None
+    mpo_kl_beta_ramp_batches: int = 0
+    # Temperature on the V softmax that builds the per-head distillation
+    # target distribution under the "mpo_marginal" mode. η=1.0 matches the
+    # legacy soft_kl behaviour. Larger η → softer targets (more uniform);
+    # smaller η → sharper. Recommended: leave at the value scale of V.
+    mpo_eta: float = 1.0
+    # Absolute batch number at which to flip from `planning_distill_mode`
+    # (typically "ce_chosen") to "mpo_marginal" and activate the KL trust
+    # region. None = no switch (training stays in the configured mode for
+    # the entire run). When set: for batch_num <= mpo_switch_batch we run
+    # in legacy/PPO mode with β forced to 0; for batch_num > mpo_switch_batch
+    # the loss flips to mpo_marginal and β becomes kl_trust_region_beta
+    # (or its scheduled value, anchored to the switch batch). Absolute
+    # batch number — stable across resumes from checkpoint.
+    mpo_switch_batch: int | None = None
     # Unit-local advantage blending
     unit_local_advantage_blend: float = 0.0   # 0 = pure global GAE, 0.2-0.3 = blend in unit-local GAE
     # Phase-reencode inference path (commit-and-re-encode refactor).
@@ -130,6 +186,25 @@ class TrainingConfig:
     # built for the POST_DEST phase. When False, the legacy single-trunk path
     # is used end-to-end. Defaults to True.
     phase_reencode_enabled: bool = True
+    # Deployment training. Path to the map JSON to use for every rollout;
+    # when set, the worker installs the map (terrain + objectives + DZ cells)
+    # before each game and the engine's hardcoded empty-board layout is
+    # replaced. None ⇒ legacy empty-board layout.
+    map_path: str | None = None
+    # When True, the deployment phase is model-driven and its trajectories
+    # are recorded into per-game DeploymentRecord lists for the PPO loss.
+    # When False, deployment uses the legacy heuristic placement and the
+    # deploy heads receive no gradient. Requires map_path to be set when
+    # training on a non-empty map (the deploy mask consults board.dz_*_cells).
+    train_deployment: bool = False
+    # Coefficient on the deploy-policy loss summed into the total PPO loss.
+    # 0.0 ⇒ deploy heads receive no gradient even if train_deployment=True.
+    deploy_loss_coeff: float = 1.0
+    # Auxiliary reward at the deploy→turn-1 boundary: V(s_first_tactical)
+    # multiplied by this scale. Helps with long-horizon credit assignment
+    # over ~10-15 deploy steps. 0.0 ⇒ off (deploy is bootstrapped solely
+    # off the terminal game outcome via GAE through the tactical trajectory).
+    deploy_post_value_bonus: float = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +236,7 @@ class TacticalActivationRecord:
     charge_target_idx: int = -1            # enemy slot for charge
     shoot_target_idx: int = -1             # enemy slot for shooting (advance-reachable dest)
     shoot_mask: list[bool] | None = None   # enemy alive AND in weapon range (10 bools)
+    cover_aware_dmg: list[float] | None = None  # (10,) cover-aware E_damage frac (§5.4/§5.5); None ⇒ replay falls back
     post_move_rel: np.ndarray | None = None  # (30,) post-move relative features
     # Post-move state_vec for the POST_DEST trunk re-encode (phase-reencode flag only).
     # None when the flag is off, on charge/shaken activations (no move), or when dest
@@ -197,6 +273,8 @@ class TacticalActivationRecord:
     planning_charge_indices: list[int] | None = None   # which charge target slots
     planning_shoot_values: list[float] | None = None   # per-shoot-target avg rollout values
     planning_shoot_indices: list[int] | None = None    # which shoot target slots
+    planning_dest_values: list[float] | None = None    # per-dest-candidate avg rollout values
+    planning_dest_indices: list[int] | None = None     # which dest candidate slots
 
 
 @dataclass
@@ -220,6 +298,20 @@ class _TacticalInferenceRequest:
     dest_mask_per_unit: dict | None = None         # {slot: (MAX_DEST_CANDIDATES,) bool ndarray}
     dest_advance_reachable_per_unit: dict | None = None  # {slot: (MAX_DEST_CANDIDATES,) bool ndarray}
     dest_features_per_unit: dict | None = None     # {slot: (MAX_DEST_CANDIDATES, DEST_FEATURE_DIM) float ndarray}
+    # Per-destination visibility: which enemy slots can the friendly slot see
+    # from each candidate dest hex (TERRAIN_SPEC.md §4.4(1)). None means "no
+    # visibility constraint" (no terrain or unset by producer).
+    dest_visibility_per_unit: dict | None = None   # {slot: (MAX_DEST_CANDIDATES, MAX_UNITS_PER_SIDE) bool ndarray}
+    # Visibility from the friendly unit's current centre — used for charge/
+    # hold/shaken activations where no destination is chosen.
+    static_visibility_per_unit: dict | None = None # {slot: (MAX_UNITS_PER_SIDE,) bool ndarray}
+    # Per-destination cover-aware expected damage (TERRAIN_SPEC §5.4/§5.5).
+    # Sum_E_damage[Y, U_def_j, cover_state(dest, U_def_j)] / starting_wounds(U_def_j),
+    # capped at 1.0, scaled by attacker alive frac. Used by the dest pointer
+    # and the shoot head as a cover-aware replacement for the cover-blind
+    # range-bucket lookup. None ⇒ caller falls back to cover-blind.
+    dest_expected_damage_per_unit: dict | None = None   # {slot: (MAX_DEST_CANDIDATES, MAX_UNITS_PER_SIDE) float32}
+    static_expected_damage_per_unit: dict | None = None # {slot: (MAX_UNITS_PER_SIDE,) float32}
     # Lazy dest feature computation: raw ingredients passed so sampling code
     # can compute features only for the selected unit (instead of all alive units).
     dest_lazy_units: list | None = None            # friendly UnitState list
@@ -230,8 +322,10 @@ class _TacticalInferenceRequest:
     dest_lazy_melee_matchups: object | None = None # enemy melee matchups
     dest_lazy_player: str = "A"
     dest_lazy_enemy_cache: object | None = None    # _DestEnemyCache
-    # Planning support — populated for Player A requests when planning is enabled.
-    # These are references (same process), not copies.
+    # Planning support — populated for both A-side and mirror B-side main-model
+    # requests when planning is enabled. units_a/units_b/fr_a/fm_a/fr_b/fm_b/pts_a/pts_b
+    # are absolute (always game-side A vs B); planning_player records which side
+    # the acting model is on so the dispatcher can map friendly/enemy correctly.
     planning_units_a: list | None = None       # list[UnitState]
     planning_units_b: list | None = None       # list[UnitState]
     planning_board: object | None = None       # Board
@@ -244,6 +338,7 @@ class _TacticalInferenceRequest:
     planning_pts_a: int = 0
     planning_pts_b: int = 0
     planning_opponent_type_idx: int = 0
+    planning_player: str = "A"                 # "A" or "B" — side the acting model is on
 
 
 @dataclass
@@ -263,6 +358,10 @@ class _TacticalSamplingResult:
     value: float
     shoot_mask: list[bool]      # enemy alive AND in weapon range (10 bools)
     dest_advance_reachable: list[bool] | None = None  # per-candidate (unpadded)
+    # Cover-aware expected wound frac at the chosen activation context
+    # (§5.4/§5.5). Replayed verbatim by the loss so sampling/replay agree.
+    # None ⇒ replay falls back to the cover-blind bucket lookup.
+    cover_aware_dmg: list[float] | None = None  # (10,) floats
     # Planning metadata (populated by coordinator when planning was used)
     was_planned: bool = False
     planning_improved: bool = False
@@ -276,6 +375,30 @@ class _TacticalSamplingResult:
     planning_charge_indices: list[int] | None = None
     planning_shoot_values: list[float] | None = None
     planning_shoot_indices: list[int] | None = None
+    planning_dest_values: list[float] | None = None
+    planning_dest_indices: list[int] | None = None
+
+
+@dataclass
+class DeploymentRecord:
+    """Trajectory record for one model-controlled deployment placement.
+
+    Each record captures one decision: pick an unplaced friendly unit (eligible
+    for the current phase) and an anchor cell in the egocentric deployment
+    grid. Masks are stored so PPO replay can recompute the masked log-prob
+    against the model's current parameters.
+    """
+    state_vec: np.ndarray              # (TACTICAL_TOTAL_FEATURES,) float32 — deploy-time encoding
+    phase: str                         # "non_scout" or "scout"
+    eligible_mask: np.ndarray          # (MAX_UNITS_PER_SIDE,) bool
+    legal_pos_mask: np.ndarray         # (DEPLOY_POS_GRID,) bool
+    unit_idx: int                      # which friendly slot was chosen
+    pos_idx: int                       # chosen anchor cell in egocentric grid
+    old_log_prob: float                # log π(unit) + log π(pos | state) under collection policy
+    old_value: float                   # V(state) under collection policy
+    reward: float = 0.0                # step reward (typically 0 for deployment)
+    opponent_type_idx: int = 0         # for value-head conditioning
+    side_idx: int = 0                  # 0=A, 1=B (physical side)
 
 
 # ---------------------------------------------------------------------------

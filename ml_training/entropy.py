@@ -40,7 +40,7 @@ class EntropyTargetTuner(nn.Module):
 
     # Alpha bounds: prevent runaway entropy bonus
     LOG_ALPHA_MIN = math.log(0.001)  # alpha >= 0.001
-    LOG_ALPHA_MAX = math.log(0.1)    # alpha <= 0.1
+    LOG_ALPHA_MAX = math.log(0.3)    # alpha <= 0.3
 
     def get_alpha(self, head: str) -> torch.Tensor:
         """Return the positive alpha coefficient for a head."""
@@ -57,6 +57,7 @@ class EntropyTargetTuner(nn.Module):
         is_move: torch.Tensor,       # (N,) bool — destination active (non-charge, non-shaken)
         is_can_shoot: torch.Tensor,  # (N,) bool — shoot active (advance-reachable dest)
         is_charge: torch.Tensor,     # (N,) bool — charge active
+        is_can_charge_any: torch.Tensor | None = None,  # (N,) bool — move/charge was a real choice
     ) -> torch.Tensor:
         """Compute the weighted entropy bonus for the policy loss.
 
@@ -65,7 +66,15 @@ class EntropyTargetTuner(nn.Module):
         # Detach alphas so the policy loss gradient doesn't flow through them —
         # only the separate alpha_loss should update the alpha parameters.
         bonus = self.get_alpha("unit").detach() * unit_ent.mean()
-        bonus = bonus + self.get_alpha("move").detach() * move_ent.mean()
+        # Move head: only contribute on real 2-way choices. Masked-deterministic
+        # states have entropy 0 by construction; including them dilutes the
+        # bonus and pushes alpha_move up against an unreachable target.
+        if is_can_charge_any is not None and is_can_charge_any.any():
+            n_cc = is_can_charge_any.sum().clamp(min=1)
+            mean_move_ent = (move_ent * is_can_charge_any).sum() / n_cc
+            bonus = bonus + self.get_alpha("move").detach() * mean_move_ent
+        elif is_can_charge_any is None:
+            bonus = bonus + self.get_alpha("move").detach() * move_ent.mean()
 
         # Destination: active for move (non-charge, non-shaken)
         n_move = is_move.sum().clamp(min=1)
@@ -95,6 +104,7 @@ class EntropyTargetTuner(nn.Module):
         enemy_alive_mask: torch.Tensor,  # (N, 10) — for charge target
         shoot_mask: torch.Tensor,     # (N, 10) — for shoot target
         dest_n_valid: torch.Tensor | None = None,  # (N,) int — number of valid dest candidates
+        is_can_charge_any: torch.Tensor | None = None,  # (N,) bool — move was a real choice
     ) -> torch.Tensor:
         """Compute the dual alpha loss that drives entropy toward targets.
 
@@ -107,8 +117,19 @@ class EntropyTargetTuner(nn.Module):
         unit_target = self.target_fraction * torch.log(n_alive)
         loss = loss + self.get_alpha("unit") * (unit_ent.detach() - unit_target).mean()
 
-        # Move type: fixed target (2-way: move/charge)
-        loss = loss + self.get_alpha("move") * (move_ent.detach() - self.target_move).mean()
+        # Move type: only count states where move/charge was a real choice
+        # (not shaken AND ≥1 chargeable enemy). Masked-deterministic states
+        # have entropy 0 and would otherwise drive alpha against an
+        # unreachable target — see compute_entropy_bonus for the matching
+        # gate. Fall back to the unmasked mean when the caller doesn't pass
+        # the gate (legacy compat).
+        if is_can_charge_any is not None:
+            if is_can_charge_any.any():
+                n_cc = is_can_charge_any.sum().clamp(min=1)
+                mean_move_ent = (move_ent.detach() * is_can_charge_any).sum() / n_cc
+                loss = loss + self.get_alpha("move") * (mean_move_ent - self.target_move)
+        else:
+            loss = loss + self.get_alpha("move") * (move_ent.detach() - self.target_move).mean()
 
         # Destination pointer: normalised entropy = dest_ent / ln(N_valid)
         # Target is target_dest_fraction (e.g. 0.25 = 25% of max entropy)

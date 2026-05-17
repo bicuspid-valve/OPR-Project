@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import math
 import random
+from dataclasses import dataclass
+from typing import Callable
 
 from board import (
     Board, COLS, ROWS, OBJECTIVES,
@@ -35,9 +37,14 @@ from ai import (
 # ===================================================================
 
 def _place_unit_at(unit: UnitState, col: int, row: int, board: Board,
-                   enemy_positions: set[tuple[int, int]] | None = None):
+                   enemy_positions: set[tuple[int, int]] | None = None,
+                   *, scout: bool = True):
     """Place a multi-model unit starting at (col, row), spreading laterally then backward.
-    Respects 1\" exclusion zone from enemy_positions if provided."""
+    Respects 1\" exclusion zone from enemy_positions if provided.
+
+    ``scout=True`` allows the 12" forward scout-zone extension. The caller
+    passes ``scout=False`` during the non-scout deployment phase so that a
+    non-scout unit's spill-over models stay inside the strict DZ."""
     n = unit.unit.models
     unit.positions = []
     is_player_a = (unit.owner == "A")
@@ -63,10 +70,7 @@ def _place_unit_at(unit: UnitState, col: int, row: int, board: Board,
                 nc = col + dc * -row_dir
                 nr = row + dr_mult * -row_dir
                 if board.is_free(nc, nr):
-                    # Check deployment zone bounds
-                    if is_player_a and not (DEPLOY_A_MIN_ROW <= nr <= max(DEPLOY_A_MAX_ROW, SCOUT_A_ROW)):
-                        continue
-                    if not is_player_a and not (min(DEPLOY_B_MIN_ROW, SCOUT_B_ROW) <= nr <= DEPLOY_B_MAX_ROW):
+                    if not board.is_in_dz(nc, nr, unit.owner, scout=scout):
                         continue
                     # Check exclusion zone
                     if ep and is_in_exclusion_zone(nc, nr, ep):
@@ -75,22 +79,40 @@ def _place_unit_at(unit: UnitState, col: int, row: int, board: Board,
                     board.place(nc, nr)
                     placed += 1
 
-    # Fallback: if we couldn't place all models, search more broadly
+    # Fallback: if we couldn't place all models, search the full legal DZ.
     if placed < n:
-        if is_player_a:
-            row_range = range(DEPLOY_A_MIN_ROW, DEPLOY_A_MAX_ROW + 1)
-        else:
-            row_range = range(DEPLOY_B_MIN_ROW, DEPLOY_B_MAX_ROW + 1)
-        for r in row_range:
-            for c in range(COLS):
+        if board.dz_a_cells is not None or board.dz_b_cells is not None:
+            # Map-driven layout: enumerate the legal cell set directly.
+            cells = (board.dz_a_cells if is_player_a else board.dz_b_cells) or frozenset()
+            if scout:
+                scout_cells = (board.scout_a_cells if is_player_a else board.scout_b_cells) or frozenset()
+                cells = cells | scout_cells
+            # Stable order: sorted by (row, col); for B reverse rows so we
+            # spill backward toward the home edge first (mirrors the legacy
+            # row_range direction).
+            order = sorted(cells, key=lambda cr: ((cr[1], cr[0]) if is_player_a else (-cr[1], cr[0])))
+            for c, r in order:
                 if placed >= n:
                     break
                 if board.is_free(c, r) and not (ep and is_in_exclusion_zone(c, r, ep)):
                     unit.positions.append((c, r))
                     board.place(c, r)
                     placed += 1
-            if placed >= n:
-                break
+        else:
+            if is_player_a:
+                row_range = range(DEPLOY_A_MIN_ROW, DEPLOY_A_MAX_ROW + 1)
+            else:
+                row_range = range(DEPLOY_B_MIN_ROW, DEPLOY_B_MAX_ROW + 1)
+            for r in row_range:
+                for c in range(COLS):
+                    if placed >= n:
+                        break
+                    if board.is_free(c, r) and not (ep and is_in_exclusion_zone(c, r, ep)):
+                        unit.positions.append((c, r))
+                        board.place(c, r)
+                        placed += 1
+                if placed >= n:
+                    break
 
     unit.models_alive = placed
     unit.weapons_per_model = unit.weapons_per_model[:placed]
@@ -117,68 +139,177 @@ def _compute_deploy_columns(count: int, player: str = "A") -> list[int]:
     return cols
 
 
-def _deploy_non_scouts(units: list[UnitState], player: str, board: Board):
-    """Deploy non-scout units for a player."""
+@dataclass
+class DeployContext:
+    """State handed to a deployment decision function for one placement step.
+
+    The decision function returns (unit, anchor_col, anchor_row); the unit must
+    come from `eligible_units` and the anchor must lie in the legal zone for
+    the current phase (non-scout: own DZ; scout: own DZ + 12" forward)."""
+    player: str                          # "A" or "B" — the deploying player
+    phase: str                           # "non_scout" or "scout"
+    board: Board
+    eligible_units: list[UnitState]      # mine, unplaced, eligible this phase
+    my_placed: list[UnitState]           # mine, already on the board
+    opp_placed: list[UnitState]          # opponent, already on the board
+    my_unplaced_other: list[UnitState]   # mine, unplaced, OTHER phase
+    opp_unplaced: list[UnitState]        # opponent, unplaced (any phase)
+
+
+DeployDecisionFn = Callable[[DeployContext], "tuple[UnitState, int, int]"]
+
+
+def _make_heuristic_decision_fn(units: list[UnitState],
+                                player: str) -> DeployDecisionFn:
+    """Build a deterministic decision fn that mirrors the legacy role-anchored
+    layout: home-holders on the home objective, holders/others spaced along
+    the front row, scouts spaced along the scout row.
+
+    The plan is pre-computed once; each call pops the highest-priority unit
+    out of `ctx.eligible_units` and returns its planned anchor."""
     is_a = (player == "A")
     front_row = DEPLOY_A_FRONT_ROW if is_a else DEPLOY_B_FRONT_ROW
+    scout_row = SCOUT_A_ROW if is_a else SCOUT_B_ROW
     home_obj = OBJECTIVES[HOME_OBJ_A if is_a else HOME_OBJ_B]
+    centre_col = 36 if is_a else COLS - 1 - 36
 
     non_scouts = [u for u in units if not u.unit.scout]
+    scouts = [u for u in units if u.unit.scout]
     home_holders = [u for u in non_scouts if u.ai_role == "home_objective_holder"]
     holders = [u for u in non_scouts if u.ai_role == "objective_holder"]
     others = [u for u in non_scouts
               if u.ai_role not in ("objective_holder", "home_objective_holder")]
 
-    # Deploy home_objective_holders on the home objective
-    for u in home_holders:
-        _place_unit_at(u, home_obj[0], home_obj[1], board)
-
     holder_cols = _compute_deploy_columns(len(holders), player)
     other_cols = _compute_deploy_columns(len(others), player)
-
-    for i, u in enumerate(holders):
-        col = holder_cols[i] if i < len(holder_cols) else (36 if is_a else COLS - 1 - 36)
-        _place_unit_at(u, col, front_row, board)
-
-    for i, u in enumerate(others):
-        col = other_cols[i] if i < len(other_cols) else (36 if is_a else COLS - 1 - 36)
-        _place_unit_at(u, col, front_row, board)
-
-
-def _deploy_scouts(units: list[UnitState], player: str, board: Board,
-                   enemy_positions: set[tuple[int, int]]):
-    """Deploy scout units forward, respecting 1\" exclusion from enemies."""
-    is_a = (player == "A")
-    scout_row = SCOUT_A_ROW if is_a else SCOUT_B_ROW
-
-    scouts = [u for u in units if u.unit.scout]
     scout_cols = _compute_deploy_columns(len(scouts), player)
+
+    plan: dict[int, tuple[int, int]] = {}
+    for u in home_holders:
+        plan[id(u)] = (int(home_obj[0]), int(home_obj[1]))
+    for i, u in enumerate(holders):
+        plan[id(u)] = (holder_cols[i] if i < len(holder_cols) else centre_col,
+                       front_row)
+    for i, u in enumerate(others):
+        plan[id(u)] = (other_cols[i] if i < len(other_cols) else centre_col,
+                       front_row)
     for i, u in enumerate(scouts):
-        col = scout_cols[i] if i < len(scout_cols) else (36 if is_a else COLS - 1 - 36)
-        _place_unit_at(u, col, scout_row, board, enemy_positions=enemy_positions)
+        plan[id(u)] = (scout_cols[i] if i < len(scout_cols) else centre_col,
+                       scout_row)
+
+    priority: dict[int, int] = {}
+    for u in home_holders: priority[id(u)] = 0
+    for u in holders:      priority[id(u)] = 1
+    for u in others:       priority[id(u)] = 2
+    for u in scouts:       priority[id(u)] = 3
+
+    def decision_fn(ctx: DeployContext) -> tuple[UnitState, int, int]:
+        # Stable-tiebreak by current list order so two units with equal priority
+        # come out in the order the caller passed them.
+        u = min(
+            range(len(ctx.eligible_units)),
+            key=lambda i: (priority.get(id(ctx.eligible_units[i]), 99), i),
+        )
+        unit = ctx.eligible_units[u]
+        col, row = plan[id(unit)]
+        return unit, col, row
+
+    return decision_fn
 
 
 def deploy_armies(units_a: list[UnitState], units_b: list[UnitState],
-                  board: Board):
-    """Deploy both armies with proper scout ordering per §3.3.
-    Non-scouts deploy first (order randomised), then scouts deploy in
-    random order — each batch excludes the other side's already-placed units."""
-    _deploy_non_scouts(units_a, "A", board)
-    _deploy_non_scouts(units_b, "B", board)
+                  board: Board, *,
+                  decision_fn_a: DeployDecisionFn | None = None,
+                  decision_fn_b: DeployDecisionFn | None = None) -> None:
+    """Alternating deployment.
 
-    # Randomise which side deploys scouts first so neither has an advantage
-    if random.random() < 0.5:
-        first_units, first_player = units_a, "A"
-        second_units, second_player = units_b, "B"
+    1. Split each side into non-scouts and scouts.
+    2. Pick a random first player.
+    3. Non-scout phase: alternate one placement at a time until one side runs
+       out; the other side then places its remaining non-scouts back-to-back.
+    4. Scout phase: the side that emptied its non-scouts first deploys its
+       first scout, then sides alternate; if one runs out, the other finishes.
+
+    decision_fn_a/b receive a DeployContext and return (unit, anchor_col,
+    anchor_row). Defaults to the legacy role-anchored heuristic so existing
+    callers and tests see deterministic, rule-compliant placement."""
+    if decision_fn_a is None:
+        decision_fn_a = _make_heuristic_decision_fn(units_a, "A")
+    if decision_fn_b is None:
+        decision_fn_b = _make_heuristic_decision_fn(units_b, "B")
+
+    decision_fns: dict[str, DeployDecisionFn] = {"A": decision_fn_a, "B": decision_fn_b}
+    side_units = {"A": units_a, "B": units_b}
+    non_scouts: dict[str, list[UnitState]] = {
+        p: [u for u in side_units[p] if not u.unit.scout] for p in ("A", "B")
+    }
+    scouts: dict[str, list[UnitState]] = {
+        p: [u for u in side_units[p] if u.unit.scout] for p in ("A", "B")
+    }
+    placed: dict[str, list[UnitState]] = {"A": [], "B": []}
+
+    def other(p: str) -> str:
+        return "B" if p == "A" else "A"
+
+    first_player = "A" if random.random() < 0.5 else "B"
+
+    # Determine the side that "runs out of non-scouts first" — used to decide
+    # who starts the scout phase. For the degenerate cases where one or both
+    # sides start with zero non-scouts, fix it up front.
+    if not non_scouts["A"] and not non_scouts["B"]:
+        ran_out_first: str | None = first_player
+    elif not non_scouts["A"]:
+        ran_out_first = "A"
+    elif not non_scouts["B"]:
+        ran_out_first = "B"
     else:
-        first_units, first_player = units_b, "B"
-        second_units, second_player = units_a, "A"
+        ran_out_first = None
 
-    enemy_pos = _collect_enemy_positions(second_units)
-    _deploy_scouts(first_units, first_player, board, enemy_pos)
+    # --- Phase 1: alternating non-scouts ---
+    turn = first_player
+    while non_scouts["A"] or non_scouts["B"]:
+        if non_scouts[turn]:
+            ctx = DeployContext(
+                player=turn,
+                phase="non_scout",
+                board=board,
+                eligible_units=list(non_scouts[turn]),
+                my_placed=list(placed[turn]),
+                opp_placed=list(placed[other(turn)]),
+                my_unplaced_other=list(scouts[turn]),
+                opp_unplaced=list(non_scouts[other(turn)]) + list(scouts[other(turn)]),
+            )
+            unit, col, row = decision_fns[turn](ctx)
+            _place_unit_at(unit, col, row, board)
+            non_scouts[turn].remove(unit)
+            placed[turn].append(unit)
+            if not non_scouts[turn] and ran_out_first is None:
+                ran_out_first = turn
+        turn = other(turn)
 
-    enemy_pos = _collect_enemy_positions(first_units)
-    _deploy_scouts(second_units, second_player, board, enemy_pos)
+    if ran_out_first is None:
+        ran_out_first = first_player  # defensive; unreachable given the guards above
+
+    # --- Phase 2: alternating scouts, starting with the side that emptied first ---
+    turn = ran_out_first
+    while scouts["A"] or scouts["B"]:
+        if scouts[turn]:
+            enemy_positions = _collect_enemy_positions(side_units[other(turn)])
+            ctx = DeployContext(
+                player=turn,
+                phase="scout",
+                board=board,
+                eligible_units=list(scouts[turn]),
+                my_placed=list(placed[turn]),
+                opp_placed=list(placed[other(turn)]),
+                my_unplaced_other=[],
+                opp_unplaced=list(scouts[other(turn)]),
+            )
+            unit, col, row = decision_fns[turn](ctx)
+            _place_unit_at(unit, col, row, board, enemy_positions=enemy_positions)
+            scouts[turn].remove(unit)
+            placed[turn].append(unit)
+        turn = other(turn)
 
 
 # ===================================================================
@@ -232,7 +363,10 @@ def simulate_game(army_a: list[ResolvedUnit],
                   ml_batch_tactical=True,
                   ml_coroutine_mode=False,
                   ml_planning=False,
-                  planning_params: dict | None = None):
+                  planning_params: dict | None = None,
+                  map_data=None,
+                  decision_fn_a=None,
+                  decision_fn_b=None):
     """Play one grid-based tactical game.
 
     Returns 'A', 'B', or 'draw' when ml_coroutine_mode=False (default).
@@ -246,12 +380,16 @@ def simulate_game(army_a: list[ResolvedUnit],
     if ml_coroutine_mode:
         return _simulate_game_coroutine(
             army_a, army_b, mode=mode, states_a=states_a, states_b=states_b,
-            ml_model_a=ml_model_a, ml_model_b=ml_model_b)
+            ml_model_a=ml_model_a, ml_model_b=ml_model_b,
+            map_data=map_data,
+            decision_fn_a=decision_fn_a, decision_fn_b=decision_fn_b)
     return _simulate_game_impl(
         army_a, army_b, mode=mode, states_a=states_a, states_b=states_b,
         ml_model_a=ml_model_a, ml_model_b=ml_model_b,
         ml_sampling=ml_sampling,
-        ml_planning=ml_planning, planning_params=planning_params)
+        ml_planning=ml_planning, planning_params=planning_params,
+        map_data=map_data,
+        decision_fn_a=decision_fn_a, decision_fn_b=decision_fn_b)
 
 
 def _simulate_game_impl(army_a, army_b, mode="objectives",
@@ -259,7 +397,10 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                         ml_model_a=None, ml_model_b=None,
                         ml_sampling=False,
                         ml_planning=False, planning_params=None,
-                        _tactical_inference_fn=None) -> str:
+                        _tactical_inference_fn=None,
+                        map_data=None,
+                        decision_fn_a=None,
+                        decision_fn_b=None) -> str:
     """Internal: standard (non-generator) game loop.
 
     _tactical_inference_fn: optional callable(my_units, opp_units, round_num, board,
@@ -269,6 +410,9 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
         decisions.  Used by _simulate_game_coroutine to inject yield-based inference.
     """
     board = Board()
+    if map_data is not None:
+        from map_loader import apply_map as _apply_map
+        _apply_map(board, map_data)
     is_kill_points = (mode == "kill_points")
 
     # Create unit states (or use pre-built ones with hero merging)
@@ -287,7 +431,14 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
             u.owner = "B"
 
     # Deployment
-    deploy_armies(units_a, units_b, board)
+    deploy_armies(units_a, units_b, board,
+                  decision_fn_a=decision_fn_a, decision_fn_b=decision_fn_b)
+
+    # Post-deployment, post-terrain-set: build the §5.5 expected ranged damage
+    # table. (Terrain itself is set inside deploy_armies if/when layouts are
+    # wired in; for now terrain defaults to empty and vis_cover_table is None.)
+    from expected_damage_table import build_table as _build_e_damage
+    board.expected_damage_table = _build_e_damage(units_a, units_b)
 
     # ML setup: lazy imports and precomputed damage bases
     use_ml = ml_model_a is not None or ml_model_b is not None
@@ -411,7 +562,7 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                         ))
                     _ml_tac_decision = active is not None
             else:
-                ordered = activation_order(my_units, enemies=opp_units, mode=mode)
+                ordered = activation_order(my_units, enemies=opp_units, mode=mode, board=board)
                 active = ordered[0] if ordered else None
 
             if active is None:
@@ -496,29 +647,28 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
                 rt, wr = _kite_range_params(active, opp_units, _reason)
                 execute_movement(active, goal, budget, board, enemy_positions,
                                  flying=active.unit.flying,
+                                 strider=active.unit.strider,
                                  range_target=rt, weapon_range=wr)
 
                 # Execute shooting (not if rushing)
                 if action != "rush":
                     if _ml_tac_decision:
-                        target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                        target = pick_target_from_ranking(active, opp_units, _ml_target_ranking, board)
                     else:
-                        target = pick_target(active, opp_units,
-                         )
+                        target = pick_target(active, opp_units, board=board)
                     if target is not None:
-                        resolve_shooting(active, target)
+                        resolve_shooting(active, target, board=board)
                         check_morale(target)
                         _sync_dead_models(target, board)
 
             elif action == "hold":
                 # Execute shooting
                 if _ml_tac_decision:
-                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking, board)
                 else:
-                    target = pick_target(active, opp_units,
-                     )
+                    target = pick_target(active, opp_units, board=board)
                 if target is not None:
-                    resolve_shooting(active, target)
+                    resolve_shooting(active, target, board=board)
                     check_morale(target)
                     _sync_dead_models(target, board)
 
@@ -556,7 +706,10 @@ def _simulate_game_impl(army_a, army_b, mode="objectives",
 
 def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                               states_a=None, states_b=None,
-                              ml_model_a=None, ml_model_b=None):
+                              ml_model_a=None, ml_model_b=None,
+                              map_data=None,
+                              decision_fn_a=None,
+                              decision_fn_b=None):
     """Generator variant of simulate_game for cross-game batched inference.
 
     Yields InferenceRequest at each per-activation tactical decision point.
@@ -564,16 +717,25 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
     delivered via StopIteration.value.
     """
     import torch as _torch
+    import numpy as _np
     from ml_features import encode_state_tactical as _encode_tac
     from ml_integration_tactical import (
-        InferenceRequest, decode_tactical_result, pick_target_from_ranking,
+        Phase1Request, Phase2Request,
+        InferenceResult, decode_tactical_result, pick_target_from_ranking,
+        compute_destination_candidates as _compute_dest_candidates,
+        compute_destination_features as _compute_dest_features,
         MAX_UNITS_PER_SIDE as _MAX_UNITS,
+        DEST_FEATURE_DIM as _DEST_FEAT_DIM,
+        MOVE_MOVE as _MOVE_MOVE,
         _get_model_space_positions as _ms_pos,
         _get_movement_budgets as _mv_budgets,
         _get_max_weapon_ranges as _mwr,
     )
 
     board = Board()
+    if map_data is not None:
+        from map_loader import apply_map as _apply_map
+        _apply_map(board, map_data)
     is_kill_points = (mode == "kill_points")
 
     if states_a is not None:
@@ -590,7 +752,8 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
         for u in units_b:
             u.owner = "B"
 
-    deploy_armies(units_a, units_b, board)
+    deploy_armies(units_a, units_b, board,
+                  decision_fn_a=decision_fn_a, decision_fn_b=decision_fn_b)
 
     from ml_features import precompute_damage
 
@@ -678,9 +841,73 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                     _e_pos = _ms_pos(opp_units, my_player)
                     _adv_d, _rush_d = _mv_budgets(my_units)
                     _mwr_d = _mwr(my_units)
-                    _ir = yield InferenceRequest(
+
+                    # --- Phase 1: unit selection / move type / charge ---
+                    _p1: 'Phase1Result' = yield Phase1Request(
                         _vec, _mask, _enemy_mask, my_player,
                         _f_pos, _e_pos, _adv_d, _rush_d, _mwr_d,
+                    )
+
+                    # --- Compute Dijkstra candidates for the selected unit ---
+                    _sel_idx = _p1.unit_idx
+                    _selected = my_units[_sel_idx] if 0 <= _sel_idx < len(my_units) else None
+                    _valid_sel = (_selected is not None
+                                   and _selected.models_alive > 0
+                                   and not _selected.activated)
+
+                    if _valid_sel and _p1.move_type == _MOVE_MOVE:
+                        _enemy_pos_set: set[tuple[int, int]] = set()
+                        for _eu in opp_units:
+                            if _eu.models_alive > 0:
+                                for _pos in _eu.alive_positions():
+                                    _enemy_pos_set.add(_pos)
+                        _candidates, _cand_mask, _adv_r = _compute_dest_candidates(
+                            _selected, board, _enemy_pos_set, my_player)
+                        _budget = float(_selected.unit.rush_distance)
+                        _enemy_alive_np = _np.array(
+                            [(i < len(opp_units) and opp_units[i].models_alive > 0)
+                             for i in range(_MAX_UNITS)], dtype=bool)
+                        _dest_feats = _compute_dest_features(
+                            _candidates, _cand_mask, _selected, _sel_idx, my_player,
+                            opp_units, _enemy_alive_np,
+                            _my_fr, _opp_fr, _opp_fm,
+                            _budget, advance_reachable=_adv_r)
+                        _dest_feats_t = _torch.from_numpy(_dest_feats).float()
+                        _dest_mask_t = _torch.from_numpy(_cand_mask).bool()
+                    else:
+                        # Charge / hold / invalid selection: feed dummy dest data.
+                        _candidates = _np.zeros((1, 2), dtype=_np.int32)
+                        _adv_r = _np.zeros(1, dtype=bool)
+                        _dest_feats_t = _torch.zeros(1, _DEST_FEAT_DIM)
+                        _dest_mask_t = _torch.zeros(1, dtype=_torch.bool)
+
+                    # --- Phase 2: destination + shoot pointer ---
+                    _p2: 'Phase2Result' = yield Phase2Request(
+                        unit_idx=_p1.unit_idx,
+                        move_type=_p1.move_type,
+                        charge_target_idx=_p1.charge_target_idx,
+                        value=_p1.value,
+                        dest_features=_dest_feats_t,
+                        dest_mask=_dest_mask_t,
+                        candidates=_candidates,
+                        advance_reachable=_adv_r,
+                        friendly_positions=_f_pos,
+                        enemy_positions=_e_pos,
+                        max_weapon_ranges=_mwr_d,
+                        player=my_player,
+                    )
+
+                    # Reassemble into the legacy InferenceResult shape and decode.
+                    _ir = InferenceResult(
+                        unit_idx=_p2.unit_idx,
+                        move_type=_p2.move_type,
+                        dest_col=_p2.dest_col,
+                        dest_row=_p2.dest_row,
+                        charge_target_idx=_p2.charge_target_idx,
+                        shoot_target_idx=_p2.shoot_target_idx,
+                        target_ranking=_p2.target_ranking,
+                        value=_p2.value,
+                        is_advance_reachable=_p2.is_advance_reachable,
                     )
                     active, _ml_target_ranking, _ml_action, _ml_goal, _ml_charge_target, _ml_reason = (
                         decode_tactical_result(_ir, my_units, opp_units, board, my_player))
@@ -688,7 +915,7 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                 else:
                     active = None
             else:
-                ordered = activation_order(my_units, enemies=opp_units, mode=mode)
+                ordered = activation_order(my_units, enemies=opp_units, mode=mode, board=board)
                 active = ordered[0] if ordered else None
 
             if active is None:
@@ -756,25 +983,24 @@ def _simulate_game_coroutine(army_a, army_b, mode="objectives",
                 rt, wr = _kite_range_params(active, opp_units, _reason)
                 execute_movement(active, goal, budget, board, enemy_positions,
                                  flying=active.unit.flying,
+                                 strider=active.unit.strider,
                                  range_target=rt, weapon_range=wr)
                 if action != "rush":
                     if _ml_tac_decision:
-                        target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                        target = pick_target_from_ranking(active, opp_units, _ml_target_ranking, board)
                     else:
-                        target = pick_target(active, opp_units,
-                         )
+                        target = pick_target(active, opp_units, board=board)
                     if target is not None:
-                        resolve_shooting(active, target)
+                        resolve_shooting(active, target, board=board)
                         check_morale(target)
                         _sync_dead_models(target, board)
             elif action == "hold":
                 if _ml_tac_decision:
-                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking, board)
                 else:
-                    target = pick_target(active, opp_units,
-                     )
+                    target = pick_target(active, opp_units, board=board)
                 if target is not None:
-                    resolve_shooting(active, target)
+                    resolve_shooting(active, target, board=board)
                     check_morale(target)
                     _sync_dead_models(target, board)
 
@@ -871,7 +1097,10 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                            ml_model_b=None,
                            ml_sampling=False,
                            ml_planning=False,
-                           planning_params: dict | None = None) -> tuple[str, list[dict], list[str], list[str], list[int], list[dict]]:
+                           planning_params: dict | None = None,
+                           map_data=None,
+                           decision_fn_a=None,
+                           decision_fn_b=None) -> tuple[str, list[dict], list[str], list[str], list[int], list[dict]]:
     """Play a recorded game. Returns (result, frames, unit_labels, unit_owners, unit_points).
     Each frame = {'positions', 'alive', 'objectives', 'description', 'round'}.
     mode: "objectives" (default) or "kill_points".
@@ -880,6 +1109,9 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
     Assessment info in frames is always from Player A's perspective.
     """
     board = Board()
+    if map_data is not None:
+        from map_loader import apply_map as _apply_map
+        _apply_map(board, map_data)
     is_kill_points = (mode == "kill_points")
 
     if states_a is not None:
@@ -929,7 +1161,8 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
             from ml_planning import plan_activation as _plan_activation
 
     # Deployment
-    deploy_armies(units_a, units_b, board)
+    deploy_armies(units_a, units_b, board,
+                  decision_fn_a=decision_fn_a, decision_fn_b=decision_fn_b)
     if not is_kill_points:
         if ml_model_a is None:
             assign_objectives(units_a)
@@ -1020,7 +1253,7 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                 if current_is_a:
                     ml_assessment = _assess
             else:
-                ordered = activation_order(my_units, enemies=opp_units, mode=mode)
+                ordered = activation_order(my_units, enemies=opp_units, mode=mode, board=board)
                 active = ordered[0] if ordered else None
 
             if active is None:
@@ -1146,6 +1379,7 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
                 rt, wr = _kite_range_params(active, opp_units, ai_reason)
                 execute_movement(active, goal, budget, board, enemy_positions,
                                  flying=active.unit.flying,
+                                 strider=active.unit.strider,
                                  range_target=rt, weapon_range=wr)
                 post_centre = active.centre()
                 move_dist = math.sqrt((post_centre[0] - pre_centre[0]) ** 2 + (post_centre[1] - pre_centre[1]) ** 2)
@@ -1153,15 +1387,14 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
 
                 if action != "rush":
                     if _ml_tac_decision:
-                        target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                        target = pick_target_from_ranking(active, opp_units, _ml_target_ranking, board)
                     else:
-                        target = pick_target(active, opp_units,
-                         )
+                        target = pick_target(active, opp_units, board=board)
                     if target is not None:
                         target_idx = unit_to_idx[id(target)]
                         target_label = labels[target_idx]
                         before = target.models_alive
-                        combat_stats = resolve_shooting(active, target, recorded=True)
+                        combat_stats = resolve_shooting(active, target, recorded=True, board=board)
                         check_morale(target)
                         _sync_dead_models(target, board)
                         killed = before - target.models_alive
@@ -1177,15 +1410,14 @@ def simulate_game_recorded(army_a: list[ResolvedUnit],
 
             elif action == "hold":
                 if _ml_tac_decision:
-                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking)
+                    target = pick_target_from_ranking(active, opp_units, _ml_target_ranking, board)
                 else:
-                    target = pick_target(active, opp_units,
-                     )
+                    target = pick_target(active, opp_units, board=board)
                 if target is not None:
                     target_idx = unit_to_idx[id(target)]
                     target_label = labels[target_idx]
                     before = target.models_alive
-                    combat_stats = resolve_shooting(active, target, recorded=True)
+                    combat_stats = resolve_shooting(active, target, recorded=True, board=board)
                     check_morale(target)
                     _sync_dead_models(target, board)
                     killed = before - target.models_alive

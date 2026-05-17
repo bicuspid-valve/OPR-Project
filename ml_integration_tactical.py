@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from board import Board, COLS, ROWS, OBJECTIVES, OBJ_SEIZE_RANGE, dist, dist_sq
-from combat import evaluate_target
+from combat import evaluate_target, _shooter_cover_lookup
 from models import UnitState
 from ml_features import (
     MAX_UNITS_PER_SIDE,
@@ -186,6 +186,80 @@ class InferenceResult:
 
 
 # ---------------------------------------------------------------------------
+# Two-phase coroutine protocol
+# ---------------------------------------------------------------------------
+# The two-phase variant lets the coroutine compute Dijkstra-reachable
+# destination candidates between the model's unit-selection step and its
+# destination-pointer step. The coordinator does:
+#   1. Batched phase 1 across all games  — trunk, unit selection, move type,
+#      charge target, value.
+#   2. Each coroutine, on receiving its Phase1Result, computes Dijkstra
+#      candidates for the selected unit and yields a Phase2Request.
+#   3. Batched phase 2 across all games — destination pointer + shoot target,
+#      using the trunk state cached on the coordinator from phase 1.
+#
+# This restores the same dest_features pipeline the non-coroutine path uses
+# while preserving the cross-game inference batching of the coroutine path.
+
+@dataclass
+class Phase1Request:
+    """Phase-1 yield: pre-decode state. The coordinator runs trunk + unit
+    selection + move type + charge target + value in one batched pass."""
+    state_vec: torch.Tensor
+    alive_mask: torch.Tensor
+    enemy_alive_mask: torch.Tensor
+    player: str
+    friendly_positions: list[tuple[float, float]]
+    enemy_positions: list[tuple[float, float]]
+    advance_distances: list[float]
+    rush_distances: list[float]
+    max_weapon_ranges: list[float]
+
+
+@dataclass
+class Phase1Result:
+    """Phase-1 result sent back to the coroutine so it can pick the selected
+    unit and compute its Dijkstra candidates."""
+    unit_idx: int
+    move_type: int
+    charge_target_idx: int
+    value: float
+
+
+@dataclass
+class Phase2Request:
+    """Phase-2 yield: contains Dijkstra-derived destination candidates plus
+    the data needed by the destination/shoot pointers and downstream decode."""
+    unit_idx: int
+    move_type: int
+    charge_target_idx: int
+    value: float
+    dest_features: torch.Tensor          # (C, FEAT)
+    dest_mask: torch.Tensor              # (C,) bool
+    candidates: object                    # numpy (C, 2) int — (col, row)
+    advance_reachable: object             # numpy (C,) bool
+    friendly_positions: list[tuple[float, float]]
+    enemy_positions: list[tuple[float, float]]
+    max_weapon_ranges: list[float]
+    player: str
+
+
+@dataclass
+class Phase2Result:
+    """Final decoded decision returned to the coroutine, identical in shape
+    to InferenceResult — the coroutine treats it as such."""
+    unit_idx: int
+    move_type: int
+    dest_col: int
+    dest_row: int
+    charge_target_idx: int
+    shoot_target_idx: int
+    target_ranking: list[int]
+    value: float
+    is_advance_reachable: bool = True
+
+
+# ---------------------------------------------------------------------------
 # Post-move relative features
 # ---------------------------------------------------------------------------
 
@@ -221,6 +295,12 @@ def compute_post_move_rel(
 
     Returns (30,) tensor.
     """
+    if _fc.USE_C_EXT and _fc.is_available():
+        arr = _fc.fast_compute_post_move_rel(
+            post_x, post_y, enemy_positions, _INV_BOARD_DIAG)
+        # arr is (30,) float32; torch.from_numpy shares memory — safe because
+        # arr is a fresh copy from frombuffer+.copy() in the wrapper.
+        return torch.from_numpy(arr)
     feats = torch.zeros(POST_MOVE_REL_FEATURES)
     for i, (ex, ey) in enumerate(enemy_positions):
         dx = ex - post_x
@@ -257,6 +337,212 @@ def _get_max_weapon_ranges(units: list[UnitState]) -> list[float]:
         else:
             ranges.append(0.0)
     return ranges
+
+
+def compute_visibility_mask(
+    shooter_pos: tuple[float, float],
+    enemy_units: list[UnitState],
+    board: Board | None,
+) -> torch.Tensor:
+    """Per-enemy-slot visibility mask from *shooter_pos* (game-space col, row).
+
+    Returns a (MAX_UNITS_PER_SIDE,) bool tensor. Slot i is True iff at least
+    one alive model of ``enemy_units[i]`` is visible from ``shooter_pos`` per
+    TERRAIN_SPEC.md §4.4(1). When the board has no terrain, all alive enemy
+    slots are True (no visibility constraint).
+    """
+    mask = torch.zeros(MAX_UNITS_PER_SIDE, dtype=torch.bool)
+    has_terrain = board is not None and bool(board.terrain)
+    if not has_terrain:
+        for i in range(min(MAX_UNITS_PER_SIDE, len(enemy_units))):
+            if enemy_units[i].models_alive > 0:
+                mask[i] = True
+        return mask
+
+    from terrain_los import is_visible
+    sx = int(round(shooter_pos[0]))
+    sy = int(round(shooter_pos[1]))
+    for i in range(min(MAX_UNITS_PER_SIDE, len(enemy_units))):
+        e = enemy_units[i]
+        if e.models_alive <= 0:
+            continue
+        for tp in e.alive_positions():
+            if is_visible((sx, sy), tp, board.terrain):
+                mask[i] = True
+                break
+    return mask
+
+
+def compute_unit_visibility_arrays(
+    unit: UnitState,
+    candidates: np.ndarray,
+    cand_mask: np.ndarray,
+    enemy_units: list[UnitState],
+    board: Board | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Precompute per-destination and static visibility for a friendly unit.
+
+    Returns
+    -------
+    dest_visibility : (MAX_DEST_CANDIDATES, MAX_UNITS_PER_SIDE) bool ndarray
+        ``dest_visibility[c, e]`` is True iff at least one alive model of
+        ``enemy_units[e]`` is visible from candidate dest hex ``candidates[c]``
+        (in game-space). Padded rows (``cand_mask[c]=False``) are left zero.
+    static_visibility : (MAX_UNITS_PER_SIDE,) bool ndarray
+        Visibility from the unit's current centre to each enemy slot — used
+        for activations that do not consume the destination pointer (charge/
+        hold/shaken).
+
+    When ``board`` has no terrain, both arrays are filled with the enemy-alive
+    mask (no visibility constraint).
+    """
+    n_cand_full = MAX_DEST_CANDIDATES
+    dest_vis = np.zeros((n_cand_full, MAX_UNITS_PER_SIDE), dtype=np.bool_)
+    static_vis = np.zeros(MAX_UNITS_PER_SIDE, dtype=np.bool_)
+
+    n_enemies = min(MAX_UNITS_PER_SIDE, len(enemy_units))
+    alive = [(i, enemy_units[i].alive_positions())
+             for i in range(n_enemies)
+             if enemy_units[i].models_alive > 0]
+    if not alive:
+        return dest_vis, static_vis
+
+    has_terrain = board is not None and bool(board.terrain)
+    if not has_terrain:
+        for ei, _ in alive:
+            static_vis[ei] = True
+            dest_vis[:, ei] = cand_mask  # valid dests see all alive enemies
+        return dest_vis, static_vis
+
+    # Static visibility from unit centre
+    cx, cy = unit.centre()
+    sx_s = int(round(cx))
+    sy_s = int(round(cy))
+    for ei, eps in alive:
+        _, vmask = _shooter_cover_lookup(board, (sx_s, sy_s), eps)
+        if any(vmask):
+            static_vis[ei] = True
+
+    # Per-destination visibility — only iterate valid candidates
+    n_cand = candidates.shape[0]
+    for ci in range(n_cand):
+        if not cand_mask[ci]:
+            continue
+        sx = int(candidates[ci, 0])
+        sy = int(candidates[ci, 1])
+        for ei, eps in alive:
+            _, vmask = _shooter_cover_lookup(board, (sx, sy), eps)
+            if any(vmask):
+                dest_vis[ci, ei] = True
+
+    return dest_vis, static_vis
+
+
+def compute_unit_expected_damage_arrays(
+    unit: UnitState,
+    candidates: np.ndarray,
+    cand_mask: np.ndarray,
+    enemy_units: list[UnitState],
+    board: Board | None,
+    expected_damage_table: dict | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Precompute per-destination and static cover-aware expected damage.
+
+    For each candidate destination, compute the §5.5 game-time combination
+    sum of E_damage[Y, U_def_j, cover_state(dest, U_def_j)] over the acting
+    unit's currently alive shooter models, normalised by ``U_def_j``'s
+    starting wounds and capped at 1.0. The destination is used as a single
+    shooter-position proxy for every shooter (TERRAIN_SPEC §5.4).
+
+    Returns
+    -------
+    dest_dmg : (MAX_DEST_CANDIDATES, MAX_UNITS_PER_SIDE) float32
+        Expected wound fraction from each candidate dest to each enemy slot,
+        scaled by ``unit.models_alive / unit.unit.models``. Invisible/dead/
+        invalid combinations are 0.
+    static_dmg : (MAX_UNITS_PER_SIDE,) float32
+        Same computation from the unit's current centre — used when the
+        activation does not consume the destination pointer (charge/hold/
+        shaken).
+
+    When ``expected_damage_table`` is None or the unit/enemy_units are not
+    indexable, returns zero arrays (caller should fall back to the cover-
+    blind path).
+    """
+    dest_dmg = np.zeros((MAX_DEST_CANDIDATES, MAX_UNITS_PER_SIDE), dtype=np.float32)
+    static_dmg = np.zeros(MAX_UNITS_PER_SIDE, dtype=np.float32)
+
+    if expected_damage_table is None or unit is None:
+        return dest_dmg, static_dmg
+
+    n_enemies = min(MAX_UNITS_PER_SIDE, len(enemy_units))
+    alive_enemies = []
+    for i in range(n_enemies):
+        e = enemy_units[i]
+        if e.models_alive > 0:
+            alive_enemies.append((i, e, e.alive_positions()))
+    if not alive_enemies:
+        return dest_dmg, static_dmg
+
+    atk_id = id(unit)
+    n_atk_alive = unit.models_alive
+    if n_atk_alive <= 0:
+        return dest_dmg, static_dmg
+    atk_alive_frac = n_atk_alive / max(unit.unit.models, 1)
+
+    def _sum_for_pair(def_unit: UnitState, cover: bool) -> float:
+        """Sum E_damage across surviving shooter models for one (atk, def) pair."""
+        total = 0.0
+        def_id = id(def_unit)
+        for mi in range(n_atk_alive):
+            entry = expected_damage_table.get((atk_id, mi, def_id))
+            if entry is None:
+                continue
+            total += entry[1] if cover else entry[0]
+        return total
+
+    def _eval(shooter_sq: tuple[int, int]) -> dict[int, float]:
+        """Returns {enemy_slot: wound_fraction} for one shooter square."""
+        out: dict[int, float] = {}
+        has_terrain = board is not None and bool(board.terrain)
+        for ei, def_unit, eps in alive_enemies:
+            if has_terrain:
+                n_bad, vmask = _shooter_cover_lookup(board, shooter_sq, eps)
+                if not any(vmask):
+                    continue  # zero damage when fully blocked
+                cover = (2 * n_bad > def_unit.models_alive)
+            else:
+                cover = False
+            total = _sum_for_pair(def_unit, cover)
+            if total <= 0:
+                continue
+            sw = max(_e_dmg_starting_wounds(def_unit.unit), 1)
+            out[ei] = min(total / sw, 1.0) * atk_alive_frac
+        return out
+
+    # Static (from unit centre)
+    cx, cy = unit.centre()
+    static_map = _eval((int(round(cx)), int(round(cy))))
+    for ei, val in static_map.items():
+        static_dmg[ei] = val
+
+    # Per-destination
+    n_cand = candidates.shape[0]
+    for ci in range(n_cand):
+        if not cand_mask[ci]:
+            continue
+        sx = int(candidates[ci, 0])
+        sy = int(candidates[ci, 1])
+        dmg_map = _eval((sx, sy))
+        for ei, val in dmg_map.items():
+            dest_dmg[ci, ei] = val
+
+    return dest_dmg, static_dmg
+
+
+def _e_dmg_starting_wounds(unit) -> int:
+    """Defender starting wounds — mirrors expected_damage_table._starting_wounds."""
+    return (unit.tough if unit.tough else 1) * unit.models
 
 
 def compute_in_range_mask(
@@ -338,12 +624,16 @@ def compute_destination_candidates(
     exclusion_grid = build_exclusion_grid(enemy_positions)
 
     flying = bool(unit.unit.flying)
+    strider = bool(unit.unit.strider)
+    impassible = board.impassible_grid if board.terrain else None
+    difficult = board.difficult_grid if board.terrain else None
 
     # Full candidate set: Dijkstra with rush budget
     reachable = _fc.fast_dijkstra_reachable_set(
         centroid, rush_budget, board.occupancy, enemy_positions,
-        is_charge=False, flying=flying,
+        is_charge=False, flying=flying, strider=strider,
         exclusion_grid=exclusion_grid, cols=COLS, rows=ROWS,
+        impassible_grid=impassible, difficult_grid=difficult,
     )  # (N, 2) int32
 
     # Advance-reachable subset: Dijkstra with advance budget
@@ -353,8 +643,9 @@ def compute_destination_candidates(
     elif advance_budget > 0:
         adv_cells = _fc.fast_dijkstra_reachable_set(
             centroid, advance_budget, board.occupancy, enemy_positions,
-            is_charge=False, flying=flying,
+            is_charge=False, flying=flying, strider=strider,
             exclusion_grid=exclusion_grid, cols=COLS, rows=ROWS,
+            impassible_grid=impassible, difficult_grid=difficult,
         )
         adv_reachable_set = set()
         for r in range(len(adv_cells)):
@@ -467,6 +758,8 @@ def compute_destination_features(
     unit_centre: tuple[float, float] | None = None,
     unit_alive_frac: float | None = None,
     advance_reachable: np.ndarray | None = None,  # (MAX_DEST_CANDIDATES,) bool
+    board: Board | None = None,
+    dest_expected_damage: np.ndarray | None = None,  # (MAX_DEST_CANDIDATES, MAX_UNITS_PER_SIDE)
 ) -> np.ndarray:
     """Compute per-hex features for all candidates (vectorized).
 
@@ -563,7 +856,17 @@ def compute_destination_features(
     buckets = flat_buckets.reshape(n_valid, MAX_UNITS_PER_SIDE)  # (N, 10)
 
     # --- 3.3 Offensive Value (10 features) [15:25] ---
-    if unit_slot < len(friendly_ranged_matchups):
+    # Cover-aware path: when the caller precomputed per-(dest, enemy) cover-
+    # aware expected damage (TERRAIN_SPEC §5.5), use it directly. Each row
+    # already encodes "max wound fraction from this dest, with cover + LoS
+    # gating + attacker alive frac applied." This is the value the spec
+    # prescribes; the bucket-lookup path below is the cover-blind fallback.
+    if dest_expected_damage is not None:
+        off_vals = dest_expected_damage[:n_valid, :].astype(np.float32, copy=False)
+        off_vals = off_vals.copy()
+        off_vals[:, ~alive_mask_np] = 0.0
+        features[:n_valid, 15:25] = off_vals
+    elif unit_slot < len(friendly_ranged_matchups):
         # friendly_ranged_matchups[unit_slot, :, :] is (10, 7)
         fr_row = friendly_ranged_matchups[unit_slot]  # (10, 7)
         # Gather damage values: fr_row[ei, bucket[ci, ei]] for each (ci, ei)
@@ -625,6 +928,36 @@ def compute_destination_features(
     else:
         # Legacy fallback: assume all advance-reachable
         features[:n_valid, 75] = 1.0
+
+    # --- 3.6 Per-hex terrain features (TERRAIN_SPEC.md §5.4) [76:82] ---
+    # cover one-hot {sheltering, obscuring, blocking} at [76:79], movement
+    # one-hot {open, difficult, impassible} at [79:82]. Movement defaults to
+    # OPEN (so [79]=1) for cells not covered by terrain.
+    if board is not None and board.terrain:
+        from board import CoverType, MovementType
+        for i in range(n_valid):
+            piece = board.terrain_at_square.get(
+                (int(cols_v[i]), int(rows_v[i])))
+            if piece is None:
+                features[i, 79] = 1.0  # OPEN
+                continue
+            ct = piece.cover_type
+            mt = piece.movement_type
+            if ct == CoverType.SHELTERING:
+                features[i, 76] = 1.0
+            elif ct == CoverType.OBSCURING:
+                features[i, 77] = 1.0
+            elif ct == CoverType.BLOCKING:
+                features[i, 78] = 1.0
+            if mt == MovementType.OPEN:
+                features[i, 79] = 1.0
+            elif mt == MovementType.DIFFICULT:
+                features[i, 80] = 1.0
+            elif mt == MovementType.IMPASSIBLE:
+                features[i, 81] = 1.0
+    else:
+        # No terrain → all hexes are OPEN movement, no cover.
+        features[:n_valid, 79] = 1.0
 
     return features
 
@@ -879,7 +1212,7 @@ def batched_argmax_tactical(
     charge_indices = charge_logits.argmax(dim=-1)                           # (N,)
 
     # Value
-    values = model.value_head(h, _round_oh).squeeze(-1)                      # (N,)
+    values = model.value_head(h, _round_oh)                                  # (N,) — head already squeezes
 
     # Per-sample: look up selected destination hex, compute post_move_rel
     unit_list = unit_indices.tolist()
@@ -968,6 +1301,216 @@ def batched_argmax_tactical(
             shoot_target_idx=shoot_list[i],
             target_ranking=ranking,
             value=val_list[i],
+            is_advance_reachable=adv_reachable_list[i],
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Two-phase batched inference (proper destination pointer support)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def batched_phase1_inference(
+    model: TacticalModel,
+    requests: list[Phase1Request],
+) -> tuple[list[Phase1Result], list[dict]]:
+    """Phase 1: trunk + unit selection + move type + charge target + value.
+
+    Returns:
+      - list of Phase1Result (decoded selections per request)
+      - list of cache dicts to be retained by the coordinator until each
+        request's matching Phase 2 call. Each cache holds the trunk tensors
+        needed for the destination and shoot pointers in phase 2.
+    """
+    n = len(requests)
+    if n == 0:
+        return [], []
+
+    n_units = MAX_UNITS_PER_SIDE
+
+    state_batch = torch.stack([r.state_vec for r in requests])
+    alive_batch = torch.stack([r.alive_mask for r in requests])
+    enemy_alive_batch = torch.stack([r.enemy_alive_mask for r in requests])
+
+    h, units, _round_oh = model.trunk(state_batch)
+
+    # Unit selection
+    unit_logits = model.unit_selection_head(h)
+    unit_logits = unit_logits.masked_fill(~alive_batch, float('-inf'))
+    unit_indices = unit_logits.argmax(dim=-1)
+
+    unit_features = units[:, :n_units, :].gather(
+        1, unit_indices.unsqueeze(1).unsqueeze(2).expand(n, 1, TACTICAL_UNIT_FEATURES),
+    ).squeeze(1).detach()
+
+    can_charge_batch = extract_can_charge_mask(state_batch, unit_indices)
+
+    # Move type
+    h_uf = torch.cat([h, unit_features], dim=-1)
+    move_logits = model.move_type_head(h_uf)
+    no_chargeable = ~can_charge_batch.any(dim=-1)
+    move_logits = move_logits.clone()
+    move_logits[:, MOVE_CHARGE] = move_logits[:, MOVE_CHARGE].masked_fill(
+        no_chargeable, float('-inf'))
+    move_indices = move_logits.argmax(dim=-1)
+    move_onehot = F.one_hot(move_indices, NUM_MOVE_TYPES).float()
+
+    # h_uf_m is needed by the destination pointer in phase 2.
+    h_uf_m = torch.cat([h, unit_features, move_onehot], dim=-1)
+
+    # Charge target
+    charge_logits = model.compute_charge_logits(
+        h, units, unit_indices, enemy_alive_batch, can_charge_batch,
+    )
+    no_enemies = ~enemy_alive_batch.any(dim=-1)
+    charge_logits = charge_logits.masked_fill(no_enemies.unsqueeze(-1), 0.0)
+    charge_indices = charge_logits.argmax(dim=-1)
+
+    # Value
+    values = model.value_head(h, _round_oh)
+
+    unit_list = unit_indices.tolist()
+    move_list = move_indices.tolist()
+    charge_list = charge_indices.tolist()
+    val_list = values.tolist()
+
+    results: list[Phase1Result] = []
+    caches: list[dict] = []
+    for i in range(n):
+        results.append(Phase1Result(
+            unit_idx=unit_list[i],
+            move_type=move_list[i],
+            charge_target_idx=charge_list[i],
+            value=val_list[i],
+        ))
+        caches.append({
+            'h': h[i].detach().clone(),
+            'units': units[i].detach().clone(),
+            'h_uf_m': h_uf_m[i].detach().clone(),
+            'enemy_alive': enemy_alive_batch[i].detach().clone(),
+        })
+
+    return results, caches
+
+
+@torch.no_grad()
+def batched_phase2_inference(
+    model: TacticalModel,
+    requests: list[Phase2Request],
+    caches: list[dict],
+) -> list[Phase2Result]:
+    """Phase 2: destination pointer (over real Dijkstra candidates) + shoot
+    target. Uses the trunk tensors cached in phase 1."""
+    n = len(requests)
+    if n == 0:
+        return []
+
+    n_units = MAX_UNITS_PER_SIDE
+
+    # Re-batch cached trunk tensors
+    h_batch = torch.stack([c['h'] for c in caches])
+    units_batch = torch.stack([c['units'] for c in caches])
+    h_uf_m_batch = torch.stack([c['h_uf_m'] for c in caches])
+    enemy_alive_batch = torch.stack([c['enemy_alive'] for c in caches])
+
+    # ----- Destination pointer -----
+    # For MOVE_MOVE requests we received real Dijkstra candidates; for
+    # MOVE_CHARGE we received a 1-row dummy. The pointer runs uniformly;
+    # the result is only used for MOVE_MOVE.
+    _batch_max_dc = max((r.dest_features.shape[0] for r in requests), default=1)
+    dest_features_batch = torch.zeros(n, _batch_max_dc, DEST_FEATURE_DIM)
+    dest_mask_batch = torch.zeros(n, _batch_max_dc, dtype=torch.bool)
+    for i, r in enumerate(requests):
+        nc = r.dest_features.shape[0]
+        dest_features_batch[i, :nc] = r.dest_features
+        dest_mask_batch[i, :nc] = r.dest_mask[:nc]
+
+    dest_logits = model.compute_dest_logits(
+        h_uf_m_batch, dest_features_batch, dest_mask_batch)
+    dest_indices = dest_logits.argmax(dim=-1)
+    dest_idx_list = dest_indices.tolist()
+
+    # ----- Resolve destination + post-move position per request -----
+    dest_cols: list[int] = []
+    dest_rows: list[int] = []
+    adv_reachable_list: list[bool] = []
+    pmr_tensors: list[torch.Tensor] = []
+    unit_indices_list: list[int] = []
+
+    for i in range(n):
+        r = requests[i]
+        mt = r.move_type
+        uid = r.unit_idx
+        unit_indices_list.append(uid)
+
+        if mt == MOVE_MOVE:
+            didx = dest_idx_list[i]
+            # candidates is numpy (C, 2)
+            dc = int(r.candidates[didx, 0])
+            dr = int(r.candidates[didx, 1])
+            try:
+                is_ar = bool(r.advance_reachable[didx])
+            except (IndexError, TypeError):
+                is_ar = True
+        else:
+            # Charge: post-move position is the unit centroid.
+            ucx, ucy = r.friendly_positions[uid]
+            if r.player == "B":
+                ucx = _flip_x(ucx)
+                ucy = _flip_y(ucy)
+            dc, dr = int(round(ucx)), int(round(ucy))
+            is_ar = True
+
+        dest_cols.append(dc)
+        dest_rows.append(dr)
+        adv_reachable_list.append(is_ar)
+
+        # post_move_rel uses model-space coords
+        px, py = float(dc), float(dr)
+        if r.player == "B":
+            px = _flip_x(px)
+            py = _flip_y(py)
+        if mt != MOVE_MOVE:
+            px, py = r.friendly_positions[uid]
+
+        pmr = compute_post_move_rel(px, py, r.enemy_positions)
+        pmr_tensors.append(pmr)
+
+    # ----- Shoot pointer -----
+    pmr_batch = torch.stack(pmr_tensors)
+    unit_indices_t = torch.tensor(unit_indices_list, dtype=torch.long)
+    max_wr_list = [requests[i].max_weapon_ranges[unit_indices_list[i]]
+                   for i in range(n)]
+    max_wr_t = torch.tensor(max_wr_list, dtype=torch.float32)
+    shoot_mask_batch = compute_in_range_mask_batched(
+        pmr_batch, max_wr_t, enemy_alive_batch)
+    shoot_logits = model.compute_shoot_logits(
+        h_batch, units_batch, unit_indices_t, pmr_batch, enemy_alive_batch,
+        shoot_range_mask=shoot_mask_batch,
+    )
+    no_shootable = ~shoot_mask_batch.any(dim=-1)
+    shoot_logits = shoot_logits.masked_fill(no_shootable.unsqueeze(-1), 0.0)
+    shoot_indices = shoot_logits.argmax(dim=-1)
+    shoot_list = shoot_indices.tolist()
+
+    results: list[Phase2Result] = []
+    for i in range(n):
+        r = requests[i]
+        ranking = (
+            list(range(n_units)) if no_shootable[i] else
+            torch.argsort(shoot_logits[i], descending=True).tolist()
+        )
+        results.append(Phase2Result(
+            unit_idx=r.unit_idx,
+            move_type=r.move_type,
+            dest_col=dest_cols[i],
+            dest_row=dest_rows[i],
+            charge_target_idx=r.charge_target_idx,
+            shoot_target_idx=shoot_list[i],
+            target_ranking=ranking,
+            value=r.value,
             is_advance_reachable=adv_reachable_list[i],
         ))
 
@@ -1098,6 +1641,11 @@ def _apply_tactical_model_phased(
     dest_entropy = 0.0
     is_advance_reachable = True
 
+    # Cover-aware expected damage arrays — used by both the dest-feature
+    # offensive block [15:25] and the shoot head override (TERRAIN_SPEC §5.4).
+    _e_dmg_table = getattr(board, 'expected_damage_table', None)
+    _dest_dmg_arr = None
+    _static_dmg_arr = None
     if move_type == MOVE_MOVE and not is_shaken:
         enemy_pos_set: set[tuple[int, int]] = set()
         for eu in enemy_units:
@@ -1107,12 +1655,15 @@ def _apply_tactical_model_phased(
 
         candidates, cand_mask, adv_reachable = compute_destination_candidates(
             selected_unit, board, enemy_pos_set, player)
+        _dest_dmg_arr, _static_dmg_arr = compute_unit_expected_damage_arrays(
+            selected_unit, candidates, cand_mask, enemy_units, board, _e_dmg_table)
         budget = float(selected_unit.unit.rush_distance)
         dest_feats = compute_destination_features(
             candidates, cand_mask, selected_unit, selected_idx, player,
             enemy_units, enemy_alive_np,
             friendly_ranged_matchups, enemy_ranged_matchups, enemy_melee_matchups,
-            budget, advance_reachable=adv_reachable)
+            budget, advance_reachable=adv_reachable, board=board,
+            dest_expected_damage=_dest_dmg_arr)
 
         dest_features_t = torch.from_numpy(dest_feats).float()
         dest_mask_t = torch.from_numpy(cand_mask)
@@ -1128,6 +1679,13 @@ def _apply_tactical_model_phased(
         dest_row = int(candidates[dest_idx, 1])
         dest_n_candidates = int(cand_mask.sum())
         is_advance_reachable = bool(adv_reachable[dest_idx])
+    else:
+        # No move (charge / shaken): only the static damage row is needed for
+        # the shoot head override.
+        _, _static_dmg_arr = compute_unit_expected_damage_arrays(
+            selected_unit, np.zeros((MAX_DEST_CANDIDATES, 2), dtype=np.int32),
+            np.zeros(MAX_DEST_CANDIDATES, dtype=np.bool_),
+            enemy_units, board, _e_dmg_table)
 
         dest_probs = torch.softmax(dest_logits, dim=-1)
         top_k = min(3, dest_n_candidates)
@@ -1180,10 +1738,19 @@ def _apply_tactical_model_phased(
         enemy_alive_batched, can_charge_mask.unsqueeze(0),
     ).squeeze(0)
 
+    # Cover-aware expected wound frac for the chosen activation context.
+    _ewf_override = None
+    if _e_dmg_table is not None:
+        if move_type == MOVE_MOVE and not is_shaken and _dest_dmg_arr is not None:
+            _ewf_override = torch.from_numpy(_dest_dmg_arr[dest_idx].astype(np.float32)).unsqueeze(0)
+        elif _static_dmg_arr is not None:
+            _ewf_override = torch.from_numpy(_static_dmg_arr.astype(np.float32)).unsqueeze(0)
+
     shoot_logits_b = model.compute_shoot_logits(
         h_dest, units_dest, selected_idx,
         post_move_rel.unsqueeze(0), enemy_alive_batched,
         shoot_range_mask=None,
+        expected_wound_frac_override=_ewf_override,
     ).squeeze(0)
 
     max_wr = max(
@@ -1191,6 +1758,12 @@ def _apply_tactical_model_phased(
         default=0.0,
     )
     shoot_range_mask = compute_in_range_mask(post_move_rel, float(max_wr), enemy_alive_mask)
+    if move_type == MOVE_MOVE and not is_shaken:
+        shooter_gs = (float(dest_col), float(dest_row))
+    else:
+        shooter_gs = selected_unit.centre()
+    vis_mask = compute_visibility_mask(shooter_gs, enemy_units, board)
+    shoot_range_mask = shoot_range_mask & vis_mask
     if is_shaken:
         shoot_range_mask = torch.zeros_like(shoot_range_mask)
     masked_shoot_logits = shoot_logits_b.masked_fill(~shoot_range_mask, float('-inf'))
@@ -1383,6 +1956,9 @@ def apply_tactical_model(
     dest_entropy = 0.0
     is_advance_reachable = True  # default for centroid / shaken
 
+    _e_dmg_table = getattr(board, 'expected_damage_table', None)
+    _dest_dmg_arr = None
+    _static_dmg_arr = None
     if move_type == MOVE_MOVE and not is_shaken:
         # Build enemy position set for Dijkstra
         enemy_pos_set: set[tuple[int, int]] = set()
@@ -1393,12 +1969,15 @@ def apply_tactical_model(
 
         candidates, cand_mask, adv_reachable = compute_destination_candidates(
             selected_unit, board, enemy_pos_set, player)
+        _dest_dmg_arr, _static_dmg_arr = compute_unit_expected_damage_arrays(
+            selected_unit, candidates, cand_mask, enemy_units, board, _e_dmg_table)
         budget = float(selected_unit.unit.rush_distance)
         dest_feats = compute_destination_features(
             candidates, cand_mask, selected_unit, selected_idx, player,
             enemy_units, enemy_alive_np,
             friendly_ranged_matchups, enemy_ranged_matchups, enemy_melee_matchups,
-            budget, advance_reachable=adv_reachable)
+            budget, advance_reachable=adv_reachable, board=board,
+            dest_expected_damage=_dest_dmg_arr)
 
         dest_features_t = torch.from_numpy(dest_feats).float()
         dest_mask_t = torch.from_numpy(cand_mask)
@@ -1433,11 +2012,26 @@ def apply_tactical_model(
             py = _flip_y(py)
     else:
         px, py = unit_cx_ms, unit_cy_ms
+        # Static damage for non-move (charge/shaken) — needed for shoot head override.
+        if _static_dmg_arr is None and _e_dmg_table is not None:
+            _, _static_dmg_arr = compute_unit_expected_damage_arrays(
+                selected_unit, np.zeros((MAX_DEST_CANDIDATES, 2), dtype=np.int32),
+                np.zeros(MAX_DEST_CANDIDATES, dtype=np.bool_),
+                enemy_units, board, _e_dmg_table)
     post_move_rel = compute_post_move_rel(px, py, enemy_positions)
+
+    # Cover-aware expected wound frac override for the shoot head.
+    _ewf_override = None
+    if _e_dmg_table is not None:
+        if move_type == MOVE_MOVE and not is_shaken and _dest_dmg_arr is not None:
+            _ewf_override = torch.from_numpy(_dest_dmg_arr[dest_idx].astype(np.float32))
+        elif _static_dmg_arr is not None:
+            _ewf_override = torch.from_numpy(_static_dmg_arr.astype(np.float32))
 
     # --- Forward pass 2: re-run with post-move features for shooting head ---
     out2 = model(state_vec, alive_mask, enemy_alive_mask,
-                 forced_unit_idx=selected_idx, post_move_rel=post_move_rel)
+                 forced_unit_idx=selected_idx, post_move_rel=post_move_rel,
+                 expected_wound_frac_override=_ewf_override)
 
     # Apply in-range mask to shoot logits
     max_wr = max(
@@ -1445,6 +2039,12 @@ def apply_tactical_model(
         default=0.0,
     )
     shoot_range_mask = compute_in_range_mask(post_move_rel, float(max_wr), enemy_alive_mask)
+    if move_type == MOVE_MOVE and not is_shaken:
+        shooter_gs = (float(dest_col), float(dest_row))
+    else:
+        shooter_gs = selected_unit.centre()
+    vis_mask = compute_visibility_mask(shooter_gs, enemy_units, board)
+    shoot_range_mask = shoot_range_mask & vis_mask
     if is_shaken:
         shoot_range_mask = torch.zeros_like(shoot_range_mask)
     masked_shoot_logits = out2.shoot_target_logits.masked_fill(~shoot_range_mask, float('-inf'))
@@ -1629,6 +2229,9 @@ def apply_tactical_model_sampling(
     else:
         dest_col_gs, dest_row_gs = dest_col, dest_row
     _is_ar = True
+    _e_dmg_table = getattr(board, 'expected_damage_table', None)
+    _dest_dmg_arr = None
+    _static_dmg_arr = None
 
     if move_type == MOVE_MOVE and not is_shaken:
         enemy_pos_set: set[tuple[int, int]] = set()
@@ -1639,12 +2242,15 @@ def apply_tactical_model_sampling(
 
         candidates, cand_mask, adv_reachable = compute_destination_candidates(
             selected_unit, board, enemy_pos_set, player)
+        _dest_dmg_arr, _static_dmg_arr = compute_unit_expected_damage_arrays(
+            selected_unit, candidates, cand_mask, enemy_units, board, _e_dmg_table)
         budget = float(selected_unit.unit.rush_distance)
         dest_feats = compute_destination_features(
             candidates, cand_mask, selected_unit, selected_idx, player,
             enemy_units, enemy_alive_np,
             friendly_ranged_matchups, enemy_ranged_matchups, enemy_melee_matchups,
-            budget, advance_reachable=adv_reachable)
+            budget, advance_reachable=adv_reachable, board=board,
+            dest_expected_damage=_dest_dmg_arr)
 
         dest_features_t = torch.from_numpy(dest_feats).float().unsqueeze(0)
         dest_mask_t = torch.from_numpy(cand_mask).unsqueeze(0)
@@ -1654,6 +2260,12 @@ def apply_tactical_model_sampling(
         dest_col_gs = int(candidates[dest_idx, 0])
         dest_row_gs = int(candidates[dest_idx, 1])
         _is_ar = bool(adv_reachable[dest_idx])
+    else:
+        if _e_dmg_table is not None:
+            _, _static_dmg_arr = compute_unit_expected_damage_arrays(
+                selected_unit, np.zeros((MAX_DEST_CANDIDATES, 2), dtype=np.int32),
+                np.zeros(MAX_DEST_CANDIDATES, dtype=np.bool_),
+                enemy_units, board, _e_dmg_table)
 
     # Compute post_move_rel from selected hex
     if move_type == MOVE_MOVE and not is_shaken:
@@ -1685,12 +2297,26 @@ def apply_tactical_model_sampling(
     )
     shoot_range_mask = compute_in_range_mask(
         post_move_rel.squeeze(0), float(max_wr), enemy_alive_mask)
+    if move_type == MOVE_MOVE and not is_shaken:
+        shooter_gs = (float(dest_col_gs), float(dest_row_gs))
+    else:
+        shooter_gs = selected_unit.centre()
+    vis_mask = compute_visibility_mask(shooter_gs, enemy_units, board)
+    shoot_range_mask = shoot_range_mask & vis_mask
     if is_shaken:
         shoot_range_mask = torch.zeros_like(shoot_range_mask)
+    # Cover-aware expected wound frac override.
+    _ewf_override = None
+    if _e_dmg_table is not None:
+        if move_type == MOVE_MOVE and not is_shaken and _dest_dmg_arr is not None:
+            _ewf_override = torch.from_numpy(_dest_dmg_arr[dest_idx].astype(np.float32))
+        elif _static_dmg_arr is not None:
+            _ewf_override = torch.from_numpy(_static_dmg_arr.astype(np.float32))
     shoot_logits = model.compute_shoot_logits(
         h.squeeze(0), units.squeeze(0), selected_idx,
         post_move_rel.squeeze(0), enemy_alive_mask,
         shoot_range_mask=shoot_range_mask,
+        expected_wound_frac_override=_ewf_override,
     )
     no_shootable = not shoot_range_mask.any()
     if no_enemies or no_shootable:
@@ -1721,15 +2347,17 @@ def pick_target_from_ranking(
     attacker: UnitState,
     enemies: list[UnitState],
     target_ranking: list[int],
+    board: Board | None = None,
 ) -> UnitState | None:
-    """Walk the ML target ranking and return the highest-ranked enemy in weapon range."""
+    """Walk the ML target ranking and return the highest-ranked enemy in weapon range
+    (and visible, when *board* carries terrain)."""
     for slot_idx in target_ranking:
         if slot_idx >= len(enemies):
             continue
         enemy = enemies[slot_idx]
         if enemy.models_alive <= 0:
             continue
-        can_shoot, _, _ = evaluate_target(attacker, enemy)
+        can_shoot, _, _ = evaluate_target(attacker, enemy, board)
         if can_shoot:
             return enemy
     return None

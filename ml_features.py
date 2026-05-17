@@ -22,16 +22,33 @@ MAX_UNITS_PER_SIDE = 10
 RANGE_THRESHOLDS = [6, 9, 12, 18, 24, 30, 36]
 NUM_RANGE_THRESHOLDS = len(RANGE_THRESHOLDS)
 
-# 4 (round one-hot) + 5 (objective control) + 5 (projected obj control)
-# + 2 (points) = 16 global values
-GLOBAL_FEATURES = 16
+# Tactical global features layout:
+#   [0..3]   round one-hot               (4)
+#   [4..8]   objective control           (5)
+#   [9..13]  projected obj control       (5)
+#   [14]     alive friendly fraction     (1)
+#   [15]     alive enemy fraction        (1)
+#   [16..18] deploy_phase one-hot {non_scout, scout, in_game}  (3) — NEW
+#   [19]     is_my_turn_to_deploy         (1) — NEW
+#   [20]     n_unplaced_self / MAX_UNITS_PER_SIDE   (1) — NEW
+#   [21]     n_unplaced_opp  / MAX_UNITS_PER_SIDE   (1) — NEW
+GLOBAL_FEATURES = 22
+_GOFF_ROUND = 0
+_GOFF_OBJ_CTRL = 4
+_GOFF_OBJ_CTRL_PROJ = 9
+_GOFF_ALIVE_F = 14
+_GOFF_ALIVE_E = 15
+_GOFF_DEPLOY_PHASE = 16   # 3 dims: 0=non_scout, 1=scout, 2=in_game
+_GOFF_MY_DEPLOY_TURN = 19
+_GOFF_N_UNPLACED_SELF = 20
+_GOFF_N_UNPLACED_OPP = 21
 
 # Tactical model: egocentric (sin θ, cos θ, dist) for objectives and enemies
 # Per-unit: 10 basic + 2 position + 15 obj-rel + 30 enemy-rel + 30 same-side-rel
 #         + 70 ranged + 10 melee + 10 opp-post-advance-dist
 #         + 10 obj-reachability (5 obj × (can_advance, can_rush))
 #         + 10 can_charge (1 per opposing unit)
-#         + has_activated + fatigued + is_shaken = 200
+#         + has_activated + fatigued + is_shaken + is_deployed = 201
 _NUM_OBJECTIVES = 5
 _TACTICAL_OBJ_REL = _NUM_OBJECTIVES * 3       # 15: (sin θ, cos θ, dist) per objective
 _TACTICAL_OPP_REL = MAX_UNITS_PER_SIDE * 3    # 30: (sin θ, cos θ, dist) per opposing unit
@@ -42,9 +59,10 @@ _TACTICAL_OBJ_REACH = _NUM_OBJECTIVES * 2     # 10: 5 objectives × (can_advance
 _TACTICAL_CAN_CHARGE = MAX_UNITS_PER_SIDE  # 10: can_charge per opposing unit
 TACTICAL_UNIT_FEATURES = (_TACTICAL_BASE + NUM_RANGE_THRESHOLDS * MAX_UNITS_PER_SIDE
                           + MAX_UNITS_PER_SIDE + _TACTICAL_OPP_POST_ADV
-                          + _TACTICAL_OBJ_REACH + _TACTICAL_CAN_CHARGE + 3)  # 200
-# (87 + 70 ranged + 10 melee + 10 opp-post-advance + 10 obj-reach + 10 can_charge + 3 tactical bools)
-TACTICAL_TOTAL_FEATURES = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES + GLOBAL_FEATURES  # 4016
+                          + _TACTICAL_OBJ_REACH + _TACTICAL_CAN_CHARGE + 4)  # 201
+# (87 + 70 ranged + 10 melee + 10 opp-post-advance + 10 obj-reach + 10 can_charge
+#  + 3 tactical bools + 1 is_deployed)
+TACTICAL_TOTAL_FEATURES = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES + GLOBAL_FEATURES  # 4042
 
 # Tactical per-unit feature offsets
 _TOFF_SCALARS = 0         # 10 scalars
@@ -60,6 +78,15 @@ _TOFF_CAN_CHARGE = _TOFF_OBJ_REACH + _TACTICAL_OBJ_REACH  # 187: 10 can_charge f
 _TOFF_ACTIVATED = _TOFF_CAN_CHARGE + _TACTICAL_CAN_CHARGE  # 197: has_activated
 _TOFF_FATIGUED = _TOFF_ACTIVATED + 1   # 198: fatigued
 _TOFF_SHAKEN = _TOFF_FATIGUED + 1      # 199: is_shaken
+_TOFF_IS_DEPLOYED = _TOFF_SHAKEN + 1   # 200: 1 if unit is on the board, else 0
+
+# Deployment-action geometry: per-side egocentric grid of legal anchor cells.
+# Non-scout phase mask: rows 0..11 (own DZ depth = 12).
+# Scout phase mask:     rows 0..23 (own DZ + 12" forward).
+# A single head of width DEPLOY_POS_GRID covers both, with phase-dependent mask.
+DEPLOY_POS_DEPTH = 24       # max depth (egocentric) — covers scout zone
+DEPLOY_POS_GRID = DEPLOY_POS_DEPTH * COLS  # 1728 cells
+DEPLOY_POS_NONSCOUT_DEPTH = 12  # depth for non-scout phase mask
 
 # Normalisation ceilings
 _MAX_TOUGH = 24
@@ -67,14 +94,73 @@ _MAX_MODELS = 10
 _MAX_SPEED = 24.0
 
 # Destination pointer constants
-DEST_FEATURE_DIM = 76       # per-hex feature vector size (75 base + 1 advance-reachable flag)
+# 75 base + 1 advance-reachable flag + 6 terrain (3 cover one-hot + 3 movement one-hot).
+# Terrain block (TERRAIN_SPEC.md §5.4): per candidate hex, one-hot of cover_type
+# {sheltering, obscuring, blocking} at [76:79] and movement_type
+# {open, difficult, impassible} at [79:82]. The pre-existing reachable flag at
+# [75] is already terrain-aware via the Dijkstra candidate computation.
+DEST_FEATURE_DIM = 82
 DEST_EMBED_DIM = 64         # embedding dimension for pointer cross-attention
 MAX_DEST_CANDIDATES = 4096  # upper bound for candidate arrays; actual padding uses min(this, batch_max)
+
+# Per-square terrain channel encoding — TERRAIN_SPEC.md §5.4 recommended
+# layout. K = 6 board-shaped one-hot planes:
+#   0: open (no terrain)
+#   1: difficult-only (movement DIFFICULT, cover SHELTERING)  ← arbitrary; see encode_terrain_planes
+#   2: impassible-only (movement IMPASSIBLE, cover SHELTERING — n/a today, future-proof)
+#   3: sheltering (movement OPEN, cover SHELTERING)
+#   4: obscuring (movement OPEN/DIFFICULT, cover OBSCURING)
+#   5: blocking (movement IMPASSIBLE, cover BLOCKING)
+TERRAIN_CHANNELS = 6
 
 # Pre-allocated zero arrays for missing unit slots (never mutated)
 _ZERO_RANGED_ROW = np.zeros((MAX_UNITS_PER_SIDE, NUM_RANGE_THRESHOLDS), dtype=np.float32)
 _ZERO_MELEE_ROW = np.zeros(MAX_UNITS_PER_SIDE, dtype=np.float32)
 
+
+
+# ---------------------------------------------------------------------------
+# Terrain channels (TERRAIN_SPEC.md §5.4 per-square layout)
+# ---------------------------------------------------------------------------
+
+def encode_terrain_planes(board: Board) -> np.ndarray:
+    """Return (TERRAIN_CHANNELS, ROWS, COLS) one-hot terrain planes.
+
+    Each cell is hot in exactly one channel; the channel is chosen by
+    cover_type (BLOCKING/OBSCURING/SHELTERING) when present, falling back to
+    movement_type (IMPASSIBLE/DIFFICULT/OPEN). Cells with no terrain piece
+    are hot in channel 0 (open).
+
+    Intended to be consumed by a small spatial encoder (CNN) and concatenated
+    into the global feature path of the tactical model. The model wiring is a
+    follow-up — this function emits the correctly-shaped tensor today so
+    downstream code can begin to depend on it.
+    """
+    from board import CoverType, MovementType
+    planes = np.zeros((TERRAIN_CHANNELS, ROWS, COLS), dtype=np.float32)
+    if not board.terrain:
+        planes[0, :, :] = 1.0
+        return planes
+    planes[0, :, :] = 1.0  # default open
+    for piece in board.terrain:
+        ct = piece.cover_type
+        mt = piece.movement_type
+        if ct == CoverType.BLOCKING:
+            ch = 5
+        elif ct == CoverType.OBSCURING:
+            ch = 4
+        elif ct == CoverType.SHELTERING:
+            ch = 3
+        elif mt == MovementType.IMPASSIBLE:
+            ch = 2
+        elif mt == MovementType.DIFFICULT:
+            ch = 1
+        else:
+            ch = 0
+        for c, r in piece.squares():
+            planes[0, r, c] = 0.0
+            planes[ch, r, c] = 1.0
+    return planes
 
 
 # ---------------------------------------------------------------------------
@@ -110,14 +196,37 @@ def _expected_ranged_damage_at_range(
     Rules modelled: quality, reliable, stealth (unless unstoppable), AP, blast,
     deadly, defense, shielded, crack, rending, bane, unstoppable, regeneration,
     artillery (+1/-2 hit beyond 9"), relentless (extra nat6 hits beyond 9"),
-    piercing spotter (+0.5 AP average).
+    piercing spotter (+0.5 AP average). BB additions: Lacerate (block^2),
+    Shred (+1/6 wound per def die), Smash (Blast(+3) vs def 5+ majority,
+    ignores Regen), Indirect (ignores stealth/cover), Versatile Reach (+4"
+    range), Versatile Attack EV pick at >9". ED additions: Clan Warrior
+    (extra attack on nat 6, 5+ with Boost), Surge (+1 hit on nat 6 per
+    weapon), Tear (AP+4 vs Tough(9)+), Puncture (AP+4 vs Tough(3-9), ignores
+    Regen), Piercing Hunter (+1 AP at >9"), Ignores Cover (strips stealth).
     """
     beyond_9 = max_range > 9
 
+    # Versatile Reach grants +4" range to ranged weapons; reflect by lowering
+    # the effective max-range gate when computing per-weapon contribution.
+    vr_bonus = 4 if attacker.versatile_reach else 0
+
     # --- Base hit quality (before per-weapon unstoppable check) ---
     base_quality = attacker.quality
-    # Stealth: -1 to hit
-    stealth_penalty = 1 if defender.stealth else 0
+    # Stealth: -1 to hit. Ignores Cover (ED) strips this for the whole unit.
+    stealth_penalty = 0 if attacker.ignores_cover else (1 if defender.stealth else 0)
+    # ED Piercing Hunter: +1 AP at >9".
+    ph_ap = 1 if (attacker.piercing_hunter and beyond_9) else 0
+    # ED Tear: +4 AP vs Tough(9)+. Puncture: +4 AP vs Tough(3-9), ignores Regen.
+    tear_active = defender.tough >= 9
+    puncture_active = 3 <= defender.tough <= 9
+    # ED Clan Warrior multiplier: each nat 6 (or 5+ w/ boost) generates an
+    # extra attack die. Approximate as a multiplier on attack count.
+    if attacker.clan_warrior:
+        cw_thresh = 5 if attacker.clan_warrior_boost else 6
+        cw_trigger_p = (7 - cw_thresh) / 6.0   # 1/6 or 2/6
+        cw_attack_mult = 1.0 + cw_trigger_p     # one extra die per triggering die
+    else:
+        cw_attack_mult = 1.0
     # Artillery modifiers (only beyond 9")
     artillery_atk_bonus = 1 if (attacker.artillery and beyond_9) else 0
     artillery_def_penalty = 2 if (defender.artillery and beyond_9) else 0
@@ -125,25 +234,62 @@ def _expected_ranged_damage_at_range(
     # Defender effective defense (shielded: +1)
     d_def = defender.defense + (1 if defender.shielded else 0)
 
+    # Smash: Blast(+3) when more than half of defender models have Defense 5+.
+    smash_active = defender.defense >= 5  # 1 model unit or all models share Def
+
     # Piercing spotter: average +0.5 AP
     spotter_ap = 0.5 if attacker.piercing_spotter else 0.0
 
+    # Versatile Attack: pre-compute the bonus for >9" engagements. We pick the
+    # higher of AP(+1) or +1-to-hit by direct comparison below per-weapon.
+    va_active = attacker.versatile_attack and beyond_9
+
     total = 0.0
     for w in attacker.weapons:
-        if w.melee or w.range_inches < max_range:
+        if w.melee:
+            continue
+        if w.range_inches + vr_bonus < max_range:
             continue
 
-        # Unstoppable ignores negative hit modifiers (stealth, artillery def)
+        # Unstoppable ignores negative hit modifiers (stealth, artillery def).
+        # Indirect ignores cover (we use the stealth penalty as the closest
+        # proxy for cover in this sim).
+        eff_stealth_penalty = stealth_penalty
+        if w.indirect:
+            eff_stealth_penalty = 0
         if w.unstoppable:
             quality = max(base_quality - artillery_atk_bonus, 2)
         else:
-            quality = min(max(base_quality + stealth_penalty + artillery_def_penalty
+            quality = min(max(base_quality + eff_stealth_penalty + artillery_def_penalty
                               - artillery_atk_bonus, 2), 6)
         hit_prob = (7 - quality) / 6.0
 
+        # Versatile Attack EV pick — try both options and take the higher.
+        if va_active:
+            # Option B: +1-to-hit (lower threshold, max 6)
+            quality_hit = min(max(quality - 1, 2), 6)
+            hit_prob_hit = (7 - quality_hit) / 6.0
+            # Per-weapon EV is computed inline below; we just choose the
+            # quality / ap pair that maximises expected wounds.
+            # Approximate: pick by simple expected-wound proxy.
+            ap_a = w.ap + 1
+            ap_b = w.ap
+            blk_a = max((7 - min(d_def + ap_a, 7)) / 6.0, 1 / 6)
+            blk_b = max((7 - min(d_def + ap_b, 7)) / 6.0, 1 / 6)
+            ev_a = hit_prob * (1.0 - blk_a)
+            ev_b = hit_prob_hit * (1.0 - blk_b)
+            if ev_b > ev_a:
+                hit_prob = hit_prob_hit
+                va_ap = 0
+            else:
+                va_ap = 1
+        else:
+            va_ap = 0
+
         p = 5 / 6 if w.reliable else hit_prob
 
-        dice = w.attacks
+        # Clan Warrior expands the effective attack count.
+        dice = w.attacks * cw_attack_mult
 
         # Split hits into nat6 and normal (for crack/rending/relentless)
         nat6_hits = dice * (1 / 6)
@@ -153,14 +299,29 @@ def _expected_ranged_damage_at_range(
         if attacker.relentless and beyond_9:
             normal_hits += nat6_hits
 
-        # Blast multiplier
-        if w.blast:
-            blast_mult = min(w.blast, defender.models)
+        # ED Surge: each nat 6 generates an extra normal hit (per-weapon).
+        if w.surge:
+            normal_hits += nat6_hits
+
+        # Blast multiplier (Smash adds +3 to Blast vs def-5+ majority targets)
+        eff_blast = w.blast
+        smash_now = w.smash and smash_active
+        if smash_now:
+            eff_blast = (eff_blast or 0) + 3
+        if eff_blast:
+            blast_mult = min(eff_blast, defender.models)
             nat6_hits *= blast_mult
             normal_hits *= blast_mult
 
+        # ED Tear / Puncture conditional AP.
+        ed_extra_ap = ph_ap
+        if w.tear and tear_active:
+            ed_extra_ap += 4
+        if w.puncture and puncture_active:
+            ed_extra_ap += 4
+
         # --- Nat6 path: crack +2 AP, rending +4 AP ---
-        nat6_ap = w.ap + spotter_ap
+        nat6_ap = w.ap + spotter_ap + va_ap + ed_extra_ap
         if w.crack:
             nat6_ap += 2
         if w.rending:
@@ -169,14 +330,25 @@ def _expected_ranged_damage_at_range(
         eff_def_nat6 = min(d_def + nat6_ap, 7)
         block_nat6 = (_bane_block_prob(eff_def_nat6) if w.bane
                       else max((7 - eff_def_nat6) / 6.0, 1 / 6))
+        # Lacerate: defender re-rolls successful blocks → block prob squared.
+        if w.lacerate:
+            block_nat6 = block_nat6 * block_nat6
         wounds_nat6 = nat6_hits * (1 - block_nat6)
 
         # --- Normal path ---
-        normal_ap = w.ap + spotter_ap
+        normal_ap = w.ap + spotter_ap + va_ap + ed_extra_ap
         eff_def_normal = min(d_def + normal_ap, 7)
         block_normal = (_bane_block_prob(eff_def_normal) if w.bane
                         else max((7 - eff_def_normal) / 6.0, 1 / 6))
+        if w.lacerate:
+            block_normal = block_normal * block_normal
         wounds_normal = normal_hits * (1 - block_normal)
+
+        # Shred: 1/6 of defense rolls are nat 1 → +1 raw wound each.
+        # Approximate: total def dice ≈ (nat6_hits + normal_hits) (already
+        # blast-multiplied); add (1/6) per die.
+        if w.shred:
+            wounds_normal += (nat6_hits + normal_hits) * (1.0 / 6.0)
 
         # Deadly multiplier (cap at model HP — overkill is wasted)
         if w.deadly:
@@ -187,9 +359,11 @@ def _expected_ranged_damage_at_range(
 
         weapon_wounds = wounds_nat6 + wounds_normal
 
-        # Regeneration: 5+ negates → 1/3 negated → multiply by 2/3
-        # Bypassed by rending, unstoppable, bane
-        if defender.regeneration and not (w.rending or w.unstoppable or w.bane):
+        # Regeneration: 5+ negates → 1/3 negated → multiply by 2/3.
+        # Bypassed by rending, unstoppable, bane, Smash, and Puncture.
+        if (defender.regeneration
+                and not (w.rending or w.unstoppable or w.bane or smash_now
+                         or (w.puncture and puncture_active))):
             weapon_wounds *= (2 / 3)
 
         total += weapon_wounds
@@ -212,13 +386,40 @@ def _expected_melee_damage_raw(
     piercing spotter (+0.5 AP average), impact.
     """
     base_quality = attacker.quality
-    base_hit_prob = (7 - base_quality) / 6.0
+    # ED: Melee Evasion on defender → -1 to hit; Precision Fighter on attacker → +1.
+    # Vengeance markers are runtime state and aren't visible from ResolvedUnit
+    # — we ignore them here; the live combat path applies them.
+    base_quality_eff = base_quality
+    if defender.melee_evasion:
+        base_quality_eff += 1
+    if attacker.precision_fighter:
+        base_quality_eff -= 1
+    base_quality_eff = max(2, min(6, base_quality_eff))
+    base_hit_prob = (7 - base_quality_eff) / 6.0
 
     # Defender effective defense (shielded: +1)
     d_def = defender.defense + (1 if defender.shielded else 0)
+    smash_active = defender.defense >= 5
+    tear_active = defender.tough >= 9
+    puncture_active = 3 <= defender.tough <= 9
 
     # Piercing spotter: average +0.5 AP
     spotter_ap = 0.5 if attacker.piercing_spotter else 0.0
+
+    # Versatile Attack on charge: pick AP(+1) vs +1-to-hit by EV per weapon.
+    va_active = attacker.versatile_attack
+
+    # ED Clan Warrior melee multiplier.
+    if attacker.clan_warrior:
+        cw_thresh = 5 if attacker.clan_warrior_boost else 6
+        cw_trigger_p = (7 - cw_thresh) / 6.0
+        cw_attack_mult = 1.0 + cw_trigger_p
+    else:
+        cw_attack_mult = 1.0
+
+    # ED Unpredictable Fighter — average across the d6 roll: 0.5 chance of
+    # AP+1, 0.5 chance of +1 to hit. Approximate as half-bonus to each.
+    uf_active = attacker.unpredictable_fighter
 
     total = 0.0
     for w in attacker.weapons:
@@ -227,12 +428,43 @@ def _expected_melee_damage_raw(
 
         # Thrust: +1 to hit on charge (quality -1, min 2)
         if w.thrust:
-            thrust_quality = max(base_quality - 1, 2)
+            thrust_quality = max(base_quality_eff - 1, 2)
             p = 5 / 6 if w.reliable else (7 - thrust_quality) / 6.0
         else:
             p = 5 / 6 if w.reliable else base_hit_prob
 
-        dice = w.attacks
+        # Versatile Attack: try +1-to-hit vs AP(+1), pick higher proxy.
+        va_ap = 0
+        if va_active:
+            quality_hit = max((thrust_quality if w.thrust else base_quality_eff) - 1, 2)
+            p_hit_va = 5 / 6 if w.reliable else (7 - quality_hit) / 6.0
+            ap_a = w.ap + (1 if w.thrust else 0) + 1
+            ap_b = w.ap + (1 if w.thrust else 0)
+            blk_a = max((7 - min(d_def + ap_a, 7)) / 6.0, 1 / 6)
+            blk_b = max((7 - min(d_def + ap_b, 7)) / 6.0, 1 / 6)
+            ev_a = p * (1.0 - blk_a)
+            ev_b = p_hit_va * (1.0 - blk_b)
+            if ev_b > ev_a:
+                p = p_hit_va
+            else:
+                va_ap = 1
+
+        # Unpredictable Fighter average bonus: +0.5 AP and an effective
+        # quality of base-0.5 (we simplify by averaging hit prob).
+        uf_ap = 0.5 if uf_active else 0.0
+        if uf_active:
+            quality_h = max((thrust_quality if w.thrust else base_quality_eff) - 1, 2)
+            p_uf_hit = 5 / 6 if w.reliable else (7 - quality_h) / 6.0
+            p = 0.5 * p + 0.5 * p_uf_hit
+
+        # ED Tear / Puncture conditional AP.
+        ed_extra_ap = 0.0
+        if w.tear and tear_active:
+            ed_extra_ap += 4
+        if w.puncture and puncture_active:
+            ed_extra_ap += 4
+
+        dice = w.attacks * cw_attack_mult
 
         # Split hits into nat6 and normal
         nat6_hits = dice * (1 / 6)
@@ -242,14 +474,23 @@ def _expected_melee_damage_raw(
         if attacker.furious:
             normal_hits += nat6_hits
 
-        # Blast multiplier
-        if w.blast:
-            blast_mult = min(w.blast, defender.models)
+        # Surge in melee: +1 hit per nat 6 (per weapon).
+        if w.surge:
+            normal_hits += nat6_hits
+
+        # Blast multiplier (Smash adds Blast(+3) vs def-5+ majority)
+        eff_blast = w.blast
+        smash_now = w.smash and smash_active
+        if smash_now:
+            eff_blast = (eff_blast or 0) + 3
+        if eff_blast:
+            blast_mult = min(eff_blast, defender.models)
             nat6_hits *= blast_mult
             normal_hits *= blast_mult
 
-        # Base AP: weapon AP + thrust bonus, reduced by fortified
-        base_ap = w.ap + (1 if w.thrust else 0)
+        # Base AP: weapon AP + thrust + Versatile Attack + Unpredictable
+        # Fighter (averaged) + Tear/Puncture conditional, reduced by fortified.
+        base_ap = w.ap + (1 if w.thrust else 0) + va_ap + uf_ap + ed_extra_ap
         if defender.fortified:
             base_ap = max(base_ap - 1, 0)
 
@@ -263,6 +504,8 @@ def _expected_melee_damage_raw(
         eff_def_nat6 = min(d_def + nat6_ap, 7)
         block_nat6 = (_bane_block_prob(eff_def_nat6) if w.bane
                       else max((7 - eff_def_nat6) / 6.0, 1 / 6))
+        if w.lacerate:
+            block_nat6 = block_nat6 * block_nat6
         wounds_nat6 = nat6_hits * (1 - block_nat6)
 
         # --- Normal path ---
@@ -270,7 +513,13 @@ def _expected_melee_damage_raw(
         eff_def_normal = min(d_def + normal_ap, 7)
         block_normal = (_bane_block_prob(eff_def_normal) if w.bane
                         else max((7 - eff_def_normal) / 6.0, 1 / 6))
+        if w.lacerate:
+            block_normal = block_normal * block_normal
         wounds_normal = normal_hits * (1 - block_normal)
+
+        # Shred extra wounds (1/6 chance per def die).
+        if w.shred:
+            wounds_normal += (nat6_hits + normal_hits) * (1.0 / 6.0)
 
         # Deadly multiplier (cap at model HP — overkill is wasted)
         if w.deadly:
@@ -281,9 +530,11 @@ def _expected_melee_damage_raw(
 
         weapon_wounds = wounds_nat6 + wounds_normal
 
-        # Regeneration: 5+ negates → multiply by 2/3
-        # Bypassed by rending, unstoppable, bane
-        if defender.regeneration and not (w.rending or w.unstoppable or w.bane):
+        # Regeneration: 5+ negates → multiply by 2/3.
+        # Bypassed by rending, unstoppable, bane, Smash, and Puncture.
+        if (defender.regeneration
+                and not (w.rending or w.unstoppable or w.bane or smash_now
+                         or (w.puncture and puncture_active))):
             weapon_wounds *= (2 / 3)
 
         total += weapon_wounds
@@ -626,9 +877,9 @@ def _encode_unit_tactical_into(
         orb += 2
 
     # 187-196  Can-charge: 1.0 if this unit can charge opposing unit j, else 0.0
-    # Uses same logic as ai._can_charge: centre-to-centre dist < rush_distance + 2
-    # Skip dead/missing units (sentinel position) to avoid false positives.
-    charge_threshold = rush_budget + 2.0
+    # Uses same logic as ai._can_charge: centre-to-centre dist < charge + 2.
+    # Versatile Reach grants +2" charge via unit.charge_distance.
+    charge_threshold = float(unit.charge_distance) + 2.0
     charge_threshold_sq = charge_threshold * charge_threshold
     cc = offset + _TOFF_CAN_CHARGE
     for j, (ox, oy) in enumerate(opposing_positions):
@@ -640,6 +891,80 @@ def _encode_unit_tactical_into(
             buf[cc + j] = 1.0
 
     # 197-199: tactical booleans written by encode_state_tactical caller
+
+
+def _encode_unit_tactical_into_fast(
+    us: UnitState,
+    is_friendly: bool,
+    player: str,
+    objectives_np: np.ndarray,              # (10,) float64 — 5 × (x, y)
+    opp_positions_np: np.ndarray,           # (20,) float64 — 10 × (x, y)
+    opp_advance_np: np.ndarray,             # (10,) float64
+    same_positions_np: np.ndarray,          # (20,) float64 — 10 × (x, y)
+    ranged_matchups: np.ndarray,            # (10, 7) float32
+    melee_matchups: np.ndarray,             # (10,) float32
+    total_side_points: int,
+    buf: np.ndarray,
+    offset: int,
+) -> None:
+    """C-accelerated variant. Caller must skip dead units (models_alive <= 0).
+    Writes the same 200-float block as `_encode_unit_tactical_into`.
+
+    Shared-per-side arrays (objectives, positions, advance distances) are
+    pre-built once by encode_state_tactical to avoid per-unit marshaling.
+    """
+    unit = us.unit
+    cx, cy = us.centre()
+    if player == "B":
+        cx = _flip_x(cx)
+        cy = _flip_y(cy)
+
+    # Survival fraction (uses wounds_per_model for tough units)
+    if unit.tough:
+        total_start = unit.tough * unit.models
+        total_rem = sum(
+            unit.tough - w for w in us.wounds_per_model[: us.models_alive]
+        )
+        survival = total_rem / max(total_start, 1)
+    else:
+        survival = us.models_alive / max(unit.models, 1)
+
+    wound_count = unit.tough if unit.tough > 0 else 1
+    speed_val = 0.0 if unit.artillery else float(unit.rush_distance)
+    points_frac = unit.points / max(total_side_points, 1)
+
+    scalars = np.empty(15, dtype=np.float64)
+    scalars[0] = wound_count
+    scalars[1] = unit.models
+    scalars[2] = speed_val
+    scalars[3] = survival
+    scalars[4] = points_frac
+    scalars[5] = 1.0 if unit.flying else 0.0
+    scalars[6] = 1.0 if unit.artillery else 0.0
+    scalars[7] = 1.0 if unit.fearless else 0.0
+    scalars[8] = 1.0 if unit.fear > 0 else 0.0
+    scalars[9] = 1.0 if is_friendly else 0.0
+    scalars[10] = cx
+    scalars[11] = cy
+    scalars[12] = float(unit.advance_distance)
+    scalars[13] = float(unit.rush_distance)
+    scalars[14] = us.models_alive
+
+    _fc.fast_encode_unit_tactical(
+        scalars,
+        objectives_np,
+        opp_positions_np,
+        opp_advance_np,
+        same_positions_np,
+        ranged_matchups,
+        melee_matchups,
+        buf, offset,
+        _INV_BOARD_DIAG,
+        _MAX_TOUGH, _MAX_MODELS, _MAX_SPEED,
+        OBJ_SEIZE_RANGE,
+        _DEAD_SENTINEL,
+        COLS, ROWS,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +1128,16 @@ def encode_state_tactical(
 
     buf = np.zeros(TACTICAL_TOTAL_FEATURES, dtype=np.float32)
 
+    use_fast = _fc.USE_C_EXT and _fc.is_available()
+    if use_fast:
+        # Pre-build shared arrays once per side (avoids 20× marshaling).
+        # Positions use _DEAD_SENTINEL for dead slots, so flatten directly.
+        obj_np = np.asarray(objectives, dtype=np.float64).reshape(-1)
+        enemy_pos_np = np.asarray(enemy_positions, dtype=np.float64).reshape(-1)
+        friendly_pos_np = np.asarray(friendly_positions, dtype=np.float64).reshape(-1)
+        enemy_adv_np = np.asarray(enemy_advance_dists, dtype=np.float64)
+        friendly_adv_np = np.asarray(friendly_advance_dists, dtype=np.float64)
+
     # --- Friendly slots (0–9): TACTICAL_UNIT_FEATURES each ---
     for i in range(MAX_UNITS_PER_SIDE):
         offset = i * TACTICAL_UNIT_FEATURES
@@ -810,10 +1145,16 @@ def encode_state_tactical(
             us = friendly_units[i]
             rm = friendly_ranged_matchups[i] if i < len(friendly_ranged_matchups) else _ZERO_RANGED_ROW
             mm = friendly_melee_matchups[i] if i < len(friendly_melee_matchups) else _ZERO_MELEE_ROW
-            _encode_unit_tactical_into(us, True, player, objectives, rm, mm,
-                                       total_friendly_points, enemy_positions,
-                                       enemy_advance_dists,
-                                       friendly_positions, buf, offset)
+            if use_fast and us.models_alive > 0:
+                _encode_unit_tactical_into_fast(
+                    us, True, player,
+                    obj_np, enemy_pos_np, enemy_adv_np, friendly_pos_np,
+                    rm, mm, total_friendly_points, buf, offset)
+            else:
+                _encode_unit_tactical_into(us, True, player, objectives, rm, mm,
+                                           total_friendly_points, enemy_positions,
+                                           enemy_advance_dists,
+                                           friendly_positions, buf, offset)
             if us.models_alive > 0:
                 if us.activated:
                     buf[offset + _TOFF_ACTIVATED] = 1.0
@@ -821,6 +1162,7 @@ def encode_state_tactical(
                     buf[offset + _TOFF_FATIGUED] = 1.0
                 if us.shaken:
                     buf[offset + _TOFF_SHAKEN] = 1.0
+                buf[offset + _TOFF_IS_DEPLOYED] = 1.0
 
     # --- Enemy slots (10–19): TACTICAL_UNIT_FEATURES each ---
     enemy_base = MAX_UNITS_PER_SIDE * TACTICAL_UNIT_FEATURES
@@ -830,10 +1172,16 @@ def encode_state_tactical(
             us = enemy_units[i]
             rm = enemy_ranged_matchups[i] if i < len(enemy_ranged_matchups) else _ZERO_RANGED_ROW
             mm = enemy_melee_matchups[i] if i < len(enemy_melee_matchups) else _ZERO_MELEE_ROW
-            _encode_unit_tactical_into(us, False, player, objectives, rm, mm,
-                                       total_enemy_points, friendly_positions,
-                                       friendly_advance_dists,
-                                       enemy_positions, buf, offset)
+            if use_fast and us.models_alive > 0:
+                _encode_unit_tactical_into_fast(
+                    us, False, player,
+                    obj_np, friendly_pos_np, friendly_adv_np, enemy_pos_np,
+                    rm, mm, total_enemy_points, buf, offset)
+            else:
+                _encode_unit_tactical_into(us, False, player, objectives, rm, mm,
+                                           total_enemy_points, friendly_positions,
+                                           friendly_advance_dists,
+                                           enemy_positions, buf, offset)
             if us.models_alive > 0:
                 if us.activated:
                     buf[offset + _TOFF_ACTIVATED] = 1.0
@@ -841,17 +1189,295 @@ def encode_state_tactical(
                     buf[offset + _TOFF_FATIGUED] = 1.0
                 if us.shaken:
                     buf[offset + _TOFF_SHAKEN] = 1.0
+                buf[offset + _TOFF_IS_DEPLOYED] = 1.0
 
-    # --- Global features (16) ---
+    # --- Global features ---
     g = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES
-    buf[g + round_num - 1] = 1.0
-    buf[g + 4:g + 9] = _objective_control_mapped(board, player)
-    buf[g + 9:g + 14] = _projected_objective_control_mapped(
+    buf[g + _GOFF_ROUND + round_num - 1] = 1.0
+    buf[g + _GOFF_OBJ_CTRL:g + _GOFF_OBJ_CTRL + 5] = _objective_control_mapped(board, player)
+    buf[g + _GOFF_OBJ_CTRL_PROJ:g + _GOFF_OBJ_CTRL_PROJ + 5] = _projected_objective_control_mapped(
         board, friendly_units, enemy_units, player)
     alive_f = sum(u.unit.points for u in friendly_units if u.models_alive > 0)
-    buf[g + 14] = alive_f / max(total_friendly_points, 1)
+    buf[g + _GOFF_ALIVE_F] = alive_f / max(total_friendly_points, 1)
     alive_e = sum(u.unit.points for u in enemy_units if u.models_alive > 0)
-    buf[g + 15] = alive_e / max(total_enemy_points, 1)
+    buf[g + _GOFF_ALIVE_E] = alive_e / max(total_enemy_points, 1)
+    # In-game state: deploy_phase = in_game (index 2 of the 3-hot). Remaining
+    # deploy globals (is_my_deploy_turn, n_unplaced_*) stay at 0.
+    buf[g + _GOFF_DEPLOY_PHASE + 2] = 1.0
 
     assert len(buf) == TACTICAL_TOTAL_FEATURES
     return torch.from_numpy(buf)
+
+
+# ---------------------------------------------------------------------------
+# Deployment-phase encoding
+# ---------------------------------------------------------------------------
+
+def _encode_unplaced_unit_into(
+    us: UnitState,
+    is_friendly: bool,
+    ranged_matchups: np.ndarray,
+    melee_matchups: np.ndarray,
+    total_side_points: int,
+    buf: np.ndarray,
+    offset: int,
+) -> None:
+    """Write position-independent features for a unit that hasn't been placed yet.
+
+    Fills the 10 stat scalars and the ranged/melee matchup blocks (which depend
+    only on unit stats, not positions). is_deployed stays 0; every position-
+    relative slot stays at the buffer's zero init."""
+    unit = us.unit
+    wound_count = unit.tough if unit.tough > 0 else 1
+    buf[offset:offset + 10] = [
+        wound_count / _MAX_TOUGH,
+        unit.models / _MAX_MODELS,
+        (0.0 if unit.artillery else float(unit.rush_distance)) / _MAX_SPEED,
+        _survival_fraction(us),
+        unit.points / max(total_side_points, 1),
+        1.0 if unit.flying else 0.0,
+        1.0 if unit.artillery else 0.0,
+        1.0 if unit.fearless else 0.0,
+        1.0 if unit.fear > 0 else 0.0,
+        1.0 if is_friendly else 0.0,
+    ]
+    rs = offset + _TOFF_RANGED
+    flat = ranged_matchups.reshape(-1)
+    buf[rs:rs + flat.size] = flat
+    ms = offset + _TOFF_MELEE
+    buf[ms:ms + melee_matchups.size] = melee_matchups
+
+
+_DEPLOY_PHASE_IDX = {"non_scout": 0, "scout": 1, "in_game": 2}
+
+
+def encode_state_deploy(
+    friendly_units: list[UnitState],
+    enemy_units: list[UnitState],
+    board: Board,
+    player: str,
+    *,
+    deploy_phase: str,
+    is_my_turn: bool,
+    friendly_ranged_matchups: np.ndarray | None = None,
+    friendly_melee_matchups: np.ndarray | None = None,
+    enemy_ranged_matchups: np.ndarray | None = None,
+    enemy_melee_matchups: np.ndarray | None = None,
+    total_friendly_points: int | None = None,
+    total_enemy_points: int | None = None,
+) -> torch.Tensor:
+    """Encode a mid-deployment game state for the tactical model's deployment heads.
+
+    Same tensor shape as encode_state_tactical (TACTICAL_TOTAL_FEATURES). Per-unit
+    encoding for placed units (positions non-empty) mirrors encode_state_tactical,
+    so the model sees the in-game-style relative geometry of whatever is on the
+    board. Unplaced units get a stat-only encoding (no spurious zero-distance
+    relations); is_deployed=0 distinguishes them.
+
+    deploy_phase: one of "non_scout" or "scout" — drives the deploy_phase
+        one-hot in the global block.
+    is_my_turn: 1 if the *player* is about to deploy a unit right now.
+    """
+    if deploy_phase not in ("non_scout", "scout"):
+        raise ValueError(f"deploy_phase must be 'non_scout' or 'scout', got {deploy_phase!r}")
+
+    if total_friendly_points is None:
+        total_friendly_points = sum(u.unit.points for u in friendly_units)
+    if total_enemy_points is None:
+        total_enemy_points = sum(u.unit.points for u in enemy_units)
+
+    if friendly_ranged_matchups is None or friendly_melee_matchups is None:
+        fr, fm = precompute_damage(
+            [u.unit for u in friendly_units],
+            [u.unit for u in enemy_units],
+        )
+        if friendly_ranged_matchups is None:
+            friendly_ranged_matchups = fr
+        if friendly_melee_matchups is None:
+            friendly_melee_matchups = fm
+    if enemy_ranged_matchups is None or enemy_melee_matchups is None:
+        er, em = precompute_damage(
+            [u.unit for u in enemy_units],
+            [u.unit for u in friendly_units],
+        )
+        if enemy_ranged_matchups is None:
+            enemy_ranged_matchups = er
+        if enemy_melee_matchups is None:
+            enemy_melee_matchups = em
+
+    objectives = _get_model_objectives(player)
+    # Positions: only placed enemies/friends contribute; everyone else uses
+    # _DEAD_SENTINEL so the relative-geometry block is well-defined for the
+    # placed units that look at them.
+    def _positions(units: list[UnitState]) -> list[tuple[float, float]]:
+        out: list[tuple[float, float]] = []
+        for i in range(MAX_UNITS_PER_SIDE):
+            if i < len(units) and units[i].positions:
+                cx, cy = units[i].centre()
+                if player == "B":
+                    cx = _flip_x(cx)
+                    cy = _flip_y(cy)
+                out.append((cx, cy))
+            else:
+                out.append(_DEAD_SENTINEL)
+        return out
+
+    enemy_positions = _positions(enemy_units)
+    friendly_positions = _positions(friendly_units)
+    enemy_advance_dists = [
+        float(enemy_units[i].unit.advance_distance)
+        if i < len(enemy_units) and enemy_units[i].positions
+        else 0.0
+        for i in range(MAX_UNITS_PER_SIDE)
+    ]
+    friendly_advance_dists = [
+        float(friendly_units[i].unit.advance_distance)
+        if i < len(friendly_units) and friendly_units[i].positions
+        else 0.0
+        for i in range(MAX_UNITS_PER_SIDE)
+    ]
+
+    buf = np.zeros(TACTICAL_TOTAL_FEATURES, dtype=np.float32)
+
+    def _fill_side(units, ranged, melee, total_pts, base, is_friendly,
+                   opp_positions, opp_adv, same_positions):
+        for i in range(MAX_UNITS_PER_SIDE):
+            offset = base + i * TACTICAL_UNIT_FEATURES
+            if i >= len(units):
+                continue
+            us = units[i]
+            rm = ranged[i] if i < len(ranged) else _ZERO_RANGED_ROW
+            mm = melee[i] if i < len(melee) else _ZERO_MELEE_ROW
+            if us.positions:
+                _encode_unit_tactical_into(
+                    us, is_friendly, player, objectives, rm, mm,
+                    total_pts, opp_positions, opp_adv, same_positions,
+                    buf, offset)
+                buf[offset + _TOFF_IS_DEPLOYED] = 1.0
+            elif us.models_alive > 0:
+                _encode_unplaced_unit_into(
+                    us, is_friendly, rm, mm, total_pts, buf, offset)
+
+    _fill_side(friendly_units, friendly_ranged_matchups, friendly_melee_matchups,
+               total_friendly_points, 0, True,
+               enemy_positions, enemy_advance_dists, friendly_positions)
+    enemy_base = MAX_UNITS_PER_SIDE * TACTICAL_UNIT_FEATURES
+    _fill_side(enemy_units, enemy_ranged_matchups, enemy_melee_matchups,
+               total_enemy_points, enemy_base, False,
+               friendly_positions, friendly_advance_dists, enemy_positions)
+
+    # --- Global features ---
+    g = MAX_UNITS_PER_SIDE * 2 * TACTICAL_UNIT_FEATURES
+    # Objective control / projected control / alive-fraction blocks stay at 0
+    # — they're undefined pre-deployment. Round one-hot stays at 0 too.
+    buf[g + _GOFF_DEPLOY_PHASE + _DEPLOY_PHASE_IDX[deploy_phase]] = 1.0
+    if is_my_turn:
+        buf[g + _GOFF_MY_DEPLOY_TURN] = 1.0
+    n_unplaced_self = sum(1 for u in friendly_units if not u.positions)
+    n_unplaced_opp = sum(1 for u in enemy_units if not u.positions)
+    buf[g + _GOFF_N_UNPLACED_SELF] = n_unplaced_self / float(MAX_UNITS_PER_SIDE)
+    buf[g + _GOFF_N_UNPLACED_OPP] = n_unplaced_opp / float(MAX_UNITS_PER_SIDE)
+
+    assert len(buf) == TACTICAL_TOTAL_FEATURES
+    return torch.from_numpy(buf)
+
+
+# ---------------------------------------------------------------------------
+# Deployment action masks + index↔world coordinate mapping
+# ---------------------------------------------------------------------------
+
+def build_deploy_eligible_mask(
+    units: list[UnitState],
+    phase: str,
+) -> torch.Tensor:
+    """Per-friendly-slot bool mask of "right phase AND not yet placed AND
+    actually exists in this slot". Length = MAX_UNITS_PER_SIDE."""
+    want_scout = (phase == "scout")
+    m = torch.zeros(MAX_UNITS_PER_SIDE, dtype=torch.bool)
+    for i in range(MAX_UNITS_PER_SIDE):
+        if i >= len(units):
+            continue
+        u = units[i]
+        if u.positions:           # already placed
+            continue
+        if u.models_alive <= 0:   # not a real unit
+            continue
+        if bool(u.unit.scout) != want_scout:
+            continue
+        m[i] = True
+    return m
+
+
+def deploy_pos_idx_to_world(pos_idx: int, player: str) -> tuple[int, int]:
+    """Map a deploy_pos_head logit index to a world (col, row) anchor.
+
+    The head's grid is egocentric: index = depth * COLS + col_ego, depth
+    counted from the deploying player's own back edge. For player A back-
+    edge is row 0; for player B back-edge is row ROWS-1 and the egocentric
+    column is also flipped to match _flip_x in the per-unit encoding."""
+    depth = pos_idx // COLS
+    col_ego = pos_idx % COLS
+    if player == "A":
+        return col_ego, depth
+    return (COLS - 1) - col_ego, (ROWS - 1) - depth
+
+
+def world_to_deploy_pos_idx(col: int, row: int, player: str) -> int:
+    """Inverse of deploy_pos_idx_to_world."""
+    if player == "A":
+        depth, col_ego = row, col
+    else:
+        depth = (ROWS - 1) - row
+        col_ego = (COLS - 1) - col
+    return depth * COLS + col_ego
+
+
+def build_deploy_legal_pos_mask(
+    player: str,
+    phase: str,
+    board: Board,
+    *,
+    enemy_positions: set[tuple[int, int]] | None = None,
+) -> torch.Tensor:
+    """Bool mask of shape (DEPLOY_POS_GRID,) — True for legal anchor cells in
+    the deploying player's own zone for the given phase.
+
+    Rules:
+      * Non-scout phase: own DZ depth = DEPLOY_POS_NONSCOUT_DEPTH (12 rows).
+      * Scout phase: full DEPLOY_POS_DEPTH (24 rows) — own DZ + 12" forward.
+      * Cell must be on the board, unoccupied, and inside the player's
+        deployment zone for the phase (``Board.is_in_dz``). When the board
+        carries map-driven DZ cell sets (``dz_*_cells``), this excludes
+        walls and any irregular gaps; on a legacy empty board it reduces
+        to the row-range check.
+      * Scout phase: cell must not be in 1" exclusion of any enemy position
+        (mirrors the per-step exclusion used by deploy_armies' scout phase).
+
+    Multi-model "wholly within zone" fit is *not* enforced here — the
+    spiral in _place_unit_at handles overflow via its fallback. A per-unit
+    anchor-fit mask can layer on top of this for tighter training signal.
+    """
+    from movement import is_in_exclusion_zone
+
+    if phase == "non_scout":
+        depth_lim = DEPLOY_POS_NONSCOUT_DEPTH
+        scout_zone = False
+    elif phase == "scout":
+        depth_lim = DEPLOY_POS_DEPTH
+        scout_zone = True
+    else:
+        raise ValueError(f"phase must be 'non_scout' or 'scout', got {phase!r}")
+
+    ep = enemy_positions if (phase == "scout") else None
+    m = torch.zeros(DEPLOY_POS_GRID, dtype=torch.bool)
+    for depth in range(depth_lim):
+        for col_ego in range(COLS):
+            world_col, world_row = deploy_pos_idx_to_world(depth * COLS + col_ego, player)
+            if not board.is_free(world_col, world_row):
+                continue
+            if not board.is_in_dz(world_col, world_row, player, scout=scout_zone):
+                continue
+            if ep and is_in_exclusion_zone(world_col, world_row, ep):
+                continue
+            m[depth * COLS + col_ego] = True
+    return m

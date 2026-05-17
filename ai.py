@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import math
 
-from board import Board, OBJECTIVES, OBJ_SEIZE_RANGE, HOME_OBJ_A, HOME_OBJ_B, dist, dist_sq
+from board import Board, COLS, ROWS, OBJECTIVES, OBJ_SEIZE_RANGE, HOME_OBJ_A, HOME_OBJ_B, dist, dist_sq
+import fast_core as _fc
 
 
 def _obj_goal(obj: tuple) -> tuple[int, int]:
@@ -55,7 +56,8 @@ def _is_near_objective(unit: UnitState) -> bool:
 
 
 def pick_target_killer(attacker: UnitState, enemies: list[UnitState],
-                       target_multipliers: list[float] | None = None) -> UnitState | None:
+                       target_multipliers: list[float] | None = None,
+                       board: Board | None = None) -> UnitState | None:
     """Killer targeting: max wounds/cost, prefer full-volley targets."""
     best = None
     best_score = -1.0
@@ -64,7 +66,7 @@ def pick_target_killer(attacker: UnitState, enemies: list[UnitState],
     for i, enemy in enumerate(enemies):
         if enemy.models_alive <= 0:
             continue
-        can_shoot, score, full = evaluate_target(attacker, enemy)
+        can_shoot, score, full = evaluate_target(attacker, enemy, board)
         if not can_shoot:
             continue
         if target_multipliers is not None and i < len(target_multipliers):
@@ -83,7 +85,8 @@ def pick_target_killer(attacker: UnitState, enemies: list[UnitState],
 
 
 def pick_target_clearer(attacker: UnitState, enemies: list[UnitState],
-                        target_multipliers: list[float] | None = None) -> UnitState | None:
+                        target_multipliers: list[float] | None = None,
+                        board: Board | None = None) -> UnitState | None:
     """Objective-Clearer targeting: 3x multiplier for enemies near objectives."""
     best = None
     best_score = -1.0
@@ -92,7 +95,7 @@ def pick_target_clearer(attacker: UnitState, enemies: list[UnitState],
     for i, enemy in enumerate(enemies):
         if enemy.models_alive <= 0:
             continue
-        can_shoot, score, full = evaluate_target(attacker, enemy)
+        can_shoot, score, full = evaluate_target(attacker, enemy, board)
         if not can_shoot:
             continue
         if _is_near_objective(enemy):
@@ -112,7 +115,8 @@ def pick_target_clearer(attacker: UnitState, enemies: list[UnitState],
 
 
 def pick_target_holder(attacker: UnitState, enemies: list[UnitState],
-                       target_multipliers: list[float] | None = None) -> UnitState | None:
+                       target_multipliers: list[float] | None = None,
+                       board: Board | None = None) -> UnitState | None:
     """Objective-Holder targeting: only targets of opportunity (in range now)."""
     best = None
     best_score = -1.0
@@ -120,7 +124,7 @@ def pick_target_holder(attacker: UnitState, enemies: list[UnitState],
     for i, enemy in enumerate(enemies):
         if enemy.models_alive <= 0:
             continue
-        can_shoot, score, _full = evaluate_target(attacker, enemy)
+        can_shoot, score, _full = evaluate_target(attacker, enemy, board)
         if not can_shoot:
             continue
         if target_multipliers is not None and i < len(target_multipliers):
@@ -133,18 +137,19 @@ def pick_target_holder(attacker: UnitState, enemies: list[UnitState],
 
 
 def pick_target(attacker: UnitState, enemies: list[UnitState],
-                target_multipliers: list[float] | None = None) -> UnitState | None:
+                target_multipliers: list[float] | None = None,
+                board: Board | None = None) -> UnitState | None:
     """Dispatch to role-specific target selection."""
     role = attacker.ai_role
     if role == "objective_clearer":
-        return pick_target_clearer(attacker, enemies, target_multipliers)
+        return pick_target_clearer(attacker, enemies, target_multipliers, board)
     elif role == "objective_holder":
-        return pick_target_holder(attacker, enemies, target_multipliers)
+        return pick_target_holder(attacker, enemies, target_multipliers, board)
     elif role == "home_objective_holder":
         # Standard target priority (like killer) while sitting on home objective
-        return pick_target_killer(attacker, enemies, target_multipliers)
+        return pick_target_killer(attacker, enemies, target_multipliers, board)
     else:
-        return pick_target_killer(attacker, enemies, target_multipliers)
+        return pick_target_killer(attacker, enemies, target_multipliers, board)
 
 
 # ===================================================================
@@ -189,12 +194,12 @@ def choose_action_and_goal(unit: UnitState, enemies: list[UnitState],
 
     if combat_pref == "melee":
         if mode == "kill_points" or not is_holder_role:
-            return _choose_melee_killer_action(unit, enemies)
+            return _choose_melee_killer_action(unit, enemies, board)
         else:
-            return _choose_melee_holder_action(unit, enemies)
+            return _choose_melee_holder_action(unit, enemies, board)
 
     if mode == "kill_points" or not is_holder_role:
-        action, goal, reason = _choose_killer_action(unit, enemies, target_multipliers)
+        action, goal, reason = _choose_killer_action(unit, enemies, target_multipliers, board)
         return action, goal, None, reason
     else:
         action, goal, reason = _choose_holder_action(unit, enemies)
@@ -204,6 +209,7 @@ def choose_action_and_goal(unit: UnitState, enemies: list[UnitState],
 def _choose_killer_action(unit: UnitState,
                           enemies: list[UnitState],
                           target_multipliers: list[float] | None = None,
+                          board: Board | None = None,
                           ) -> tuple[str, tuple[int, int] | None, str]:
     """Killer/Clearer action: prioritize shooting, advance to get in range.
     Respects movement_stance for ranged-preference killers:
@@ -217,10 +223,10 @@ def _choose_killer_action(unit: UnitState,
     use_stance = (combat_pref == "ranged"
                   and unit.ai_role not in ("objective_holder", "home_objective_holder"))
 
-    best_target = pick_target(unit, enemies, target_multipliers)
+    best_target = pick_target(unit, enemies, target_multipliers, board)
 
     if best_target is not None:
-        if is_full_volley(unit, best_target):
+        if is_full_volley(unit, best_target, board):
             # All weapons in range
             if use_stance and stance == "aggressive":
                 # Aggressive: keep closing even when in range
@@ -395,15 +401,63 @@ def _pick_favoured_target(unit: UnitState, enemies: list[UnitState]) -> UnitStat
 # CHARGE TARGET SELECTION
 # ===================================================================
 
-def _can_charge(unit: UnitState, target: UnitState) -> bool:
-    """Quick check: can any model reach within 1\" (adjacent) of target?"""
-    charge_budget = unit.unit.rush_distance
+_MELEE_RANGE_SQ = 4  # 2 squares c2c — mirrors combat.MELEE_RANGE_SQ
+
+
+def _can_charge(unit: UnitState, target: UnitState,
+                board: Board | None = None,
+                enemy_positions: set[tuple[int, int]] | None = None) -> bool:
+    """Can the charger physically reach within 2\" of any target model?
+
+    Stage 1 (cheap): centre-to-centre Euclidean filter against charge_distance.
+    Stage 2 (terrain-aware): from the charger model nearest the target's
+    centre, run a charge-aware pathfind. The charge is legal iff the
+    returned cell lands within 2\" c2c of any defender model. Stage 2 is
+    skipped when there is no terrain on the board (the Euclidean filter is
+    then sufficient) or when *board* is None (legacy callers).
+    """
+    # Use charge_distance so Versatile Reach's +2" charge bonus is honoured.
+    charge_budget = unit.unit.charge_distance
     cx, cy = unit.centre()
     tx, ty = target.centre()
-    # Quick centre-to-centre check (squared to avoid sqrt)
+    # Stage 1: quick centre-to-centre check (squared to avoid sqrt)
     threshold = charge_budget + 2
     d_sq = (cx - tx) ** 2 + (cy - ty) ** 2
-    return d_sq < threshold * threshold
+    if d_sq >= threshold * threshold:
+        return False
+
+    # Stage 2: terrain-aware reach check
+    if board is None or not board.terrain:
+        return True
+
+    charger_positions = unit.alive_positions()
+    target_positions = target.alive_positions()
+    if not charger_positions or not target_positions:
+        return False
+
+    goal = (int(round(tx)), int(round(ty)))
+    nearest = min(charger_positions,
+                  key=lambda p: (p[0] - goal[0]) ** 2 + (p[1] - goal[1]) ** 2)
+
+    if enemy_positions is None:
+        enemy_positions = set(target_positions)
+
+    result = _fc.fast_pathfind_move(
+        nearest, goal, charge_budget, board.occupancy, enemy_positions,
+        is_charge=True,
+        flying=unit.unit.flying,
+        strider=unit.unit.strider,
+        cols=COLS, rows=ROWS,
+        impassible_grid=board.impassible_grid,
+        difficult_grid=board.difficult_grid,
+    )
+
+    for tp in target_positions:
+        dc = result[0] - tp[0]
+        dr = result[1] - tp[1]
+        if dc * dc + dr * dr <= _MELEE_RANGE_SQ:
+            return True
+    return False
 
 
 def _melee_target_score(attacker: UnitState, target: UnitState) -> float:
@@ -427,15 +481,18 @@ def _melee_target_score(attacker: UnitState, target: UnitState) -> float:
 
 
 def pick_charge_target(attacker: UnitState,
-                       enemies: list[UnitState]) -> UnitState | None:
+                       enemies: list[UnitState],
+                       board: Board | None = None) -> UnitState | None:
     """Pick the best charge target from enemies within charge range."""
     best = None
     best_score = -1.0
 
+    enemy_positions = _collect_enemy_positions(enemies) if board is not None else None
+
     for enemy in enemies:
         if enemy.models_alive <= 0:
             continue
-        if not _can_charge(attacker, enemy):
+        if not _can_charge(attacker, enemy, board, enemy_positions):
             continue
         score = _melee_target_score(attacker, enemy)
         if attacker.ai_role == "objective_clearer" and _is_near_objective(enemy):
@@ -447,23 +504,33 @@ def pick_charge_target(attacker: UnitState,
     return best
 
 
+def _collect_enemy_positions(enemies: list[UnitState]) -> set[tuple[int, int]]:
+    """Union of alive model positions across all enemy units."""
+    positions: set[tuple[int, int]] = set()
+    for e in enemies:
+        if e.models_alive > 0:
+            positions.update(e.alive_positions())
+    return positions
+
+
 # ===================================================================
 # MELEE AI DECISION LOGIC
 # ===================================================================
 
 def _choose_melee_killer_action(
         unit: UnitState,
-        enemies: list[UnitState]
+        enemies: list[UnitState],
+        board: Board | None = None,
 ) -> tuple[str, tuple[int, int] | None, UnitState | None, str]:
     """Melee killer/clearer: charge if possible, else advance+shoot, else rush."""
-    target = pick_charge_target(unit, enemies)
+    target = pick_charge_target(unit, enemies, board)
     if target is not None:
         tc = target.centre()
         goal = (int(round(tc[0])), int(round(tc[1])))
         return "charge", goal, target, "charge target in range"
 
     # Fall back to ranged behaviour
-    action, goal, reason = _choose_killer_action(unit, enemies)
+    action, goal, reason = _choose_killer_action(unit, enemies, board=board)
     if action == "hold" and goal is None:
         # No ranged target — rush toward favoured target
         favoured = _pick_favoured_target(unit, enemies)
@@ -476,7 +543,8 @@ def _choose_melee_killer_action(
 
 def _choose_melee_holder_action(
         unit: UnitState,
-        enemies: list[UnitState]
+        enemies: list[UnitState],
+        board: Board | None = None,
 ) -> tuple[str, tuple[int, int] | None, UnitState | None, str]:
     """Melee holder: move to objective, charge only if target is near objective."""
     obj_idx = unit.assigned_objective
@@ -487,7 +555,7 @@ def _choose_melee_holder_action(
 
     if not _unit_on_objective(unit, obj_idx):
         # Not on objective — check if we can charge an enemy near/between us and objective
-        charge_target = _pick_holder_charge_target(unit, enemies, obj)
+        charge_target = _pick_holder_charge_target(unit, enemies, obj, board)
         if charge_target is not None:
             tc = charge_target.centre()
             goal = (int(round(tc[0])), int(round(tc[1])))
@@ -500,7 +568,7 @@ def _choose_melee_holder_action(
         return "rush", _obj_goal(obj), None, f"{obj_name} objective not in advance range ({d:.0f}\" away)"
 
     # On objective — charge only if target is within 4\" of objective
-    charge_target = _pick_holder_charge_target(unit, enemies, obj)
+    charge_target = _pick_holder_charge_target(unit, enemies, obj, board)
     if charge_target is not None:
         tc = charge_target.centre()
         goal = (int(round(tc[0])), int(round(tc[1])))
@@ -511,14 +579,16 @@ def _choose_melee_holder_action(
 
 
 def _pick_holder_charge_target(unit: UnitState, enemies: list[UnitState],
-                               obj: tuple[int, int]) -> UnitState | None:
+                               obj: tuple[int, int],
+                               board: Board | None = None) -> UnitState | None:
     """Pick the best charge target for a holder: must be chargeable and near the objective."""
     best = None
     best_score = -1.0
+    enemy_positions = _collect_enemy_positions(enemies) if board is not None else None
     for enemy in enemies:
         if enemy.models_alive <= 0:
             continue
-        if not _can_charge(unit, enemy):
+        if not _can_charge(unit, enemy, board, enemy_positions):
             continue
         ec = enemy.centre()
         d_to_obj = math.sqrt((ec[0] - obj[0]) ** 2 + (ec[1] - obj[1]) ** 2)
@@ -538,7 +608,8 @@ def _pick_holder_charge_target(unit: UnitState, enemies: list[UnitState],
 # ===================================================================
 
 def activation_order(units: list[UnitState], enemies: list[UnitState] | None = None,
-                     mode: str = "objectives") -> list[UnitState]:
+                     mode: str = "objectives",
+                     board: Board | None = None) -> list[UnitState]:
     """Sort units for activation priority.
     In objectives mode (6-tier):
       1. Melee killers that can charge (desc expected melee damage)
@@ -554,13 +625,14 @@ def activation_order(units: list[UnitState], enemies: list[UnitState] | None = N
         return []
 
     enemies = enemies or []
+    enemy_positions = _collect_enemy_positions(enemies) if board is not None else None
 
     def _can_charge_any(u: UnitState) -> bool:
         pref = getattr(u, 'combat_preference', 'ranged')
         if pref != 'melee':
             return False
         for e in enemies:
-            if e.models_alive > 0 and _can_charge(u, e):
+            if e.models_alive > 0 and _can_charge(u, e, board, enemy_positions):
                 return True
         return False
 
